@@ -138,42 +138,42 @@ static ERL_NIF_TERM atom_no_logits;
 typedef struct {
     pthread_mutex_t mu;
     int mu_inited;                 /* guard pthread_mutex_destroy on error path */
-    struct llama_model *model;     /* NULL after release */
+    struct llama_model *model;     /* NULL after successful release */
     int active_contexts;           /* nif_new_context bumps; ctx_dtor decrements */
     int release_pending;           /* free_model when active_contexts hit 0 */
+    int release_failed;            /* llama_model_free threw; pointer is poisoned */
 } erllama_model_t;
 
 typedef struct {
     pthread_mutex_t mu;
     int mu_inited;
-    struct llama_context *ctx;     /* NULL after release */
+    struct llama_context *ctx;     /* NULL after successful release */
     erllama_model_t *model_res;    /* keep_resource'd by new_context */
     int decode_ready;              /* set after llama_decode; cleared after kv ops */
+    int release_failed;            /* llama_free threw; pointer is poisoned */
 } erllama_context_t;
 
 static ErlNifResourceType *MODEL_RT;
 static ErlNifResourceType *CTX_RT;
 
 /* Drop the context's reference on its model; if a previous
- * free_model/1 returned `in_use` and the model is now unreferenced,
- * actually free the underlying llama_model* here. Lock is held while
- * the active counter is touched and the freeing decision is made so
- * concurrent context destructions can't double-free. */
+ * free_model/1 returned {ok, deferred} and the model is now
+ * unreferenced, actually free the underlying llama_model* here. The
+ * decision is made under the lock so concurrent context destructions
+ * can't double-free. The free itself runs while the lock is still
+ * held to keep the pointer non-observable mid-teardown. */
 static void context_drops_model(erllama_model_t *m) {
     pthread_mutex_lock(&m->mu);
     if (m->active_contexts > 0) {
         m->active_contexts--;
     }
-    int do_free =
-        (m->release_pending && m->active_contexts == 0 && m->model);
-    struct llama_model *to_free = NULL;
-    if (do_free) {
-        to_free = m->model;
+    if (m->release_pending && m->active_contexts == 0 && m->model) {
+        int rc = erllama_safe_model_free(m->model);
         m->model = NULL;
         m->release_pending = 0;
+        if (rc != 0) m->release_failed = 1;
     }
     pthread_mutex_unlock(&m->mu);
-    if (to_free) erllama_safe_model_free(to_free);
 }
 
 /* Resource destructors run when the BEAM has no remaining references.
@@ -184,8 +184,11 @@ static void context_drops_model(erllama_model_t *m) {
 static void model_dtor(ErlNifEnv *env, void *obj) {
     (void) env;
     erllama_model_t *m = (erllama_model_t *) obj;
-    if (m->model) {
-        erllama_safe_model_free(m->model);
+    /* If a prior nif_free_model already cleared m->model we skip the
+     * call here. The release_failed flag is informational only --
+     * we never call llama_model_free on a poisoned pointer. */
+    if (m->model && !m->release_failed) {
+        (void) erllama_safe_model_free(m->model);
         m->model = NULL;
     }
     if (m->mu_inited) {
@@ -197,8 +200,8 @@ static void model_dtor(ErlNifEnv *env, void *obj) {
 static void ctx_dtor(ErlNifEnv *env, void *obj) {
     (void) env;
     erllama_context_t *c = (erllama_context_t *) obj;
-    if (c->ctx) {
-        erllama_safe_free(c->ctx);
+    if (c->ctx && !c->release_failed) {
+        (void) erllama_safe_free(c->ctx);
         c->ctx = NULL;
     }
     if (c->model_res) {
@@ -246,11 +249,17 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
 
     MODEL_RT = enif_open_resource_type(
         env, NULL, "erllama_model", model_dtor, ERL_NIF_RT_CREATE, NULL);
-    if (!MODEL_RT) return -1;
+    if (!MODEL_RT) {
+        (void) erllama_safe_backend_free();
+        return -1;
+    }
 
     CTX_RT = enif_open_resource_type(
         env, NULL, "erllama_context", ctx_dtor, ERL_NIF_RT_CREATE, NULL);
-    if (!CTX_RT) return -1;
+    if (!CTX_RT) {
+        (void) erllama_safe_backend_free();
+        return -1;
+    }
 
     return 0;
 }
@@ -417,10 +426,21 @@ static ERL_NIF_TERM nif_free_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         return enif_make_tuple2(env, atom_ok, atom_deferred);
     }
     struct llama_model *to_free = m->model;
+    /* Free under the lock so a concurrent state read can't observe a
+     * mid-free m->model. Only clear the pointer if the safe wrapper
+     * confirmed a clean free; on exception we mark the resource as
+     * release_failed and keep the pointer NULL anyway, since calling
+     * llama_model_free again would be a double-free. The native
+     * object is leaked in that case (a llama destructor that throws
+     * is itself a violation; we surface the error and avoid UB). */
+    int rc = erllama_safe_model_free(to_free);
     m->model = NULL;
     m->release_pending = 0;
+    if (rc != 0) m->release_failed = 1;
     pthread_mutex_unlock(&m->mu);
-    erllama_safe_model_free(to_free);
+    if (rc != 0) {
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
     return atom_ok;
 }
 
@@ -456,6 +476,14 @@ static ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM
 
     pthread_mutex_lock(&m->mu);
     if (!m->model) {
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    /* If free_model/1 has been called and is waiting for the last
+     * context to drop, do not let a new caller resurrect the model
+     * by attaching another context. The {ok, deferred} return is
+     * a release contract: no new contexts allowed past that point. */
+    if (m->release_pending) {
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
@@ -500,9 +528,14 @@ static ERL_NIF_TERM nif_free_context(ErlNifEnv *env, int argc, const ERL_NIF_TER
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
+    /* Free under the lock so a concurrent reader cannot observe the
+     * pointer mid-teardown. On exception we still NULL the pointer
+     * to avoid a double-free path through the destructor; the native
+     * object is leaked rather than risking UB. */
     int free_rc = erllama_safe_free(c->ctx);
     c->ctx = NULL;
     c->decode_ready = 0;
+    if (free_rc != 0) c->release_failed = 1;
     erllama_model_t *m = c->model_res;
     c->model_res = NULL;
     pthread_mutex_unlock(&c->mu);
@@ -878,11 +911,10 @@ static ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_exception);
     }
-    if (erllama_safe_sampler_accept(smpl, tok) != 0) {
-        (void) erllama_safe_sampler_free(smpl);
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_exception);
-    }
+    /* llama_sampler_sample already calls llama_sampler_accept on the
+     * chain internally; calling it again here would double-advance
+     * any sampler with non-NULL accept (greedy is a no-op, but
+     * future sampler swaps would silently regress). */
     if (erllama_safe_sampler_free(smpl) != 0) {
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_exception);
@@ -1091,9 +1123,9 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_kv_seq_rm",    4, nif_kv_seq_rm,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_fsync_dir",    1, nif_fsync_dir,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_load_model",   2, nif_load_model,   ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"nif_free_model",   1, nif_free_model,   0},
+    {"nif_free_model",   1, nif_free_model,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_new_context",  2, nif_new_context,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_free_context", 1, nif_free_context, 0},
+    {"nif_free_context", 1, nif_free_context, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_tokenize",     3, nif_tokenize,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_prefill",      2, nif_prefill,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_decode_one",   1, nif_decode_one,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
