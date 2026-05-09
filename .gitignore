@@ -1,0 +1,17 @@
+_build/
+.rebar3/
+.eunit/
+*.beam
+*.so
+*.o
+*.d
+*.dylib
+ebin/
+deps/
+log/
+.DS_Store
+*.swp
+*~
+erl_crash.dump
+priv/erllama_kv_nif.so
+rebar3.crashdump
