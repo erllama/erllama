@@ -15,5 +15,14 @@ init([]) ->
         intensity => 5,
         period => 30
     },
-    ChildSpecs = [],
+    ChildSpecs = [
+        #{
+            id => erllama_cache_sup,
+            start => {erllama_cache_sup, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => supervisor,
+            modules => [erllama_cache_sup]
+        }
+    ],
     {ok, {SupFlags, ChildSpecs}}.

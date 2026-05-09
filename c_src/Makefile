@@ -1,8 +1,8 @@
-# NIF build for erllama_kv_nif (CRC32C; kv_pack/kv_unpack stubs).
+# NIF build for erllama_nif (single .so for the whole project).
 #
-# Invoked from the umbrella rebar.config pre/post hooks. Lands the
-# shared library at apps/erllama_cache/priv/erllama_kv_nif.so so that
-# `code:priv_dir(erllama_cache)` finds it after rebar3 compile.
+# Invoked from the top-level rebar.config pre/post hooks. Lands the
+# shared library at priv/erllama_nif.so so that
+# `code:priv_dir(erllama)` finds it after rebar3 compile.
 
 UNAME := $(shell uname -s)
 
@@ -17,9 +17,9 @@ LDFLAGS += -undefined dynamic_lookup -flat_namespace
 endif
 
 PRIV_DIR := ../priv
-TARGET   := $(PRIV_DIR)/erllama_kv_nif.so
+TARGET   := $(PRIV_DIR)/erllama_nif.so
 
-SOURCES := erllama_kv_nif.c crc32c.c
+SOURCES := erllama_nif.c crc32c.c
 OBJECTS := $(SOURCES:.c=.o)
 DEPS    := $(SOURCES:.c=.d)
 

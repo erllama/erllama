@@ -13,5 +13,5 @@ log/
 *.swp
 *~
 erl_crash.dump
-priv/erllama_kv_nif.so
+priv/erllama_nif.so
 rebar3.crashdump

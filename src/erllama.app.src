@@ -1,8 +1,9 @@
-{application, erllama_cache, [
-    {description, "KV cache subsystem for erllama (RAM, ram_file, disk tiers)"},
+{application, erllama, [
+    {description,
+        "Native Erlang/OTP wrapper around llama.cpp with OpenAI-compatible API and tiered KV cache"},
     {vsn, "0.1.0"},
-    {registered, [erllama_cache_sup, erllama_cache_meta_srv]},
-    {mod, {erllama_cache_app, []}},
+    {registered, [erllama_sup, erllama_cache_sup, erllama_cache_meta_srv]},
+    {mod, {erllama_app, []}},
     {applications, [
         kernel,
         stdlib,

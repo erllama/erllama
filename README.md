@@ -10,9 +10,12 @@ roadmap; no business logic has shipped yet.
 ## Layout
 
 ```
-apps/erllama         the main application (model loading, request flow, HTTP API)
-apps/erllama_cache   the standalone KV cache subsystem
-config/sys.config    runtime configuration
+src/                    Erlang sources (single OTP app, flat)
+include/                shared headers
+c_src/                  the single NIF (erllama_nif)
+test/                   eunit + PropEr tests
+priv/                   build artefact: erllama_nif.so
+config/sys.config       runtime configuration
 IOMMAP_PREREQUISITE.md  upstream prerequisite for the iommap zero-copy primitive
 ```
 

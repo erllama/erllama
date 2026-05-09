@@ -1,12 +1,18 @@
 /*
- * erllama_kv_nif: payload-side NIFs for the erllama_cache subsystem.
+ * erllama_nif: the single NIF for erllama (cache + future llama.cpp
+ * surface).
  *
- * Surface (v0.1):
+ * v0.1 surface:
  *   crc32c(IoData) -> non_neg_integer()    [dirty CPU]
  *
- * Stubs returning {error, not_implemented} until step 2b lands:
+ * Stubs returning {error, not_implemented} until the llama.cpp
+ * wiring lands:
  *   kv_pack(Ctx, Tokens, NTokens) -> Binary
  *   kv_unpack(Ctx, Binary, SeqId) -> ok | {error, _}
+ *
+ * Future additions live here too (single .so): load_model,
+ * free_model, new_context, free_context, tokenize, detokenize,
+ * prefill, decode_async.
  *
  * No file I/O happens here; the cache layer assembles framed .kvc
  * files in Erlang and only feeds opaque payload bytes to the NIF.
@@ -62,4 +68,4 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_kv_unpack", 3, nif_kv_unpack, ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
-ERL_NIF_INIT(erllama_kv_nif, nif_funcs, load, NULL, NULL, NULL)
+ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, NULL)

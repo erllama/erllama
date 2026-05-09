@@ -8,15 +8,23 @@ erllama is a native Erlang/OTP wrapper around llama.cpp providing
 OpenAI-compatible inference with full supervision and a tiered KV
 cache. Requires Erlang/OTP 28 and rebar3 3.25+.
 
-The repo is a rebar3 umbrella:
+Single application, flat layout:
 
-- `apps/erllama` is the main application: model loading, request flow,
-  HTTP API, supervision tree.
-- `apps/erllama_cache` is the standalone KV cache subsystem (designed
-  to also ship on hex.pm independently): RAM, ram_file, and disk
-  tiers; meta server with claim/release/eviction; async save pipeline.
+```
+src/        Erlang sources (erllama_*, erllama_cache_*, erllama_nif)
+include/    Shared headers (erllama_cache.hrl)
+c_src/      C sources for the single NIF (erllama_nif.so)
+test/       eunit + PropEr property tests
+priv/       Build artefact: erllama_nif.so
+config/     sys.config
+```
 
-Authoritative design: `plans/golden-finding-horizon.md` (rev 10). The
+The KV cache is logically a subsystem (its own supervisor, modules
+prefixed `erllama_cache_*`) but lives in the same OTP application as
+the rest of erllama. There is one NIF (`erllama_nif`) that holds the
+entire native surface (cache pipeline + future llama.cpp wrappers).
+
+Authoritative design: `plans/golden-finding-horizon.md`. The
 implementation roadmap at the bottom of the plan defines the build
 order; do not skip ahead.
 
@@ -54,13 +62,7 @@ rebar3 ex_doc                                     # Generate docs
 
 ## Architecture
 
-### Application boundaries
-
-`erllama_cache` is consumed by `erllama` via gen_server / NIF calls;
-it has no inverse dependency. Treat them as separate hex packages
-even though they currently share a repo.
-
-### Cache subsystem (`erllama_cache`)
+### Cache subsystem (`erllama_cache_*` modules)
 
 ```
 erllama_cache_sup
@@ -112,9 +114,9 @@ response.
 
 ### Test Organization
 
-- `apps/<app>/test/<mod>_tests.erl`: EUnit unit tests
-- `apps/<app>/test/prop_<mod>.erl`: PropEr property-based tests
-- `apps/<app>/test/<feature>_SUITE.erl`: Common Test suites
+- `test/<mod>_tests.erl`: EUnit unit tests
+- `test/prop_<mod>.erl`: PropEr property-based tests
+- `test/<feature>_SUITE.erl`: Common Test suites
 
 ## Linting Notes
 
