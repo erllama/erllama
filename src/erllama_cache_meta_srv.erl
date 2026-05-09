@@ -48,7 +48,7 @@
     gc/0,
     dump/0,
     dump/1,
-    insert_available/4
+    insert_available/5
 ]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -145,17 +145,20 @@ announce_saved(Key, Token, Size, Header) when is_reference(Token), is_binary(Hea
 cancel_reservation(Key, Token) when is_reference(Token) ->
     gen_server:call(?SERVER, {cancel_reservation, Key, Token}).
 
-%% Direct insertion of an `available` row, used by the RAM tier which
-%% has no on-disk publish step (the slab lives in an ETS table; there
-%% is nothing to validate or rename).
+%% Direct insertion of an `available` row. Used by the RAM tier
+%% (which has no on-disk publish step) and by the disk tier on-start
+%% scan to register pre-existing valid files.
 -spec insert_available(
     erllama_cache:cache_key(),
     erllama_cache:tier(),
     non_neg_integer(),
-    binary()
+    binary(),
+    term()
 ) -> ok.
-insert_available(Key, Tier, Size, Header) ->
-    gen_server:call(?SERVER, {insert_available, Key, Tier, Size, Header}).
+insert_available(Key, Tier, Size, Header, Location) ->
+    gen_server:call(
+        ?SERVER, {insert_available, Key, Tier, Size, Header, Location}
+    ).
 
 -spec gc() -> {evicted, non_neg_integer()}.
 gc() ->
@@ -255,7 +258,9 @@ handle_call({announce_saved, Key, Token, Size, Header}, _From, S) ->
     case maps:get(Key, S#state.reservations, undefined) of
         #reservation{token = Token, monref = MonRef, tier = Tier, path = Path} ->
             erlang:demonitor(MonRef, [flush]),
-            install_available_row(Key, Tier, Size, Header, location_for(Tier, Path)),
+            install_available_row(
+                Key, Tier, Size, Header, location_for(Tier, Path)
+            ),
             S1 = S#state{reservations = maps:remove(Key, S#state.reservations)},
             S2 = notify_waiters(Key, S1),
             {reply, ok, S2};
@@ -272,8 +277,8 @@ handle_call({cancel_reservation, Key, Token}, _From, S) ->
         _ ->
             {reply, ok, S}
     end;
-handle_call({insert_available, Key, Tier, Size, Header}, _From, S) ->
-    install_available_row(Key, Tier, Size, Header, location_for(Tier, undefined)),
+handle_call({insert_available, Key, Tier, Size, Header, Location}, _From, S) ->
+    install_available_row(Key, Tier, Size, Header, Location),
     S1 = notify_waiters(Key, S),
     {reply, ok, S1};
 handle_call(gc, _From, S) ->

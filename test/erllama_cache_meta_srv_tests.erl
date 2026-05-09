@@ -57,7 +57,7 @@ lookup_exact_miss_test() ->
 
 insert_available_makes_lookup_hit_test() ->
     with_srv(fun() ->
-        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
         {ok, Row} = erllama_cache_meta_srv:lookup_exact(key(1)),
         ?assertEqual(key(1), element(?POS_KEY, Row)),
         ?assertEqual(ram, element(?POS_TIER, Row)),
@@ -71,7 +71,7 @@ insert_available_makes_lookup_hit_test() ->
 
 checkout_increments_refcount_test() ->
     with_srv(fun() ->
-        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
         {ok, Ref, ram, _Loc, <<"H">>, _Tokens} =
             erllama_cache_meta_srv:checkout(key(1), self()),
         {ok, Row} = erllama_cache_meta_srv:dump(key(1)),
@@ -88,7 +88,7 @@ checkout_misses_unknown_key_test() ->
 
 checkout_two_holders_independent_refcounts_test() ->
     with_srv(fun() ->
-        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
         Parent = self(),
         Pid =
             spawn(fun() ->
@@ -121,7 +121,7 @@ checkin_unknown_ref_is_noop_test() ->
 
 down_decrements_refcount_test() ->
     with_srv(fun() ->
-        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
         Parent = self(),
         _Pid =
             spawn(fun() ->
@@ -149,7 +149,7 @@ reserve_creates_writing_row_test() ->
 
 reserve_rejects_already_present_test() ->
     with_srv(fun() ->
-        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
         ?assertEqual(
             {error, already_present},
             erllama_cache_meta_srv:reserve_save(key(1), disk, self())
@@ -306,7 +306,7 @@ down_post_link_with_invalid_file_deletes_and_clears_test() ->
 
 wait_returns_immediately_on_available_test() ->
     with_srv(fun() ->
-        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
         {ok, _Row} = erllama_cache_meta_srv:lookup_exact_or_wait(key(1), 100)
     end).
 
@@ -371,8 +371,8 @@ wait_replies_when_save_publishes_test() ->
 
 gc_evicts_unreferenced_rows_test() ->
     with_srv(fun() ->
-        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>),
-        ok = erllama_cache_meta_srv:insert_available(key(2), ram, 200, <<"H2">>),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>, {ram}),
+        ok = erllama_cache_meta_srv:insert_available(key(2), ram, 200, <<"H2">>, {ram}),
         {evicted, N} = erllama_cache_meta_srv:gc(),
         ?assertEqual(2, N),
         ?assertEqual(miss, erllama_cache_meta_srv:lookup_exact(key(1))),
@@ -381,8 +381,8 @@ gc_evicts_unreferenced_rows_test() ->
 
 gc_skips_referenced_rows_test() ->
     with_srv(fun() ->
-        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>),
-        ok = erllama_cache_meta_srv:insert_available(key(2), ram, 200, <<"H2">>),
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H1">>, {ram}),
+        ok = erllama_cache_meta_srv:insert_available(key(2), ram, 200, <<"H2">>, {ram}),
         {ok, _Ref, _, _, _, _} = erllama_cache_meta_srv:checkout(key(1), self()),
         {evicted, N} = erllama_cache_meta_srv:gc(),
         ?assertEqual(1, N),

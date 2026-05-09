@@ -23,7 +23,7 @@
 %% @end
 -module(erllama_nif).
 
--export([crc32c/1, kv_pack/3, kv_unpack/3]).
+-export([crc32c/1, kv_pack/3, kv_unpack/3, fsync_dir/1]).
 
 -on_load(init/0).
 
@@ -51,6 +51,12 @@ kv_pack(Ctx, Tokens, NTokens) -> nif_kv_pack(Ctx, Tokens, NTokens).
     ok | {error, term()}.
 kv_unpack(Ctx, Bin, SeqId) -> nif_kv_unpack(Ctx, Bin, SeqId).
 
+%% @doc fsync(2) on a directory. Used by the disk tier to make
+%% link/unlink durable across a kernel crash. Path must be 1..4096
+%% bytes; longer values raise badarg.
+-spec fsync_dir(iodata()) -> ok | {error, atom()}.
+fsync_dir(Path) -> nif_fsync_dir(Path).
+
 %% =============================================================================
 %% NIF stubs (replaced at on_load time)
 %% =============================================================================
@@ -62,4 +68,7 @@ nif_kv_pack(_Ctx, _Tokens, _NTokens) ->
     erlang:nif_error(nif_not_loaded).
 
 nif_kv_unpack(_Ctx, _Bin, _SeqId) ->
+    erlang:nif_error(nif_not_loaded).
+
+nif_fsync_dir(_Path) ->
     erlang:nif_error(nif_not_loaded).

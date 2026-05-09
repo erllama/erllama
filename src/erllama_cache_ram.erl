@@ -31,7 +31,9 @@ start_link() ->
 -spec put(erllama_cache:cache_key(), binary(), binary()) -> ok.
 put(Key, Slab, Header) when is_binary(Slab), is_binary(Header) ->
     ets:insert(?SLABS, {Key, Slab}),
-    erllama_cache_meta_srv:insert_available(Key, ram, byte_size(Slab), Header).
+    erllama_cache_meta_srv:insert_available(
+        Key, ram, byte_size(Slab), Header, {ram}
+    ).
 
 -spec load(erllama_cache:cache_key()) -> {ok, binary()} | miss.
 load(Key) ->
