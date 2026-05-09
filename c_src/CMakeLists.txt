@@ -73,6 +73,7 @@ endif()
 # -----------------------------------------------------------------------------
 add_library(erllama_nif SHARED
     erllama_nif.c
+    erllama_safe.cpp
     crc32c.c
 )
 
@@ -87,9 +88,16 @@ target_include_directories(erllama_nif PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/llama.cpp/ggml/include
 )
 
+# pthread is used by erllama_nif.c for per-resource mutexes; depend
+# on the standard CMake Threads find module so toolchains that need
+# -pthread (e.g. some Linux distros) get it added.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 target_link_libraries(erllama_nif PRIVATE
     llama
     ggml
+    Threads::Threads
 )
 
 # Erlang NIFs need this dance for symbol resolution.
