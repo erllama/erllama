@@ -24,7 +24,16 @@
         {evict_save_timeout_ms, 30000},
         {session_resume_wait_ms, 500},
         {fingerprint_mode, safe},
-        {disk_io, auto}
+        {disk_io, auto},
+        {scheduler, #{
+            enabled => false,
+            pressure_source => noop,
+            interval_ms => 5000,
+            high_watermark => 0.85,
+            low_watermark => 0.75,
+            min_evict_bytes => 1048576,
+            evict_tiers => [ram, ram_file]
+        }}
     ]},
     {modules, []},
     {licenses, ["Apache-2.0"]},

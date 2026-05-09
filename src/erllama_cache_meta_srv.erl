@@ -46,6 +46,8 @@
     cancel_reservation/2,
     %% Operator/test helpers
     gc/0,
+    evict_bytes/1,
+    evict_bytes/2,
     dump/0,
     dump/1,
     insert_available/5
@@ -163,6 +165,22 @@ insert_available(Key, Tier, Size, Header, Location) ->
 -spec gc() -> {evicted, non_neg_integer()}.
 gc() ->
     gen_server:call(?SERVER, gc).
+
+%% @doc Evict oldest available rows until at least `TargetBytes` have
+%% been freed (or no more candidates remain). Returns the number of
+%% rows evicted and the bytes actually freed.
+-spec evict_bytes(non_neg_integer()) ->
+    {evicted, non_neg_integer(), non_neg_integer()}.
+evict_bytes(TargetBytes) ->
+    evict_bytes(TargetBytes, all).
+
+%% @doc Evict oldest available rows whose tier is in `Tiers` until at
+%% least `TargetBytes` have been freed. `Tiers = all` matches every
+%% tier; otherwise it must be a list drawn from `[ram, ram_file, disk]`.
+-spec evict_bytes(non_neg_integer(), all | [erllama_cache:tier()]) ->
+    {evicted, non_neg_integer(), non_neg_integer()}.
+evict_bytes(TargetBytes, Tiers) when is_integer(TargetBytes), TargetBytes >= 0 ->
+    gen_server:call(?SERVER, {evict_bytes, TargetBytes, Tiers}).
 
 -spec dump() -> [tuple()].
 dump() ->
@@ -284,6 +302,9 @@ handle_call({insert_available, Key, Tier, Size, Header, Location}, _From, S) ->
 handle_call(gc, _From, S) ->
     Evicted = run_eviction(),
     {reply, {evicted, Evicted}, S};
+handle_call({evict_bytes, Target, Tiers}, _From, S) ->
+    {N, Bytes} = run_eviction_bytes(Target, tier_pred(Tiers)),
+    {reply, {evicted, N, Bytes}, S};
 handle_call(_Msg, _From, S) ->
     {reply, {error, unknown_call}, S}.
 
@@ -542,24 +563,57 @@ run_eviction('$end_of_table', N) ->
     N;
 run_eviction({_LastUsed, Key} = LruKey, N) ->
     Next = ets:next(?TBL_LRU, LruKey),
+    case try_evict_one(LruKey, Key) of
+        {ok, _Bytes} -> run_eviction(Next, N + 1);
+        skip -> run_eviction(Next, N);
+        gone -> run_eviction(Next, N)
+    end.
+
+run_eviction_bytes(Target, TierPred) ->
+    run_eviction_bytes(ets:first(?TBL_LRU), Target, TierPred, 0, 0).
+
+run_eviction_bytes('$end_of_table', _Target, _TierPred, N, Bytes) ->
+    {N, Bytes};
+run_eviction_bytes(_LruKey, Target, _TierPred, N, Bytes) when
+    Bytes >= Target, Target > 0
+->
+    {N, Bytes};
+run_eviction_bytes({_LastUsed, Key} = LruKey, Target, TierPred, N, Bytes) ->
+    Next = ets:next(?TBL_LRU, LruKey),
+    case try_evict_one(LruKey, Key, TierPred) of
+        {ok, B} -> run_eviction_bytes(Next, Target, TierPred, N + 1, Bytes + B);
+        skip -> run_eviction_bytes(Next, Target, TierPred, N, Bytes);
+        gone -> run_eviction_bytes(Next, Target, TierPred, N, Bytes)
+    end.
+
+try_evict_one(LruKey, Key) ->
+    try_evict_one(LruKey, Key, fun(_) -> true end).
+
+try_evict_one(LruKey, Key, TierPred) ->
     case ets:lookup(?TBL_META, Key) of
         [Row] ->
-            case {element(?POS_STATUS, Row), element(?POS_REFCOUNT, Row)} of
-                {available, 0} ->
-                    Tier = element(?POS_TIER, Row),
+            Tier = element(?POS_TIER, Row),
+            case {element(?POS_STATUS, Row), element(?POS_REFCOUNT, Row), TierPred(Tier)} of
+                {available, 0, true} ->
                     Location = element(?POS_LOCATION, Row),
+                    Size = element(?POS_SIZE, Row),
                     delete_from_tier(Tier, Key, Location),
                     ets:delete(?TBL_LRU, LruKey),
                     ets:delete(?TBL_META, Key),
                     erllama_cache_counters:incr(?C_EVICTIONS),
-                    run_eviction(Next, N + 1);
+                    {ok, Size};
                 _ ->
-                    run_eviction(Next, N)
+                    skip
             end;
         [] ->
             ets:delete(?TBL_LRU, LruKey),
-            run_eviction(Next, N)
+            gone
     end.
+
+tier_pred(all) ->
+    fun(_) -> true end;
+tier_pred(Tiers) when is_list(Tiers) ->
+    fun(T) -> lists:member(T, Tiers) end.
 
 delete_from_tier(ram, Key, _Loc) ->
     erllama_cache_ram:delete(Key);

@@ -11,7 +11,7 @@
 %% @end
 -module(erllama_cache).
 
--export([get_counters/0, reset_counters/0]).
+-export([get_counters/0, reset_counters/0, gc/0, evict_bytes/1, evict_bytes/2]).
 
 -export_type([
     cache_key/0,
@@ -32,6 +32,28 @@ get_counters() ->
 -spec reset_counters() -> ok.
 reset_counters() ->
     erllama_cache_counters:reset().
+
+%% @doc Synchronous full eviction pass. Walks the LRU and drops every
+%% available row with `refcount = 0`. Returns the number evicted.
+-spec gc() -> {evicted, non_neg_integer()}.
+gc() ->
+    erllama_cache_meta_srv:gc().
+
+%% @doc Evict oldest available rows until at least `TargetBytes` have
+%% been freed. Returns `{evicted, NumRows, BytesFreed}`.
+-spec evict_bytes(non_neg_integer()) ->
+    {evicted, non_neg_integer(), non_neg_integer()}.
+evict_bytes(TargetBytes) ->
+    erllama_cache_meta_srv:evict_bytes(TargetBytes).
+
+%% @doc Like `evict_bytes/1`, but only considers rows whose tier is in
+%% `Tiers`. Pass `all` to match every tier, or a subset of
+%% `[ram, ram_file, disk]`. The system-pressure scheduler uses this to
+%% evict only RAM-resident slabs while leaving the disk tier alone.
+-spec evict_bytes(non_neg_integer(), all | [tier()]) ->
+    {evicted, non_neg_integer(), non_neg_integer()}.
+evict_bytes(TargetBytes, Tiers) ->
+    erllama_cache_meta_srv:evict_bytes(TargetBytes, Tiers).
 
 -type cache_key() :: <<_:256>>.
 -type tier() :: ram | ram_file | disk.

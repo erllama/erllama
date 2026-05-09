@@ -11,15 +11,29 @@ start_link() ->
 
 init([]) ->
     SupFlags = #{strategy => one_for_one, intensity => 5, period => 30},
-    Children = [erllama_cache_sup, erllama_model_sup],
-    {ok, {SupFlags, [child(Mod) || Mod <- Children]}}.
+    Children = [
+        sup_child(erllama_cache_sup),
+        sup_child(erllama_model_sup),
+        worker_child(erllama_scheduler)
+    ],
+    {ok, {SupFlags, Children}}.
 
-child(Mod) ->
+sup_child(Mod) ->
     #{
         id => Mod,
         start => {Mod, start_link, []},
         restart => permanent,
         shutdown => 5000,
         type => supervisor,
+        modules => [Mod]
+    }.
+
+worker_child(Mod) ->
+    #{
+        id => Mod,
+        start => {Mod, start_link, []},
+        restart => permanent,
+        shutdown => 5000,
+        type => worker,
         modules => [Mod]
     }.
