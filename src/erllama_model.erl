@@ -59,20 +59,16 @@
     ctx_params_hash :: <<_:256>>,
     context_size :: non_neg_integer(),
     policy :: erllama_cache_policy:config(),
+    %% Inference backend: erllama_model_stub | erllama_model_llama.
+    backend :: module(),
+    backend_state :: term(),
     %% Per-request fields
     caller :: gen_statem:from() | undefined,
     prompt_tokens :: [non_neg_integer()],
-    %% Tokens currently in the "context" (prompt prefix + generated).
-    %% In v0.1 this is a plain list; the real llama_context* arrives
-    %% with the kv_pack/kv_unpack NIFs.
+    %% Tokens currently in the "context".
     context_tokens :: [non_neg_integer()],
-    %% Tokens that the requested response should produce. Set by
-    %% complete/2 via Opts; defaults to a deterministic stub sequence.
     response_target :: pos_integer(),
-    %% Generated tokens accumulated so far.
     generated :: [non_neg_integer()],
-    %% Token count at the most recent save of any reason; used by the
-    %% policy to decide when continued saves should fire.
     last_save_at :: non_neg_integer()
 }).
 
@@ -125,25 +121,36 @@ shutdown(Model) ->
 callback_mode() -> state_functions.
 
 init([ModelId, Config]) ->
-    Data = #data{
-        model_id = ModelId,
-        tier_srv = maps:get(tier_srv, Config),
-        tier = maps:get(tier, Config),
-        fingerprint = maps:get(fingerprint, Config),
-        fingerprint_mode = maps:get(fingerprint_mode, Config, safe),
-        quant_type = maps:get(quant_type, Config, f16),
-        quant_bits = maps:get(quant_bits, Config, 16),
-        ctx_params_hash = maps:get(ctx_params_hash, Config),
-        context_size = maps:get(context_size, Config, 4096),
-        policy = maps:get(policy, Config),
-        prompt_tokens = [],
-        context_tokens = [],
-        response_target = 0,
-        generated = [],
-        last_save_at = 0
-    },
-    {ok, idle, Data}.
+    Backend = maps:get(backend, Config, erllama_model_stub),
+    case Backend:init(Config) of
+        {ok, BState} ->
+            Data = #data{
+                model_id = ModelId,
+                tier_srv = maps:get(tier_srv, Config),
+                tier = maps:get(tier, Config),
+                fingerprint = maps:get(fingerprint, Config),
+                fingerprint_mode = maps:get(fingerprint_mode, Config, safe),
+                quant_type = maps:get(quant_type, Config, f16),
+                quant_bits = maps:get(quant_bits, Config, 16),
+                ctx_params_hash = maps:get(ctx_params_hash, Config),
+                context_size = maps:get(context_size, Config, 4096),
+                policy = maps:get(policy, Config),
+                backend = Backend,
+                backend_state = BState,
+                prompt_tokens = [],
+                context_tokens = [],
+                response_target = 0,
+                generated = [],
+                last_save_at = 0
+            },
+            {ok, idle, Data};
+        {error, Reason} ->
+            {stop, Reason}
+    end.
 
+terminate(_Reason, _State, #data{backend = B, backend_state = S}) ->
+    B:terminate(S),
+    ok;
 terminate(_Reason, _State, _Data) ->
     ok.
 
@@ -152,7 +159,7 @@ terminate(_Reason, _State, _Data) ->
 %% =============================================================================
 
 idle({call, From}, {complete, Prompt, Opts}, Data) ->
-    PromptTokens = stub_tokenize(Prompt),
+    PromptTokens = backend_call(Data, tokenize, [Prompt]),
     ResponseTarget = maps:get(response_tokens, Opts, 4),
     ParentKey = maps:get(parent_key, Opts, undefined),
     Data1 = Data#data{
@@ -163,9 +170,7 @@ idle({call, From}, {complete, Prompt, Opts}, Data) ->
     },
     case lookup_or_resume(PromptTokens, ParentKey, Data1) of
         {warm, ContextTokens, RemainingTokens} ->
-            %% Already-prefilled state was loaded; finish prefill on
-            %% any tokens not covered, then jump to generating.
-            ok = stub_prefill(RemainingTokens),
+            ok = backend_call(Data1, prefill, [RemainingTokens]),
             Data2 = Data1#data{
                 context_tokens = ContextTokens ++ RemainingTokens
             },
@@ -217,18 +222,14 @@ handle_common(_State, _EventType, _EventContent, Data) ->
 %% =============================================================================
 
 enter_prefilling(Data) ->
-    %% Run "prefill" on the prompt, decide on cold save, advance to
-    %% generating. In v0.1 this is synchronous; with real llama.cpp
-    %% it would happen on a dirty CPU scheduler with the gen_statem
-    %% receiving a `prefill_done` event.
     Tokens = Data#data.prompt_tokens,
     case erllama_cache_policy:cold_save_split(Tokens, Data#data.policy) of
         {trim, TrimmedPrefix, RemainingTokens} ->
-            ok = stub_prefill(TrimmedPrefix),
+            ok = backend_call(Data, prefill, [TrimmedPrefix]),
             ok = fire_cold_save(TrimmedPrefix, Data),
-            ok = stub_prefill(RemainingTokens);
+            ok = backend_call(Data, prefill, [RemainingTokens]);
         no_save ->
-            ok = stub_prefill(Tokens)
+            ok = backend_call(Data, prefill, [Tokens])
     end,
     Data1 = Data#data{context_tokens = Tokens},
     enter_generating(Data1).
@@ -245,14 +246,39 @@ decode_step(Data) ->
         true ->
             finish_request(Data);
         false ->
-            Token = stub_decode_one(Data#data.context_tokens),
-            Data1 = Data#data{
-                context_tokens = Data#data.context_tokens ++ [Token],
-                generated = Data#data.generated ++ [Token]
-            },
-            Data2 = maybe_fire_continued(Data1),
-            {keep_state, Data2, [{next_event, internal, decode_step}]}
+            case backend_call(Data, decode_one, [Data#data.context_tokens]) of
+                {ok, Token} ->
+                    advance_with(Token, Data);
+                {eog, Token} ->
+                    Data1 = append_token(Token, Data),
+                    finish_request(Data1);
+                {error, _} = E ->
+                    From = Data#data.caller,
+                    Data1 = reset(Data),
+                    {next_state, idle, Data1, [{reply, From, E}]}
+            end
     end.
+
+advance_with(Token, Data) ->
+    Data1 = append_token(Token, Data),
+    Data2 = maybe_fire_continued(Data1),
+    {keep_state, Data2, [{next_event, internal, decode_step}]}.
+
+append_token(Token, Data) ->
+    Data#data{
+        context_tokens = Data#data.context_tokens ++ [Token],
+        generated = Data#data.generated ++ [Token]
+    }.
+
+reset(Data) ->
+    Data#data{
+        caller = undefined,
+        context_tokens = [],
+        prompt_tokens = [],
+        generated = [],
+        response_target = 0,
+        last_save_at = 0
+    }.
 
 maybe_fire_continued(Data) ->
     LiveCount = length(Data#data.context_tokens),
@@ -269,18 +295,10 @@ maybe_fire_continued(Data) ->
 
 finish_request(Data) ->
     ok = fire_finish_save(Data#data.context_tokens, Data),
-    Reply = stub_detokenize(Data#data.generated),
+    Reply = backend_call(Data, detokenize, [Data#data.generated]),
     From = Data#data.caller,
     Generated = Data#data.generated,
-    Data1 = Data#data{
-        caller = undefined,
-        context_tokens = [],
-        prompt_tokens = [],
-        generated = [],
-        response_target = 0,
-        last_save_at = 0
-    },
-    {next_state, idle, Data1, [{reply, From, {ok, Reply, Generated}}]}.
+    {next_state, idle, reset(Data), [{reply, From, {ok, Reply, Generated}}]}.
 
 %% =============================================================================
 %% Internal: cache integration
@@ -325,22 +343,29 @@ try_session_resume(PromptTokens, ParentKey, Data) ->
     end.
 
 load_tokens_from_row(Row, Data) ->
-    %% In v0.1 the "kv state" is just the token list serialised via
-    %% erllama_cache_key:encode_tokens. Real kv_unpack lands at step
-    %% 2b and replaces this load path.
     Tier = element(?POS_TIER, Row),
     Key = element(?POS_KEY, Row),
-    case Tier of
-        ram ->
-            case erllama_cache_ram:load(Key) of
-                {ok, Bin} -> erllama_cache_key:decode_tokens(Bin);
-                miss -> []
-            end;
-        _ ->
-            case erllama_cache_disk_srv:load(Data#data.tier_srv, Key) of
-                {ok, _Info, Payload} -> erllama_cache_key:decode_tokens(Payload);
-                _ -> []
-            end
+    Bin =
+        case Tier of
+            ram ->
+                case erllama_cache_ram:load(Key) of
+                    {ok, B} -> B;
+                    miss -> <<>>
+                end;
+            _ ->
+                case erllama_cache_disk_srv:load(Data#data.tier_srv, Key) of
+                    {ok, _Info, Payload} -> Payload;
+                    _ -> <<>>
+                end
+        end,
+    %% Hand the slab to the backend (real kv_unpack for llama; the
+    %% stub backend ignores the bytes and just returns ok). The
+    %% gen_statem also uses the decoded token list to track which
+    %% tokens are now in the context for future prefix checks.
+    _ = backend_call(Data, kv_unpack, [Bin]),
+    case Bin of
+        <<>> -> [];
+        _ -> erllama_cache_key:decode_tokens(Bin)
     end.
 
 fire_cold_save(TrimmedPrefix, Data) ->
@@ -357,7 +382,7 @@ fire_save_if(false, _Reason, _Tokens, _Data) ->
     ok;
 fire_save_if(true, Reason, Tokens, Data) ->
     BuildMeta = build_meta_for(Reason, Tokens, Data),
-    Payload = stub_kv_pack(Tokens),
+    Payload = backend_call(Data, kv_pack, [Tokens]),
     _ = erllama_cache_writer:save(
         Data#data.tier_srv, Data#data.tier, BuildMeta, Payload, 0
     ),
@@ -402,28 +427,8 @@ is_strict_prefix([H | T1], [H | T2]) -> is_strict_prefix(T1, T2);
 is_strict_prefix(_, _) -> false.
 
 %% =============================================================================
-%% Internal: model stubs (replaced by erllama_nif at step 2b)
+%% Internal: backend dispatch
 %% =============================================================================
 
-stub_tokenize(<<>>) ->
-    [];
-stub_tokenize(Prompt) when is_binary(Prompt) ->
-    [
-        erlang:phash2(W) rem (1 bsl 32)
-     || W <- binary:split(Prompt, <<" ">>, [global, trim_all]),
-        W =/= <<>>
-    ].
-
-stub_detokenize(Tokens) ->
-    list_to_binary(
-        lists:join(<<" ">>, [integer_to_binary(T) || T <- Tokens])
-    ).
-
-stub_prefill(_Tokens) ->
-    ok.
-
-stub_decode_one(ContextTokens) ->
-    erlang:phash2({decode, ContextTokens}) rem (1 bsl 32).
-
-stub_kv_pack(Tokens) ->
-    erllama_cache_key:encode_tokens(Tokens).
+backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
+    apply(Mod, Fn, [S | Args]).

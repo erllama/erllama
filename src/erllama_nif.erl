@@ -28,6 +28,9 @@
     new_context/2,
     free_context/1,
     tokenize/3,
+    detokenize/2,
+    prefill/2,
+    decode_one/1,
     kv_pack/3,
     kv_unpack/3
 ]).
@@ -78,6 +81,16 @@ free_context(Ctx) -> nif_free_context(Ctx).
 -spec tokenize(model_ref(), iodata(), map()) -> [token_id()] | {error, atom()}.
 tokenize(Model, Text, Opts) when is_map(Opts) -> nif_tokenize(Model, Text, Opts).
 
+-spec detokenize(model_ref(), [token_id()]) -> binary() | {error, atom()}.
+detokenize(Model, Tokens) -> nif_detokenize(Model, Tokens).
+
+-spec prefill(context_ref(), [token_id()]) -> ok | {error, term()}.
+prefill(Ctx, Tokens) -> nif_prefill(Ctx, Tokens).
+
+-spec decode_one(context_ref()) ->
+    {ok, token_id()} | {eog, token_id()} | {error, term()}.
+decode_one(Ctx) -> nif_decode_one(Ctx).
+
 -spec kv_pack(context_ref(), [token_id()], non_neg_integer()) ->
     binary() | {error, atom()}.
 kv_pack(Ctx, Tokens, NTokens) -> nif_kv_pack(Ctx, Tokens, NTokens).
@@ -97,5 +110,8 @@ nif_free_model(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_new_context(_Model, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_free_context(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_tokenize(_Model, _Text, _Opts) -> erlang:nif_error(nif_not_loaded).
+nif_detokenize(_Model, _Tokens) -> erlang:nif_error(nif_not_loaded).
+nif_prefill(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
+nif_decode_one(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_kv_pack(_Ctx, _Tokens, _NTokens) -> erlang:nif_error(nif_not_loaded).
 nif_kv_unpack(_Ctx, _Bin, _SeqId) -> erlang:nif_error(nif_not_loaded).

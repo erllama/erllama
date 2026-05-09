@@ -432,6 +432,165 @@ static ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
 }
 
 /* =========================================================================
+ * Prefill / decode_one / detokenize
+ * ========================================================================= */
+
+static int read_token_list(ErlNifEnv *env, ERL_NIF_TERM list,
+                           llama_token **out, int32_t *out_len) {
+    unsigned int n;
+    if (!enif_get_list_length(env, list, &n)) return 0;
+    if (n == 0) {
+        *out = NULL;
+        *out_len = 0;
+        return 1;
+    }
+    llama_token *toks = enif_alloc(sizeof(llama_token) * n);
+    if (!toks) return 0;
+    ERL_NIF_TERM head, tail = list;
+    unsigned int i = 0;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        int v;
+        if (!enif_get_int(env, head, &v)) {
+            enif_free(toks);
+            return 0;
+        }
+        toks[i++] = (llama_token) v;
+    }
+    *out = toks;
+    *out_len = (int32_t) n;
+    return 1;
+}
+
+static ERL_NIF_TERM nif_prefill(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    if (!c->ctx) {
+        return enif_make_tuple2(env, atom_error, atom_context_failed);
+    }
+    llama_token *tokens = NULL;
+    int32_t n = 0;
+    if (!read_token_list(env, argv[1], &tokens, &n)) {
+        return enif_make_badarg(env);
+    }
+    if (n == 0) {
+        if (tokens) enif_free(tokens);
+        return atom_ok;
+    }
+    struct llama_batch batch = llama_batch_get_one(tokens, n);
+    int rc = llama_decode(c->ctx, batch);
+    enif_free(tokens);
+    if (rc != 0) {
+        return enif_make_tuple2(env, atom_error, enif_make_int(env, rc));
+    }
+    return atom_ok;
+}
+
+static ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    if (!c->ctx) {
+        return enif_make_tuple2(env, atom_error, atom_context_failed);
+    }
+
+    /* Build a one-shot greedy sampler chain. */
+    struct llama_sampler_chain_params sp = llama_sampler_chain_default_params();
+    struct llama_sampler *smpl = llama_sampler_chain_init(sp);
+    if (!smpl) {
+        return enif_make_tuple2(env, atom_error, enif_make_atom(env, "sampler_failed"));
+    }
+    llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
+
+    llama_token tok = llama_sampler_sample(smpl, c->ctx, -1);
+    llama_sampler_accept(smpl, tok);
+    llama_sampler_free(smpl);
+
+    const struct llama_model *model = llama_get_model(c->ctx);
+    const struct llama_vocab *vocab = llama_model_get_vocab(model);
+    int eog = llama_vocab_is_eog(vocab, tok) ? 1 : 0;
+
+    /* Advance the context by decoding the sampled token. */
+    llama_token tok_buf = tok;
+    struct llama_batch batch = llama_batch_get_one(&tok_buf, 1);
+    int rc = llama_decode(c->ctx, batch);
+    if (rc != 0) {
+        return enif_make_tuple2(env, atom_error, enif_make_int(env, rc));
+    }
+
+    ERL_NIF_TERM tag = eog ? enif_make_atom(env, "eog") : atom_ok;
+    return enif_make_tuple2(env, tag, enif_make_int(env, tok));
+}
+
+static ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    if (!m->model) {
+        return enif_make_tuple2(env, atom_error, atom_load_failed);
+    }
+    const struct llama_vocab *vocab = llama_model_get_vocab(m->model);
+
+    llama_token *tokens = NULL;
+    int32_t n = 0;
+    if (!read_token_list(env, argv[1], &tokens, &n)) {
+        return enif_make_badarg(env);
+    }
+    if (n == 0) {
+        if (tokens) enif_free(tokens);
+        ErlNifBinary empty;
+        enif_alloc_binary(0, &empty);
+        return enif_make_binary(env, &empty);
+    }
+
+    /* Per-token piece, concatenated. Allocate a generous per-token
+     * buffer; piece sizes are typically small. */
+    char piece[256];
+    /* Worst case ~256 bytes per token; actual runs are much smaller. */
+    size_t cap = (size_t) n * 32 + 16;
+    char *out = enif_alloc(cap);
+    if (!out) {
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, enif_make_atom(env, "alloc_failed"));
+    }
+    size_t used = 0;
+    for (int32_t i = 0; i < n; i++) {
+        int32_t got = llama_token_to_piece(
+            vocab, tokens[i], piece, (int32_t) sizeof(piece), 0, false);
+        if (got < 0) {
+            /* Token's piece doesn't fit in 256 bytes — extremely rare;
+             * skip. */
+            continue;
+        }
+        if (used + (size_t) got > cap) {
+            cap = (used + (size_t) got) * 2;
+            char *new_out = enif_realloc(out, cap);
+            if (!new_out) {
+                enif_free(out);
+                enif_free(tokens);
+                return enif_make_tuple2(env, atom_error, enif_make_atom(env, "alloc_failed"));
+            }
+            out = new_out;
+        }
+        memcpy(out + used, piece, (size_t) got);
+        used += (size_t) got;
+    }
+    enif_free(tokens);
+
+    ErlNifBinary outbin;
+    enif_alloc_binary(used, &outbin);
+    memcpy(outbin.data, out, used);
+    enif_free(out);
+    return enif_make_binary(env, &outbin);
+}
+
+/* =========================================================================
  * fsync_dir (existing)
  * ========================================================================= */
 
@@ -502,7 +661,10 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_free_model",   1, nif_free_model,   0},
     {"nif_new_context",  2, nif_new_context,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_free_context", 1, nif_free_context, 0},
-    {"nif_tokenize",     3, nif_tokenize,     ERL_NIF_DIRTY_JOB_CPU_BOUND}
+    {"nif_tokenize",     3, nif_tokenize,     ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_prefill",      2, nif_prefill,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_decode_one",   1, nif_decode_one,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_detokenize",   2, nif_detokenize,   ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, NULL)
