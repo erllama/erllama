@@ -1,31 +1,43 @@
 %% @doc
-%% File-tier save orchestrator with an ETS-backed counting semaphore.
+%% File-tier save orchestrator with a leak-proof ETS counting
+%% semaphore.
 %%
 %% Modelled on `py_semaphore` from erlang-python (Discord pattern):
-%% one ETS table holding `{running, N}` and `{max, M}` counters,
-%% atomic `update_counter` for both directions, exponential backoff
-%% on contention, saturating decrement on release so a buggy or
-%% double-release cannot drive the counter negative.
+%% one ETS table holding `{running, N}` and `{max, M}` counters;
+%% atomic `update_counter` for fast inspection from any process.
+%%
+%% Unlike the bare ETS pattern, this module also runs a small
+%% gen_server that owns the holders map and monitors every active
+%% acquirer. If a holder dies between acquire and release (SIGKILL,
+%% process crash, etc.), the gen_server's `'DOWN'` handler releases
+%% the slot. No leaks.
+%%
+%% Hot path:
+%%
+%%   `current/0` and `max_concurrent/0` read ETS directly
+%%   (no server hop).
+%%   `acquire/1` and `release/0` go through this gen_server, which
+%%   serialises monitor bookkeeping. Per-call overhead is roughly
+%%   one gen_server hop (~1 us); for save paths measured in
+%%   seconds this is invisible.
 %%
 %% Save pipeline run by `save/4` in the caller's process:
 %%
-%%   acquire (ETS counter, blocking with backoff up to AcquireTimeoutMs)
+%%   acquire (with backoff up to AcquireTimeoutMs)
 %%   meta_srv:reserve_save -> Token
 %%   disk_srv:save (returns once the file is linked + validated)
 %%   meta_srv:announce_saved -> available
-%%   release
+%%   release (try/after)
 %%
-%% A `try/after` releases the slot on normal exits and exceptions.
-%% A SIGKILL of the caller mid-save still leaks a slot, but the
-%% saturating release means the leak does not corrupt subsequent
-%% releases; counters can only drift upward, recovered by
-%% `set_max_concurrent/1` or restart.
+%% A `try/after` releases on normal exits and exceptions; the
+%% gen_server's monitor catches everything else.
 %% @end
 -module(erllama_cache_writer).
+-behaviour(gen_server).
 
 -export([
-    init/0,
-    init/1,
+    start_link/0,
+    start_link/1,
     save/4,
     save/5,
     acquire/1,
@@ -35,39 +47,35 @@
     set_max_concurrent/1
 ]).
 
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2]).
+
+-define(SERVER, ?MODULE).
 -define(TABLE, erllama_cache_writer_sem).
 -define(COUNTER_KEY, running).
 -define(MAX_KEY, max).
 -define(BACKOFF_MS, 5).
 -define(MAX_BACKOFF_MS, 50).
 -define(DEFAULT_TIMEOUT_MS, 30000).
+-define(SLOT_PD_KEY, {?MODULE, slot}).
+
+-record(state, {
+    %% MonRef -> CallerPid; one entry per active acquire
+    holders = #{} :: #{reference() => pid()}
+}).
+
+-type state() :: #state{}.
 
 %% =============================================================================
-%% Public API: semaphore lifecycle
+%% Public API: lifecycle
 %% =============================================================================
 
-%% @doc Initialise the semaphore with a sensible default
-%% (`schedulers * 2 + 1`). Idempotent.
--spec init() -> ok.
-init() ->
-    init(default_max_concurrent()).
+-spec start_link() -> {ok, pid()} | {error, term()}.
+start_link() ->
+    start_link(default_max_concurrent()).
 
--spec init(pos_integer()) -> ok.
-init(Max) when is_integer(Max), Max > 0 ->
-    case ets:whereis(?TABLE) of
-        undefined ->
-            _ = ets:new(?TABLE, [
-                named_table,
-                public,
-                {write_concurrency, true},
-                {read_concurrency, true}
-            ]),
-            ets:insert(?TABLE, [{?COUNTER_KEY, 0}, {?MAX_KEY, Max}]),
-            ok;
-        _Tid ->
-            ets:insert(?TABLE, {?MAX_KEY, Max}),
-            ok
-    end.
+-spec start_link(pos_integer()) -> {ok, pid()} | {error, term()}.
+start_link(Max) when is_integer(Max), Max > 0 ->
+    gen_server:start_link({local, ?SERVER}, ?MODULE, [Max], []).
 
 -spec current() -> non_neg_integer().
 current() ->
@@ -88,22 +96,27 @@ set_max_concurrent(Max) when is_integer(Max), Max > 0 ->
     ets:insert(?TABLE, {?MAX_KEY, Max}),
     ok.
 
+%% =============================================================================
+%% Public API: semaphore
+%% =============================================================================
+
 %% @doc Try to acquire a slot. Blocks with exponential backoff up
-%% to `Timeout` milliseconds. Returns `ok` or
-%% `{error, max_concurrent}` on timeout.
+%% to `Timeout` milliseconds. On success the holder ref is stashed
+%% in the process dictionary so `release/0` finds it.
 -spec acquire(timeout()) -> ok | {error, max_concurrent}.
 acquire(infinity) ->
     acquire_loop(infinity, 0, ?BACKOFF_MS);
 acquire(Timeout) when is_integer(Timeout), Timeout >= 0 ->
-    Start = erlang:monotonic_time(millisecond),
-    acquire_loop(Timeout, Start, ?BACKOFF_MS).
+    acquire_loop(Timeout, erlang:monotonic_time(millisecond), ?BACKOFF_MS).
 
 -spec release() -> ok.
 release() ->
-    %% Saturating decrement: {Pos, Inc, Threshold, SetValue}.
-    %% If a buggy double-release would push below 0, snap back to 0.
-    _ = ets:update_counter(?TABLE, ?COUNTER_KEY, {2, -1, 0, 0}),
-    ok.
+    case erase(?SLOT_PD_KEY) of
+        Ref when is_reference(Ref) ->
+            gen_server:call(?SERVER, {release, Ref});
+        undefined ->
+            ok
+    end.
 
 %% =============================================================================
 %% Public API: save pipeline
@@ -140,19 +153,74 @@ save(TierSrv, Tier, BuildMeta, Payload, AcquireTimeout) when
     end.
 
 %% =============================================================================
-%% Internal: semaphore loop
+%% gen_server callbacks
 %% =============================================================================
 
--spec acquire_loop(timeout(), integer(), pos_integer()) ->
-    ok | {error, max_concurrent}.
-acquire_loop(Timeout, Start, Backoff) ->
+-spec init([pos_integer()]) -> {ok, state()}.
+init([Max]) ->
+    case ets:whereis(?TABLE) of
+        undefined ->
+            _ = ets:new(?TABLE, [
+                named_table,
+                public,
+                {write_concurrency, true},
+                {read_concurrency, true}
+            ]),
+            ets:insert(?TABLE, [{?COUNTER_KEY, 0}, {?MAX_KEY, Max}]);
+        _Tid ->
+            ets:insert(?TABLE, {?COUNTER_KEY, 0}),
+            ets:insert(?TABLE, {?MAX_KEY, Max})
+    end,
+    {ok, #state{}}.
+
+handle_call({try_acquire, Pid}, _From, S) ->
     Max = max_concurrent(),
-    N = ets:update_counter(?TABLE, ?COUNTER_KEY, {2, 1}),
-    case N =< Max of
-        true ->
+    case ets:update_counter(?TABLE, ?COUNTER_KEY, {2, 1}) of
+        N when N =< Max ->
+            Ref = erlang:monitor(process, Pid),
+            {reply, {ok, Ref}, S#state{holders = (S#state.holders)#{Ref => Pid}}};
+        _ ->
+            decr(),
+            {reply, {error, busy}, S}
+    end;
+handle_call({release, Ref}, _From, S) ->
+    case maps:take(Ref, S#state.holders) of
+        {_Pid, Holders1} ->
+            erlang:demonitor(Ref, [flush]),
+            decr(),
+            {reply, ok, S#state{holders = Holders1}};
+        error ->
+            %% Stale release (already cleaned up by 'DOWN').
+            {reply, ok, S}
+    end;
+handle_call(_Msg, _From, S) ->
+    {reply, {error, unknown_call}, S}.
+
+-spec handle_cast(term(), state()) -> {noreply, state()}.
+handle_cast(_Msg, S) ->
+    {noreply, S}.
+
+handle_info({'DOWN', Ref, process, _DownPid, _Reason}, S) ->
+    case maps:take(Ref, S#state.holders) of
+        {_HolderPid, Holders1} ->
+            decr(),
+            {noreply, S#state{holders = Holders1}};
+        error ->
+            {noreply, S}
+    end;
+handle_info(_Msg, S) ->
+    {noreply, S}.
+
+%% =============================================================================
+%% Internal: acquire loop
+%% =============================================================================
+
+acquire_loop(Timeout, Start, Backoff) ->
+    case gen_server:call(?SERVER, {try_acquire, self()}) of
+        {ok, Ref} ->
+            put(?SLOT_PD_KEY, Ref),
             ok;
-        false ->
-            release(),
+        {error, busy} ->
             case check_timeout(Timeout, Start) of
                 continue ->
                     Jitter = rand:uniform(Backoff div 2 + 1),
@@ -170,6 +238,11 @@ check_timeout(Timeout, Start) ->
         true -> timeout;
         false -> continue
     end.
+
+decr() ->
+    %% Saturating decrement of the counter; clamps at 0.
+    _ = ets:update_counter(?TABLE, ?COUNTER_KEY, {2, -1, 0, 0}),
+    ok.
 
 -spec default_max_concurrent() -> pos_integer().
 default_max_concurrent() ->

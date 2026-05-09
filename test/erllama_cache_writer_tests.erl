@@ -7,14 +7,11 @@ with_writer(Max, Body) ->
     {ok, _} = erllama_cache_ram:start_link(),
     Dir = make_tmp_dir(),
     {ok, _} = erllama_cache_disk_srv:start_link(test_disk, Dir),
-    ok = erllama_cache_writer:init(Max),
-    %% init/1 is idempotent against the persisted ETS table; reset
-    %% the counter explicitly between tests so a leak from an
-    %% earlier failure cannot bleed into the next case.
-    ets:insert(erllama_cache_writer_sem, {running, 0}),
+    {ok, _} = erllama_cache_writer:start_link(Max),
     try
         Body(Dir)
     after
+        catch gen_server:stop(erllama_cache_writer),
         catch gen_server:stop(test_disk),
         catch gen_server:stop(erllama_cache_ram),
         catch gen_server:stop(erllama_cache_meta_srv),
@@ -122,6 +119,29 @@ release_saturates_at_zero_test() ->
         ok = erllama_cache_writer:release(),
         ok = erllama_cache_writer:release(),
         ?assertEqual(0, erllama_cache_writer:current())
+    end).
+
+down_releases_slot_no_leak_test() ->
+    with_writer(1, fun(_Dir) ->
+        Parent = self(),
+        Pid =
+            spawn(fun() ->
+                ok = erllama_cache_writer:acquire(infinity),
+                Parent ! pinned,
+                receive
+                    forever -> ok
+                end
+            end),
+        receive
+            pinned -> ok
+        end,
+        ?assertEqual(1, erllama_cache_writer:current()),
+        %% Kill the holder without releasing.
+        exit(Pid, kill),
+        wait_until(fun() -> erllama_cache_writer:current() =:= 0 end, 1000),
+        %% A subsequent acquire should succeed.
+        ok = erllama_cache_writer:acquire(100),
+        erllama_cache_writer:release()
     end).
 
 set_max_concurrent_takes_effect_test() ->
