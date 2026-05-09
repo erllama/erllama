@@ -15,8 +15,14 @@ init([]) ->
         intensity => 5,
         period => 30
     },
-    %% Children are added incrementally per the implementation roadmap
-    %% in plans/golden-finding-horizon.md. v0.1.0 ships an empty supervisor
-    %% so the application starts cleanly.
-    ChildSpecs = [],
+    ChildSpecs = [
+        #{
+            id => erllama_cache_meta_srv,
+            start => {erllama_cache_meta_srv, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [erllama_cache_meta_srv]
+        }
+    ],
     {ok, {SupFlags, ChildSpecs}}.
