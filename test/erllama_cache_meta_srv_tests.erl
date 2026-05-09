@@ -7,10 +7,12 @@
 %% =============================================================================
 
 with_srv(Body) ->
-    {ok, _Pid} = erllama_cache_meta_srv:start_link(),
+    {ok, _Meta} = erllama_cache_meta_srv:start_link(),
+    {ok, _Ram} = erllama_cache_ram:start_link(),
     try
         Body()
     after
+        catch gen_server:stop(erllama_cache_ram),
         catch gen_server:stop(erllama_cache_meta_srv)
     end.
 

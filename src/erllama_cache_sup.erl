@@ -23,6 +23,14 @@ init([]) ->
             shutdown => 5000,
             type => worker,
             modules => [erllama_cache_meta_srv]
+        },
+        #{
+            id => erllama_cache_ram,
+            start => {erllama_cache_ram, start_link, []},
+            restart => permanent,
+            shutdown => 5000,
+            type => worker,
+            modules => [erllama_cache_ram]
         }
     ],
     {ok, {SupFlags, ChildSpecs}}.

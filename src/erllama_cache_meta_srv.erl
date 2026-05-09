@@ -537,27 +537,29 @@ run_eviction('$end_of_table', N) ->
     N;
 run_eviction({_LastUsed, Key} = LruKey, N) ->
     Next = ets:next(?TBL_LRU, LruKey),
-    try
-        {
-            ets:lookup_element(?TBL_META, Key, ?POS_STATUS),
-            ets:lookup_element(?TBL_META, Key, ?POS_REFCOUNT)
-        }
-    of
-        {available, 0} ->
-            %% Eviction of available, unreferenced rows. Tier-side
-            %% delete (file deletes for disk/ram_file and slab-table
-            %% deletes for ram) lands in step 7 when those tiers exist;
-            %% here we drop the meta row and the LRU entry only.
-            ets:delete(?TBL_LRU, LruKey),
-            ets:delete(?TBL_META, Key),
-            run_eviction(Next, N + 1);
-        _ ->
-            run_eviction(Next, N)
-    catch
-        error:badarg ->
+    case ets:lookup(?TBL_META, Key) of
+        [Row] ->
+            case {element(?POS_STATUS, Row), element(?POS_REFCOUNT, Row)} of
+                {available, 0} ->
+                    Tier = element(?POS_TIER, Row),
+                    Location = element(?POS_LOCATION, Row),
+                    delete_from_tier(Tier, Key, Location),
+                    ets:delete(?TBL_LRU, LruKey),
+                    ets:delete(?TBL_META, Key),
+                    run_eviction(Next, N + 1);
+                _ ->
+                    run_eviction(Next, N)
+            end;
+        [] ->
             ets:delete(?TBL_LRU, LruKey),
             run_eviction(Next, N)
     end.
+
+delete_from_tier(ram, Key, _Loc) ->
+    erllama_cache_ram:delete(Key);
+delete_from_tier(_OtherTier, _Key, _Loc) ->
+    %% Disk and ram_file tier deletes land in step 7+.
+    ok.
 
 %% =============================================================================
 %% Internal: helpers
