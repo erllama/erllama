@@ -8,6 +8,10 @@ with_writer(Max, Body) ->
     Dir = make_tmp_dir(),
     {ok, _} = erllama_cache_disk_srv:start_link(test_disk, Dir),
     ok = erllama_cache_writer:init(Max),
+    %% init/1 is idempotent against the persisted ETS table; reset
+    %% the counter explicitly between tests so a leak from an
+    %% earlier failure cannot bleed into the next case.
+    ets:insert(erllama_cache_writer_sem, {running, 0}),
     try
         Body(Dir)
     after
@@ -78,48 +82,52 @@ save_already_present_returns_error_test() ->
 %% Semaphore: capacity, busy, inflight
 %% =============================================================================
 
-inflight_and_max_reflect_init_test() ->
+current_and_max_reflect_init_test() ->
     with_writer(7, fun(_Dir) ->
         ?assertEqual(7, erllama_cache_writer:max_concurrent()),
-        ?assertEqual(0, erllama_cache_writer:inflight())
+        ?assertEqual(0, erllama_cache_writer:current())
     end).
 
-semaphore_returns_busy_at_capacity_test() ->
-    %% Cap of 1: one save in flight blocks the next.
+semaphore_returns_max_concurrent_on_timeout_test() ->
+    %% Cap of 1, deterministic: pin the slot via a direct acquire,
+    %% then try a save with a short acquire timeout.
     with_writer(1, fun(_Dir) ->
         Parent = self(),
-        Key = key_for(base_meta([1, 2, 3])),
-        %% Spawn a writer that holds a reservation manually so we
-        %% know exactly when one slot is in use. We can't easily
-        %% pause an in-flight save at the exact "after acquire,
-        %% before release" point without surgery, so we test the
-        %% semaphore primitives directly via inflight() at a
-        %% boundary: kick off a save in a paused worker and check
-        %% the second writer:save returns busy.
         Pid =
             spawn(fun() ->
-                %% Inline the same atomics path the writer uses so we
-                %% can deterministically pin a slot.
-                Sem = persistent_term:get({erllama_cache_writer, sem}),
-                _ = atomics:add_get(Sem, 1, 1),
+                ok = erllama_cache_writer:acquire(infinity),
                 Parent ! pinned,
                 receive
-                    release -> atomics:sub(Sem, 1, 1)
+                    release -> erllama_cache_writer:release()
                 end
             end),
         receive
             pinned -> ok
         end,
-        %% Now try a real save: the semaphore is full.
+        Key = key_for(base_meta([1, 2, 3])),
         ?assertEqual(
-            {error, busy},
-            erllama_cache_writer:save(test_disk, disk, base_meta([1]), <<"x">>)
+            {error, max_concurrent},
+            erllama_cache_writer:save(
+                test_disk, disk, base_meta([1, 2, 3]), <<"x">>, 30
+            )
         ),
         Pid ! release,
-        timer:sleep(20),
-        %% After the pinned slot is released, the row for Key still
-        %% should not exist (the busy save did not run).
+        wait_until(fun() -> erllama_cache_writer:current() =:= 0 end, 1000),
         ?assertEqual(miss, erllama_cache_meta_srv:lookup_exact(Key))
+    end).
+
+release_saturates_at_zero_test() ->
+    with_writer(2, fun(_Dir) ->
+        %% Double-release: the saturating decrement clamps at 0.
+        ok = erllama_cache_writer:release(),
+        ok = erllama_cache_writer:release(),
+        ?assertEqual(0, erllama_cache_writer:current())
+    end).
+
+set_max_concurrent_takes_effect_test() ->
+    with_writer(2, fun(_Dir) ->
+        ok = erllama_cache_writer:set_max_concurrent(5),
+        ?assertEqual(5, erllama_cache_writer:max_concurrent())
     end).
 
 %% =============================================================================
@@ -150,6 +158,24 @@ bad_meta_cancels_reservation_test() ->
 %% =============================================================================
 %% Helpers
 %% =============================================================================
+
+wait_until(Pred, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    wait_until_loop(Pred, Deadline).
+
+wait_until_loop(Pred, Deadline) ->
+    case Pred() of
+        true ->
+            ok;
+        false ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true ->
+                    erlang:error(timeout);
+                false ->
+                    timer:sleep(10),
+                    wait_until_loop(Pred, Deadline)
+            end
+    end.
 
 make_tmp_dir() ->
     Base = os:getenv("TMPDIR", "/tmp"),
