@@ -7,6 +7,8 @@
 %% =============================================================================
 
 with_model(PolicyOverrides, Body) ->
+    ok = erllama_cache_counters:init(),
+    erllama_cache_counters:reset(),
     {ok, _} = erllama_cache_meta_srv:start_link(),
     {ok, _} = erllama_cache_ram:start_link(),
     {ok, _} = erllama_cache_writer:start_link(2),
@@ -254,6 +256,23 @@ shutdown_idle_with_no_context_is_noop_test() ->
         ok = erllama_model:shutdown(test_model),
         ?assertEqual(0, length(erllama_cache_meta_srv:dump())),
         ?assertEqual(idle, erllama_model:status(test_model))
+    end).
+
+%% =============================================================================
+%% Counters move under traffic
+%% =============================================================================
+
+counters_track_misses_and_saves_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        Before = erllama_cache:get_counters(),
+        {ok, _, _} =
+            erllama_model:complete(test_model, long_prompt(), #{response_tokens => 4}),
+        timer:sleep(50),
+        After = erllama_cache:get_counters(),
+        %% A fresh prompt is a miss, fires cold + finish saves.
+        ?assert(maps:get(misses, After) > maps:get(misses, Before)),
+        ?assert(maps:get(saves_cold, After) > maps:get(saves_cold, Before)),
+        ?assert(maps:get(saves_finish, After) > maps:get(saves_finish, Before))
     end).
 
 %% =============================================================================

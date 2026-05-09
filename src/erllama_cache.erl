@@ -11,12 +11,27 @@
 %% @end
 -module(erllama_cache).
 
+-export([get_counters/0, reset_counters/0]).
+
 -export_type([
     cache_key/0,
     tier/0,
     status/0,
     save_reason/0
 ]).
+
+%% @doc Snapshot of operational counters as a map of slot name to
+%% non-negative integer. Suitable for forwarding to a metrics
+%% exporter (Prometheus, statsd, OpenTelemetry).
+-spec get_counters() -> #{atom() => non_neg_integer()}.
+get_counters() ->
+    erllama_cache_counters:snapshot().
+
+%% @doc Reset all counters to 0. Mostly for tests; production
+%% callers should treat counters as monotonic-since-boot.
+-spec reset_counters() -> ok.
+reset_counters() ->
+    erllama_cache_counters:reset().
 
 -type cache_key() :: <<_:256>>.
 -type tier() :: ram | ram_file | disk.

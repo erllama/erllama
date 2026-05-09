@@ -291,12 +291,17 @@ lookup_or_resume(PromptTokens, ParentKey, Data) ->
     Key = make_key(PromptTokens, Data),
     case erllama_cache_meta_srv:lookup_exact(Key) of
         {ok, Row} ->
+            erllama_cache_counters:incr(?C_HITS_EXACT),
             {warm, load_tokens_from_row(Row, Data), []};
         miss when ParentKey =/= undefined ->
             try_session_resume(PromptTokens, ParentKey, Data);
         miss ->
+            erllama_cache_counters:incr(?C_MISSES),
             cold
     end.
+
+%% Note: the resume hit counter is bumped inside `try_session_resume`
+%% only on a verified strict-prefix match.
 
 try_session_resume(PromptTokens, ParentKey, Data) ->
     Wait = maps:get(session_resume_wait_ms, Data#data.policy, 500),
@@ -308,11 +313,14 @@ try_session_resume(PromptTokens, ParentKey, Data) ->
                     %% Slab covers the first length(ParentTokens) tokens;
                     %% prefill the remainder.
                     Remaining = lists:nthtail(length(ParentTokens), PromptTokens),
+                    erllama_cache_counters:incr(?C_HITS_RESUME),
                     {warm, ParentTokens, Remaining};
                 false ->
+                    erllama_cache_counters:incr(?C_MISSES),
                     cold
             end;
         miss ->
+            erllama_cache_counters:incr(?C_MISSES),
             cold
     end.
 

@@ -35,6 +35,8 @@
 -module(erllama_cache_writer).
 -behaviour(gen_server).
 
+-include("erllama_cache.hrl").
+
 -export([
     start_link/0,
     start_link/1,
@@ -261,6 +263,9 @@ do_save(TierSrv, Tier, BuildMeta, Payload) ->
             case erllama_cache_meta_srv:reserve_save(Key, Tier, self()) of
                 {ok, Token} ->
                     do_save_reserved(TierSrv, Key, Token, BuildMeta, Payload);
+                {error, already_present} ->
+                    erllama_cache_counters:incr(?C_DUPLICATE_DROPPED),
+                    {error, already_present};
                 {error, _} = E ->
                     E
             end;
@@ -286,10 +291,20 @@ do_save_reserved(TierSrv, Key, Token, BuildMeta, Payload) ->
     case erllama_cache_disk_srv:save(TierSrv, BuildMeta, Payload) of
         {ok, _SameKey, Header, Size} ->
             case erllama_cache_meta_srv:announce_saved(Key, Token, Size, Header) of
-                ok -> {ok, Key};
-                {error, _} = E -> E
+                ok ->
+                    bump_save_counter(maps:get(save_reason, BuildMeta, unknown)),
+                    {ok, Key};
+                {error, _} = E ->
+                    E
             end;
         {error, _} = E ->
             _ = erllama_cache_meta_srv:cancel_reservation(Key, Token),
             E
     end.
+
+bump_save_counter(cold) -> erllama_cache_counters:incr(?C_SAVES_COLD);
+bump_save_counter(continued) -> erllama_cache_counters:incr(?C_SAVES_CONTINUED);
+bump_save_counter(finish) -> erllama_cache_counters:incr(?C_SAVES_FINISH);
+bump_save_counter(evict) -> erllama_cache_counters:incr(?C_SAVES_EVICT);
+bump_save_counter(shutdown) -> erllama_cache_counters:incr(?C_SAVES_SHUTDOWN);
+bump_save_counter(_) -> ok.

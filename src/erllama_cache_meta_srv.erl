@@ -551,6 +551,7 @@ run_eviction({_LastUsed, Key} = LruKey, N) ->
                     delete_from_tier(Tier, Key, Location),
                     ets:delete(?TBL_LRU, LruKey),
                     ets:delete(?TBL_META, Key),
+                    erllama_cache_counters:incr(?C_EVICTIONS),
                     run_eviction(Next, N + 1);
                 _ ->
                     run_eviction(Next, N)

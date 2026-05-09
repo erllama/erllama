@@ -265,6 +265,7 @@ parse_or_drop(Bin, Key, Path) ->
             %% Corrupt file: drop it so the next request doesn't
             %% repeat the same failed parse.
             _ = prim_file:delete(Path),
+            erllama_cache_counters:incr(?C_CORRUPT_FILES),
             {error, R}
     end.
 
