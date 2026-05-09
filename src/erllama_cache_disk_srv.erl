@@ -41,6 +41,7 @@
 
 -export([
     start_link/2,
+    start_link/3,
     save/3,
     load/2,
     delete/2,
@@ -52,6 +53,7 @@
 
 -record(state, {
     name :: atom(),
+    tier :: disk | ram_file,
     root :: file:name()
 }).
 
@@ -63,7 +65,12 @@
 
 -spec start_link(atom(), file:name()) -> {ok, pid()} | {error, term()}.
 start_link(Name, RootDir) ->
-    gen_server:start_link({local, Name}, ?MODULE, [Name, RootDir], []).
+    start_link(Name, disk, RootDir).
+
+-spec start_link(atom(), disk | ram_file, file:name()) ->
+    {ok, pid()} | {error, term()}.
+start_link(Name, Tier, RootDir) when Tier =:= disk; Tier =:= ram_file ->
+    gen_server:start_link({local, Name}, ?MODULE, [Name, Tier, RootDir], []).
 
 -spec save(atom(), erllama_cache_kvc:build_meta(), binary()) ->
     {ok, erllama_cache:cache_key(), binary(), non_neg_integer()}
@@ -97,7 +104,7 @@ scan(SrvName) ->
 %% =============================================================================
 
 -spec init([atom() | file:name()]) -> {ok, state()}.
-init([Name, Root]) ->
+init([Name, Tier, Root]) ->
     case filelib:ensure_path(Root) of
         ok -> ok;
         {error, Reason} -> erlang:error({cannot_create_dir, Root, Reason})
@@ -105,8 +112,8 @@ init([Name, Root]) ->
     %% Drop any leftover `*.tmp` from a previous run.
     sweep_tmps(Root),
     %% Register every valid .kvc with the meta server.
-    register_existing(Root),
-    {ok, #state{name = Name, root = Root}}.
+    register_existing(Tier, Root),
+    {ok, #state{name = Name, tier = Tier, root = Root}}.
 
 handle_call({save, BuildMeta, Payload}, _From, S) ->
     {reply, do_save(BuildMeta, Payload, S#state.root), S};
@@ -309,13 +316,13 @@ scan_kvc(Path, Acc) ->
             Acc
     end.
 
-register_existing(Root) ->
+register_existing(Tier, Root) ->
     Entries = scan_dir(Root),
     lists:foreach(
         fun({Key, Header, Size}) ->
             Path = filename:join(Root, bin_to_hex(Key) ++ ".kvc"),
             erllama_cache_meta_srv:insert_available(
-                Key, disk, Size, Header, {disk, Path}
+                Key, Tier, Size, Header, {Tier, Path}
             )
         end,
         Entries

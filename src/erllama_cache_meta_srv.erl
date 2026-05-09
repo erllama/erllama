@@ -562,8 +562,13 @@ run_eviction({_LastUsed, Key} = LruKey, N) ->
 
 delete_from_tier(ram, Key, _Loc) ->
     erllama_cache_ram:delete(Key);
-delete_from_tier(_OtherTier, _Key, _Loc) ->
-    %% Disk and ram_file tier deletes land in step 7+.
+delete_from_tier(disk, _Key, {disk, Path}) ->
+    _ = file:delete(Path),
+    ok;
+delete_from_tier(ram_file, _Key, {ram_file, Path}) ->
+    _ = file:delete(Path),
+    ok;
+delete_from_tier(_, _, _) ->
     ok.
 
 %% =============================================================================
