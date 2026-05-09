@@ -33,35 +33,72 @@
 #include "llama.h"
 
 /* Exception-safe wrappers for llama.cpp calls that can throw across
- * the C ABI. Implemented in c_src/erllama_safe.cpp. */
+ * the C ABI. Implemented in c_src/erllama_safe.cpp. Each returns a
+ * sentinel (NULL, 0, SIZE_MAX, INT32_MIN, etc.) on a thrown C++
+ * exception so the C NIF can surface a clean {error, oom} or
+ * {error, invalid_token} instead of letting an exception unwind into
+ * a C frame. */
 extern struct llama_sampler *erllama_safe_sampler_chain_init(
     struct llama_sampler_chain_params p);
 extern struct llama_sampler *erllama_safe_sampler_init_greedy(void);
 extern int erllama_safe_sampler_chain_add(struct llama_sampler *chain,
                                           struct llama_sampler *s);
-extern void erllama_safe_sampler_free(struct llama_sampler *s);
+extern int erllama_safe_sampler_free(struct llama_sampler *s);
 extern llama_token erllama_safe_sampler_sample(struct llama_sampler *s,
                                                 struct llama_context *ctx,
                                                 int32_t idx);
-extern void erllama_safe_sampler_accept(struct llama_sampler *s,
-                                        llama_token tok);
+extern int erllama_safe_sampler_accept(struct llama_sampler *s,
+                                       llama_token tok);
 extern int32_t erllama_safe_token_to_piece(const struct llama_vocab *vocab,
                                            llama_token tok, char *buf,
                                            int32_t buf_size,
                                            int32_t lstrip,
                                            bool special);
+extern int erllama_safe_backend_init(void);
+extern int erllama_safe_backend_free(void);
+extern struct llama_model *erllama_safe_model_load_from_file(
+    const char *path, struct llama_model_params params);
+extern int erllama_safe_model_free(struct llama_model *m);
+extern struct llama_context *erllama_safe_init_from_model(
+    struct llama_model *m, struct llama_context_params params);
+extern int erllama_safe_free(struct llama_context *c);
+extern const struct llama_model *erllama_safe_get_model(
+    const struct llama_context *c);
+extern const struct llama_vocab *erllama_safe_model_get_vocab(
+    const struct llama_model *m);
+extern int32_t erllama_safe_vocab_n_tokens(const struct llama_vocab *v);
+extern int erllama_safe_vocab_is_eog(const struct llama_vocab *v,
+                                     llama_token tok);
+extern int32_t erllama_safe_tokenize(const struct llama_vocab *vocab,
+                                     const char *text, int32_t text_len,
+                                     llama_token *tokens, int32_t n_max,
+                                     bool add_special, bool parse_special);
+extern int erllama_safe_decode(struct llama_context *c,
+                               struct llama_batch batch);
+extern size_t erllama_safe_state_seq_get_size(struct llama_context *c,
+                                              int seq_id);
+extern size_t erllama_safe_state_seq_get_data(struct llama_context *c,
+                                              uint8_t *dst, size_t size,
+                                              int seq_id);
+extern size_t erllama_safe_state_seq_set_data(struct llama_context *c,
+                                              const uint8_t *src,
+                                              size_t size, int seq_id);
+extern int erllama_safe_memory_seq_rm(struct llama_context *c, int seq_id,
+                                      int p0, int p1);
 
 #ifndef ERLLAMA_MAX_TOKENS
-/* Cap on accepted token-list inputs and tokenize output. INT32_MAX/2
- * is well above the largest practical context window and keeps token
- * count multiplications away from int32_t overflow. */
-#define ERLLAMA_MAX_TOKENS (INT32_MAX / 2)
+/* Cap on accepted token-list inputs and tokenize output. The largest
+ * practical context window today is ~10M; 1M tokens leaves plenty of
+ * headroom while bounding worst-case allocations to ~4 MB and keeping
+ * one bad request from tying up dirty schedulers indefinitely. */
+#define ERLLAMA_MAX_TOKENS (1024 * 1024)
 #endif
 
 #ifndef ERLLAMA_MAX_TOKEN_TEXT
-/* Largest text accepted by tokenize/3 (bytes). Rejects requests whose
- * length wouldn't fit in int32_t even before signedness concerns. */
-#define ERLLAMA_MAX_TOKEN_TEXT (256 * 1024 * 1024)
+/* Largest text accepted by tokenize/3 (bytes). 16 MiB is well above
+ * any realistic prompt; raise via -DERLLAMA_MAX_TOKEN_TEXT=N for
+ * batch-tokenization workflows. */
+#define ERLLAMA_MAX_TOKEN_TEXT (16 * 1024 * 1024)
 #endif
 
 /* =========================================================================
@@ -83,6 +120,9 @@ static ERL_NIF_TERM atom_released;
 static ERL_NIF_TERM atom_too_large;
 static ERL_NIF_TERM atom_invalid_token;
 static ERL_NIF_TERM atom_oom;
+static ERL_NIF_TERM atom_deferred;
+static ERL_NIF_TERM atom_exception;
+static ERL_NIF_TERM atom_no_logits;
 
 /* =========================================================================
  * Resource types
@@ -100,6 +140,7 @@ typedef struct {
     int mu_inited;                 /* guard pthread_mutex_destroy on error path */
     struct llama_model *model;     /* NULL after release */
     int active_contexts;           /* nif_new_context bumps; ctx_dtor decrements */
+    int release_pending;           /* free_model when active_contexts hit 0 */
 } erllama_model_t;
 
 typedef struct {
@@ -107,10 +148,33 @@ typedef struct {
     int mu_inited;
     struct llama_context *ctx;     /* NULL after release */
     erllama_model_t *model_res;    /* keep_resource'd by new_context */
+    int decode_ready;              /* set after llama_decode; cleared after kv ops */
 } erllama_context_t;
 
 static ErlNifResourceType *MODEL_RT;
 static ErlNifResourceType *CTX_RT;
+
+/* Drop the context's reference on its model; if a previous
+ * free_model/1 returned `in_use` and the model is now unreferenced,
+ * actually free the underlying llama_model* here. Lock is held while
+ * the active counter is touched and the freeing decision is made so
+ * concurrent context destructions can't double-free. */
+static void context_drops_model(erllama_model_t *m) {
+    pthread_mutex_lock(&m->mu);
+    if (m->active_contexts > 0) {
+        m->active_contexts--;
+    }
+    int do_free =
+        (m->release_pending && m->active_contexts == 0 && m->model);
+    struct llama_model *to_free = NULL;
+    if (do_free) {
+        to_free = m->model;
+        m->model = NULL;
+        m->release_pending = 0;
+    }
+    pthread_mutex_unlock(&m->mu);
+    if (to_free) erllama_safe_model_free(to_free);
+}
 
 /* Resource destructors run when the BEAM has no remaining references.
  * They must tolerate partial init: if alloc succeeded but mutex_init
@@ -121,7 +185,7 @@ static void model_dtor(ErlNifEnv *env, void *obj) {
     (void) env;
     erllama_model_t *m = (erllama_model_t *) obj;
     if (m->model) {
-        llama_model_free(m->model);
+        erllama_safe_model_free(m->model);
         m->model = NULL;
     }
     if (m->mu_inited) {
@@ -134,15 +198,11 @@ static void ctx_dtor(ErlNifEnv *env, void *obj) {
     (void) env;
     erllama_context_t *c = (erllama_context_t *) obj;
     if (c->ctx) {
-        llama_free(c->ctx);
+        erllama_safe_free(c->ctx);
         c->ctx = NULL;
     }
     if (c->model_res) {
-        pthread_mutex_lock(&c->model_res->mu);
-        if (c->model_res->active_contexts > 0) {
-            c->model_res->active_contexts--;
-        }
-        pthread_mutex_unlock(&c->model_res->mu);
+        context_drops_model(c->model_res);
         enif_release_resource(c->model_res);
         c->model_res = NULL;
     }
@@ -161,7 +221,9 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     (void) load_info;
 
     erllama_crc32c_init();
-    llama_backend_init();
+    if (erllama_safe_backend_init() != 0) {
+        return -1;
+    }
 
     atom_ok = enif_make_atom(env, "ok");
     atom_error = enif_make_atom(env, "error");
@@ -178,6 +240,9 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     atom_too_large = enif_make_atom(env, "too_large");
     atom_invalid_token = enif_make_atom(env, "invalid_token");
     atom_oom = enif_make_atom(env, "oom");
+    atom_deferred = enif_make_atom(env, "deferred");
+    atom_exception = enif_make_atom(env, "exception");
+    atom_no_logits = enif_make_atom(env, "no_logits");
 
     MODEL_RT = enif_open_resource_type(
         env, NULL, "erllama_model", model_dtor, ERL_NIF_RT_CREATE, NULL);
@@ -195,8 +260,9 @@ static void unload(ErlNifEnv *env, void *priv_data) {
     (void) priv_data;
     /* Counterpart to llama_backend_init in load(). Lets the BEAM
      * reload the NIF (e.g. on hot upgrade) without leaking llama
-     * global state. */
-    llama_backend_free();
+     * global state. We can't surface a failure from unload, but the
+     * exception is at least caught by the safe wrapper. */
+    (void) erllama_safe_backend_free();
 }
 
 /* =========================================================================
@@ -296,14 +362,14 @@ static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     if (get_map_bool(env, argv[1], "use_mlock", &b)) params.use_mlock = b ? true : false;
     if (get_map_bool(env, argv[1], "vocab_only", &b)) params.vocab_only = b ? true : false;
 
-    struct llama_model *model = llama_model_load_from_file(path, params);
+    struct llama_model *model = erllama_safe_model_load_from_file(path, params);
     if (!model) {
         return enif_make_tuple2(env, atom_error, atom_load_failed);
     }
 
     erllama_model_t *res = enif_alloc_resource(MODEL_RT, sizeof(*res));
     if (!res) {
-        llama_model_free(model);
+        (void) erllama_safe_model_free(model);
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
     /* Zero-init so the destructor on the alloc-but-not-fully-set-up
@@ -312,7 +378,7 @@ static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     memset(res, 0, sizeof(*res));
     if (pthread_mutex_init(&res->mu, NULL) != 0) {
         enif_release_resource(res);
-        llama_model_free(model);
+        (void) erllama_safe_model_free(model);
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
     res->mu_inited = 1;
@@ -325,10 +391,11 @@ static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 }
 
 /* free_model/1 returns:
- *   ok               -> released; subsequent ops on the term return error
- *   {error, in_use}  -> contexts still hold this model; will be freed when
- *                       the last context destructs (no-op-now is safe)
- *   {error, released}-> already released by a prior free_model call
+ *   ok                 -> released; subsequent ops on the term return error
+ *   {ok, deferred}     -> contexts still hold this model; release flagged.
+ *                         The last context destruction performs the actual
+ *                         llama_model_free under context_drops_model.
+ *   {error, released}  -> already released
  *
  * The lock blocks for the duration of any concurrent dirty NIF using
  * this resource, which is the point: free can never interleave with a
@@ -345,12 +412,15 @@ static ERL_NIF_TERM nif_free_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         return enif_make_tuple2(env, atom_error, atom_released);
     }
     if (m->active_contexts > 0) {
+        m->release_pending = 1;
         pthread_mutex_unlock(&m->mu);
-        return enif_make_tuple2(env, atom_error, atom_in_use);
+        return enif_make_tuple2(env, atom_ok, atom_deferred);
     }
-    llama_model_free(m->model);
+    struct llama_model *to_free = m->model;
     m->model = NULL;
+    m->release_pending = 0;
     pthread_mutex_unlock(&m->mu);
+    erllama_safe_model_free(to_free);
     return atom_ok;
 }
 
@@ -389,21 +459,21 @@ static ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
-    struct llama_context *ctx = llama_init_from_model(m->model, params);
+    struct llama_context *ctx = erllama_safe_init_from_model(m->model, params);
     if (!ctx) {
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_context_failed);
     }
     erllama_context_t *res = enif_alloc_resource(CTX_RT, sizeof(*res));
     if (!res) {
-        llama_free(ctx);
+        (void) erllama_safe_free(ctx);
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
     memset(res, 0, sizeof(*res));
     if (pthread_mutex_init(&res->mu, NULL) != 0) {
         enif_release_resource(res);
-        llama_free(ctx);
+        (void) erllama_safe_free(ctx);
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
@@ -430,16 +500,18 @@ static ERL_NIF_TERM nif_free_context(ErlNifEnv *env, int argc, const ERL_NIF_TER
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
-    llama_free(c->ctx);
+    int free_rc = erllama_safe_free(c->ctx);
     c->ctx = NULL;
+    c->decode_ready = 0;
     erllama_model_t *m = c->model_res;
     c->model_res = NULL;
     pthread_mutex_unlock(&c->mu);
     if (m) {
-        pthread_mutex_lock(&m->mu);
-        if (m->active_contexts > 0) m->active_contexts--;
-        pthread_mutex_unlock(&m->mu);
+        context_drops_model(m);
         enif_release_resource(m);
+    }
+    if (free_rc != 0) {
+        return enif_make_tuple2(env, atom_error, atom_exception);
     }
     return atom_ok;
 }
@@ -476,7 +548,11 @@ static ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
-    const struct llama_vocab *vocab = llama_model_get_vocab(m->model);
+    const struct llama_vocab *vocab = erllama_safe_model_get_vocab(m->model);
+    if (!vocab) {
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
 
     int32_t text_len = (int32_t) text.size;
     int32_t n_max = text_len + 8;
@@ -488,17 +564,15 @@ static ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
-    int32_t n = llama_tokenize(
+    int32_t n = erllama_safe_tokenize(
         vocab, (const char *) text.data, text_len, tokens,
         n_max, add_special ? true : false, parse_special ? true : false);
+    if (n == INT32_MIN) {
+        enif_free(tokens);
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
     if (n < 0) {
-        /* Negative return = -needed. INT32_MIN would overflow on
-         * negation, so guard. */
-        if (n == INT32_MIN) {
-            enif_free(tokens);
-            pthread_mutex_unlock(&m->mu);
-            return enif_make_tuple2(env, atom_error, atom_too_large);
-        }
         int32_t needed = -n;
         if (needed > ERLLAMA_MAX_TOKENS) {
             enif_free(tokens);
@@ -511,11 +585,15 @@ static ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
             pthread_mutex_unlock(&m->mu);
             return enif_make_tuple2(env, atom_error, atom_oom);
         }
-        n = llama_tokenize(
+        n = erllama_safe_tokenize(
             vocab, (const char *) text.data, text_len, tokens,
             needed, add_special ? true : false, parse_special ? true : false);
     }
     pthread_mutex_unlock(&m->mu);
+    if (n == INT32_MIN) {
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
     if (n < 0) {
         enif_free(tokens);
         return enif_make_tuple2(env, atom_error, atom_tokenize_failed);
@@ -555,7 +633,11 @@ static ERL_NIF_TERM nif_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
-    size_t need = llama_state_seq_get_size(c->ctx, seq_id);
+    size_t need = erllama_safe_state_seq_get_size(c->ctx, seq_id);
+    if (need == SIZE_MAX) {
+        pthread_mutex_unlock(&c->mu);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
     if (need == 0) {
         pthread_mutex_unlock(&c->mu);
         ErlNifBinary empty;
@@ -569,7 +651,8 @@ static ERL_NIF_TERM nif_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
-    size_t written = llama_state_seq_get_data(c->ctx, out.data, out.size, seq_id);
+    size_t written = erllama_safe_state_seq_get_data(
+        c->ctx, out.data, out.size, seq_id);
     pthread_mutex_unlock(&c->mu);
     if (written == 0 || written > need) {
         enif_release_binary(&out);
@@ -603,8 +686,13 @@ static ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
-    size_t consumed = llama_state_seq_set_data(
-        c->ctx, in.data, in.size, (llama_seq_id) seq_id);
+    size_t consumed = erllama_safe_state_seq_set_data(
+        c->ctx, in.data, in.size, seq_id);
+    /* kv_unpack only restores KV cells, not the per-context logits
+     * buffer; the model layer must drop the last cell and re-prefill
+     * it before the next sample. Mark the context as not ready until
+     * that primer runs. */
+    c->decode_ready = 0;
     pthread_mutex_unlock(&c->mu);
     if (consumed == 0 || consumed != in.size) {
         return enif_make_tuple2(env, atom_error, atom_unpack_failed);
@@ -636,15 +724,12 @@ static ERL_NIF_TERM nif_kv_seq_rm(ErlNifEnv *env, int argc,
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
-    llama_memory_t mem = llama_get_memory(c->ctx);
-    if (!mem) {
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_unpack_failed);
-    }
-    bool ok = llama_memory_seq_rm(mem, (llama_seq_id) seq_id,
-                                  (llama_pos) p0, (llama_pos) p1);
+    int rc = erllama_safe_memory_seq_rm(c->ctx, seq_id, p0, p1);
+    /* Removing cells invalidates last-decode logits; force a fresh
+     * prefill before the next sample. */
+    c->decode_ready = 0;
     pthread_mutex_unlock(&c->mu);
-    if (!ok) {
+    if (rc != 0) {
         return enif_make_tuple2(env, atom_error, atom_unpack_failed);
     }
     return atom_ok;
@@ -720,8 +805,10 @@ static ERL_NIF_TERM nif_prefill(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
      * to llama_decode. An out-of-range positive ID would otherwise
      * reach `id_to_token.at(id)` deep inside llama and throw a C++
      * exception across the C ABI. */
-    const struct llama_model *model = llama_get_model(c->ctx);
-    int32_t n_vocab = model ? llama_vocab_n_tokens(llama_model_get_vocab(model)) : 0;
+    const struct llama_model *model = erllama_safe_get_model(c->ctx);
+    const struct llama_vocab *vocab =
+        model ? erllama_safe_model_get_vocab(model) : NULL;
+    int32_t n_vocab = vocab ? erllama_safe_vocab_n_tokens(vocab) : 0;
     for (int32_t i = 0; i < n; i++) {
         if (n_vocab > 0 && tokens[i] >= n_vocab) {
             pthread_mutex_unlock(&c->mu);
@@ -730,9 +817,13 @@ static ERL_NIF_TERM nif_prefill(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
         }
     }
     struct llama_batch batch = llama_batch_get_one(tokens, n);
-    int dr = llama_decode(c->ctx, batch);
+    int dr = erllama_safe_decode(c->ctx, batch);
+    if (dr == 0) c->decode_ready = 1;
     pthread_mutex_unlock(&c->mu);
     enif_free(tokens);
+    if (dr == -32768) {
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
     if (dr != 0) {
         return enif_make_tuple2(env, atom_error, enif_make_int(env, dr));
     }
@@ -750,6 +841,17 @@ static ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
+    /* `llama_sampler_sample` -> `llama_get_logits_ith` aborts via
+     * GGML_ASSERT(logits != nullptr) when no decode has produced
+     * sample-able logits yet. We can't catch that abort, so we refuse
+     * to call sampler_sample unless the last successful op was a
+     * decode (set by nif_prefill / by ourselves below). kv_unpack and
+     * kv_seq_rm clear the flag; the model layer must re-prefill the
+     * last token before sampling. */
+    if (!c->decode_ready) {
+        pthread_mutex_unlock(&c->mu);
+        return enif_make_tuple2(env, atom_error, atom_no_logits);
+    }
 
     struct llama_sampler_chain_params sp = llama_sampler_chain_default_params();
     struct llama_sampler *smpl = erllama_safe_sampler_chain_init(sp);
@@ -759,34 +861,47 @@ static ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     }
     struct llama_sampler *greedy = erllama_safe_sampler_init_greedy();
     if (!greedy) {
-        erllama_safe_sampler_free(smpl);
+        (void) erllama_safe_sampler_free(smpl);
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
     if (erllama_safe_sampler_chain_add(smpl, greedy) != 0) {
-        erllama_safe_sampler_free(greedy);
-        erllama_safe_sampler_free(smpl);
+        (void) erllama_safe_sampler_free(greedy);
+        (void) erllama_safe_sampler_free(smpl);
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
 
     llama_token tok = erllama_safe_sampler_sample(smpl, c->ctx, -1);
     if (tok < 0) {
-        erllama_safe_sampler_free(smpl);
+        (void) erllama_safe_sampler_free(smpl);
         pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_invalid_token);
+        return enif_make_tuple2(env, atom_error, atom_exception);
     }
-    erllama_safe_sampler_accept(smpl, tok);
-    erllama_safe_sampler_free(smpl);
+    if (erllama_safe_sampler_accept(smpl, tok) != 0) {
+        (void) erllama_safe_sampler_free(smpl);
+        pthread_mutex_unlock(&c->mu);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
+    if (erllama_safe_sampler_free(smpl) != 0) {
+        pthread_mutex_unlock(&c->mu);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
 
-    const struct llama_model *model = llama_get_model(c->ctx);
-    const struct llama_vocab *vocab = llama_model_get_vocab(model);
-    int eog = llama_vocab_is_eog(vocab, tok) ? 1 : 0;
+    const struct llama_model *model = erllama_safe_get_model(c->ctx);
+    const struct llama_vocab *vocab =
+        model ? erllama_safe_model_get_vocab(model) : NULL;
+    int eog = vocab ? erllama_safe_vocab_is_eog(vocab, tok) : 0;
 
     llama_token tok_buf = tok;
     struct llama_batch batch = llama_batch_get_one(&tok_buf, 1);
-    int rc = llama_decode(c->ctx, batch);
+    int rc = erllama_safe_decode(c->ctx, batch);
+    if (rc == 0) c->decode_ready = 1;
+    else c->decode_ready = 0;
     pthread_mutex_unlock(&c->mu);
+    if (rc == -32768) {
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
     if (rc != 0) {
         return enif_make_tuple2(env, atom_error, enif_make_int(env, rc));
     }
@@ -819,8 +934,13 @@ static ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         enif_free(tokens);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
-    const struct llama_vocab *vocab = llama_model_get_vocab(m->model);
-    int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    const struct llama_vocab *vocab = erllama_safe_model_get_vocab(m->model);
+    if (!vocab) {
+        pthread_mutex_unlock(&m->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
+    int32_t n_vocab = erllama_safe_vocab_n_tokens(vocab);
     /* Validate before any token_to_piece call so out-of-range IDs do
      * not reach `id_to_token.at(id)` and trigger an internal throw. */
     for (int32_t i = 0; i < n; i++) {
@@ -936,17 +1056,13 @@ static ERL_NIF_TERM make_errno_atom(ErlNifEnv *env, int e) {
 
 static ERL_NIF_TERM nif_fsync_dir(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void) argc;
-    ErlNifBinary path_bin;
-    if (!enif_inspect_iolist_as_binary(env, argv[0], &path_bin)) {
-        return enif_make_badarg(env);
-    }
-    if (path_bin.size == 0 || path_bin.size > 4096) {
-        return enif_make_badarg(env);
-    }
     char path[4097];
-    memcpy(path, path_bin.data, path_bin.size);
-    path[path_bin.size] = '\0';
-
+    /* copy_path rejects empty inputs, oversize inputs, and embedded
+     * NUL bytes (which would otherwise let `<<"a\0b">>` be passed to
+     * open() as just "a"). */
+    if (!copy_path(env, argv[0], path, sizeof(path))) {
+        return enif_make_badarg(env);
+    }
     int fd = open(path, O_RDONLY);
     if (fd < 0) {
         return enif_make_tuple2(env, atom_error, make_errno_atom(env, errno));

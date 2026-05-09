@@ -45,12 +45,16 @@ int erllama_safe_sampler_chain_add(struct llama_sampler *chain,
     }
 }
 
-void erllama_safe_sampler_free(struct llama_sampler *s) noexcept {
-    if (!s) return;
+// Returns 0 on success, -1 on a thrown exception. Even the cleanup
+// path surfaces the failure so the C caller can map it to an Erlang
+// error rather than swallowing it silently.
+int erllama_safe_sampler_free(struct llama_sampler *s) noexcept {
+    if (!s) return 0;
     try {
         llama_sampler_free(s);
+        return 0;
     } catch (...) {
-        // best-effort; nothing to do
+        return -1;
     }
 }
 
@@ -66,11 +70,13 @@ llama_token erllama_safe_sampler_sample(struct llama_sampler *s,
     }
 }
 
-void erllama_safe_sampler_accept(struct llama_sampler *s,
-                                 llama_token tok) noexcept {
+int erllama_safe_sampler_accept(struct llama_sampler *s,
+                                llama_token tok) noexcept {
     try {
         llama_sampler_accept(s, tok);
+        return 0;
     } catch (...) {
+        return -1;
     }
 }
 
@@ -86,6 +92,182 @@ int32_t erllama_safe_token_to_piece(const struct llama_vocab *vocab,
         return llama_token_to_piece(vocab, tok, buf, buf_size, lstrip, special);
     } catch (...) {
         return INT32_MIN;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backend lifecycle
+// ---------------------------------------------------------------------------
+
+int erllama_safe_backend_init(void) noexcept {
+    try {
+        llama_backend_init();
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+int erllama_safe_backend_free(void) noexcept {
+    try {
+        llama_backend_free();
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Model / context lifecycle
+// ---------------------------------------------------------------------------
+
+struct llama_model *
+erllama_safe_model_load_from_file(const char *path,
+                                  struct llama_model_params params) noexcept {
+    try {
+        return llama_model_load_from_file(path, params);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+int erllama_safe_model_free(struct llama_model *m) noexcept {
+    if (!m) return 0;
+    try {
+        llama_model_free(m);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+struct llama_context *
+erllama_safe_init_from_model(struct llama_model *m,
+                             struct llama_context_params params) noexcept {
+    try {
+        return llama_init_from_model(m, params);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+int erllama_safe_free(struct llama_context *c) noexcept {
+    if (!c) return 0;
+    try {
+        llama_free(c);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
+const struct llama_model *
+erllama_safe_get_model(const struct llama_context *c) noexcept {
+    try {
+        return llama_get_model(c);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+const struct llama_vocab *
+erllama_safe_model_get_vocab(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_get_vocab(m);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+int32_t erllama_safe_vocab_n_tokens(const struct llama_vocab *v) noexcept {
+    try {
+        return llama_vocab_n_tokens(v);
+    } catch (...) {
+        return 0;
+    }
+}
+
+int erllama_safe_vocab_is_eog(const struct llama_vocab *v,
+                              llama_token tok) noexcept {
+    try {
+        return llama_vocab_is_eog(v, tok) ? 1 : 0;
+    } catch (...) {
+        return 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tokenize / decode / state
+// ---------------------------------------------------------------------------
+
+// Returns same conventions as llama_tokenize; INT32_MIN on thrown
+// exception so callers can disambiguate from "needed N more slots".
+int32_t erllama_safe_tokenize(const struct llama_vocab *vocab,
+                              const char *text, int32_t text_len,
+                              llama_token *tokens, int32_t n_max,
+                              bool add_special, bool parse_special) noexcept {
+    try {
+        return llama_tokenize(vocab, text, text_len, tokens, n_max,
+                              add_special, parse_special);
+    } catch (...) {
+        return INT32_MIN;
+    }
+}
+
+// Returns 0 ok, llama's negative error codes on decode failure, or
+// INT_MIN on thrown exception.
+int erllama_safe_decode(struct llama_context *c,
+                        struct llama_batch batch) noexcept {
+    try {
+        return llama_decode(c, batch);
+    } catch (...) {
+        return -32768;  // distinct sentinel; llama's own codes are small ints
+    }
+}
+
+// State seq APIs. Return SIZE_MAX on thrown exception (callers treat
+// as failure).
+size_t erllama_safe_state_seq_get_size(struct llama_context *c,
+                                       int seq_id) noexcept {
+    try {
+        return llama_state_seq_get_size(c, (llama_seq_id) seq_id);
+    } catch (...) {
+        return SIZE_MAX;
+    }
+}
+
+size_t erllama_safe_state_seq_get_data(struct llama_context *c,
+                                       uint8_t *dst, size_t size,
+                                       int seq_id) noexcept {
+    try {
+        return llama_state_seq_get_data(c, dst, size, (llama_seq_id) seq_id);
+    } catch (...) {
+        return 0;
+    }
+}
+
+size_t erllama_safe_state_seq_set_data(struct llama_context *c,
+                                       const uint8_t *src, size_t size,
+                                       int seq_id) noexcept {
+    try {
+        return llama_state_seq_set_data(c, src, size, (llama_seq_id) seq_id);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Memory ops for KV cell removal.
+int erllama_safe_memory_seq_rm(struct llama_context *c, int seq_id,
+                               int p0, int p1) noexcept {
+    try {
+        llama_memory_t mem = llama_get_memory(c);
+        if (!mem) return -1;
+        return llama_memory_seq_rm(mem, (llama_seq_id) seq_id,
+                                   (llama_pos) p0, (llama_pos) p1)
+                   ? 0
+                   : -1;
+    } catch (...) {
+        return -1;
     }
 }
 
