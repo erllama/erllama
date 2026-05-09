@@ -118,6 +118,20 @@ response.
 - `test/prop_<mod>.erl`: PropEr property-based tests
 - `test/<feature>_SUITE.erl`: Common Test suites
 
+### Real-model CT suite
+
+`erllama_real_model_SUITE` exercises the llama.cpp backend against a
+real GGUF file. Disabled unless `LLAMA_TEST_MODEL` points at a valid
+model:
+
+```bash
+LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-q4_k_m.gguf rebar3 ct \
+    --suite=test/erllama_real_model_SUITE
+```
+
+Without the env var the suite skips so default `rebar3 ct` runs stay
+green on CI without model files.
+
 ## Linting Notes
 
 Elvis rules are configured in `elvis.config`. The set is intentionally
