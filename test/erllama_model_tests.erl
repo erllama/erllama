@@ -182,6 +182,81 @@ parent_key_session_resume_test() ->
     end).
 
 %% =============================================================================
+%% Continued saves during generation
+%% =============================================================================
+
+continued_save_fires_during_long_generation_test() ->
+    %% Lower continued_interval so the fixture's prompt + response
+    %% crosses the boundary at least once.
+    with_model(
+        #{continued_interval => 4, response_target => 8},
+        fun(Cfg) ->
+            PromptTokens = prompt_tokens(long_prompt()),
+            {ok, _, Generated} = erllama_model:complete(
+                test_model, long_prompt(), #{response_tokens => 8}
+            ),
+            %% A continued save fires when LiveTokens - LastSavedAt
+            %% reaches continued_interval. With the cold save firing
+            %% at 12 prompt tokens, last_save_at = 12. After 4 more
+            %% generated tokens, a continued save fires for the
+            %% first 16 tokens. Those tokens are
+            %% PromptTokens ++ first 4 generated.
+            FirstContinuedTokens =
+                PromptTokens ++ lists:sublist(Generated, 4),
+            FirstContinuedKey = key_for_tokens(FirstContinuedTokens, Cfg),
+            ?assertMatch({ok, _Row}, wait_for_key(FirstContinuedKey, 1000))
+        end
+    ).
+
+%% =============================================================================
+%% Evict save
+%% =============================================================================
+
+evict_idle_with_no_context_is_noop_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        ok = erllama_model:evict(test_model),
+        ?assertEqual(0, length(erllama_cache_meta_srv:dump())),
+        ?assertEqual(idle, erllama_model:status(test_model))
+    end).
+
+evict_during_generation_persists_live_state_test() ->
+    %% Fire evict in the middle of a long generation. The model
+    %% intercepts the call between decode_step events and writes
+    %% an evict save with whatever tokens are live.
+    with_model(#{response_target => 200, continued_interval => 100000}, fun(_Cfg) ->
+        Parent = self(),
+        spawn(fun() ->
+            Parent !
+                {done,
+                    erllama_model:complete(
+                        test_model, long_prompt(), #{response_tokens => 200}
+                    )}
+        end),
+        %% Give the gen_statem a beat to enter generating.
+        timer:sleep(0),
+        ok = erllama_model:evict(test_model),
+        %% Wait for the request to complete (the finish save fires too,
+        %% so we expect at least an evict row plus cold + finish).
+        receive
+            {done, _} -> ok
+        after 5000 -> erlang:error(timeout)
+        end,
+        timer:sleep(50),
+        ?assert(length(erllama_cache_meta_srv:dump()) >= 2)
+    end).
+
+%% =============================================================================
+%% Shutdown save
+%% =============================================================================
+
+shutdown_idle_with_no_context_is_noop_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        ok = erllama_model:shutdown(test_model),
+        ?assertEqual(0, length(erllama_cache_meta_srv:dump())),
+        ?assertEqual(idle, erllama_model:status(test_model))
+    end).
+
+%% =============================================================================
 %% Concurrency
 %% =============================================================================
 

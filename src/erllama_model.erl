@@ -34,7 +34,9 @@
     stop/1,
     complete/2,
     complete/3,
-    status/1
+    status/1,
+    evict/1,
+    shutdown/1
 ]).
 
 -export([
@@ -68,7 +70,10 @@
     %% complete/2 via Opts; defaults to a deterministic stub sequence.
     response_target :: pos_integer(),
     %% Generated tokens accumulated so far.
-    generated :: [non_neg_integer()]
+    generated :: [non_neg_integer()],
+    %% Token count at the most recent save of any reason; used by the
+    %% policy to decide when continued saves should fire.
+    last_save_at :: non_neg_integer()
 }).
 
 %% =============================================================================
@@ -97,6 +102,22 @@ complete(Model, Prompt, Opts) ->
 status(Model) ->
     gen_statem:call(Model, status).
 
+%% @doc Request that the model evict its current state. Fires an
+%% `evict` save synchronously if there is anything in the context.
+%% Called by `erllama_scheduler` (future) when GPU memory pressure
+%% requires this model to release its context handle. No-op when
+%% the model is idle with no live context.
+-spec evict(atom() | pid()) -> ok.
+evict(Model) ->
+    gen_statem:call(Model, evict).
+
+%% @doc Fire a `shutdown` save synchronously and return. Called from
+%% the application's `prep_stop` hook so live state survives a
+%% graceful restart.
+-spec shutdown(atom() | pid()) -> ok.
+shutdown(Model) ->
+    gen_statem:call(Model, shutdown).
+
 %% =============================================================================
 %% gen_statem callbacks
 %% =============================================================================
@@ -118,7 +139,8 @@ init([ModelId, Config]) ->
         prompt_tokens = [],
         context_tokens = [],
         response_target = 0,
-        generated = []
+        generated = [],
+        last_save_at = 0
     },
     {ok, idle, Data}.
 
@@ -171,6 +193,8 @@ prefilling(EventType, EventContent, Data) ->
 
 generating({call, From}, status, Data) ->
     {keep_state, Data, [{reply, From, generating}]};
+generating(internal, decode_step, Data) ->
+    decode_step(Data);
 generating(EventType, EventContent, Data) ->
     handle_common(generating, EventType, EventContent, Data).
 
@@ -181,6 +205,10 @@ generating(EventType, EventContent, Data) ->
 handle_common(_State, {call, From}, {complete, _, _}, Data) ->
     %% Reject concurrent complete calls; only one in flight.
     {keep_state, Data, [{reply, From, {error, busy}}]};
+handle_common(_State, {call, From}, evict, Data) ->
+    {keep_state, fire_save_for_reason(evict, Data), [{reply, From, ok}]};
+handle_common(_State, {call, From}, shutdown, Data) ->
+    {keep_state, fire_save_for_reason(shutdown, Data), [{reply, From, ok}]};
 handle_common(_State, _EventType, _EventContent, Data) ->
     {keep_state, Data}.
 
@@ -206,22 +234,53 @@ enter_prefilling(Data) ->
     enter_generating(Data1).
 
 enter_generating(Data) ->
-    %% Run the decode loop (stubbed: produce N deterministic tokens).
-    Generated = stub_decode(
-        Data#data.context_tokens,
-        Data#data.response_target
+    %% Decode token-by-token via internal events so continued saves
+    %% can fire mid-stream. Each decode_step appends one token,
+    %% checks the policy, and either continues or finishes.
+    Data1 = Data#data{last_save_at = length(Data#data.context_tokens)},
+    {next_state, generating, Data1, [{next_event, internal, decode_step}]}.
+
+decode_step(Data) ->
+    case length(Data#data.generated) >= Data#data.response_target of
+        true ->
+            finish_request(Data);
+        false ->
+            Token = stub_decode_one(Data#data.context_tokens),
+            Data1 = Data#data{
+                context_tokens = Data#data.context_tokens ++ [Token],
+                generated = Data#data.generated ++ [Token]
+            },
+            Data2 = maybe_fire_continued(Data1),
+            {keep_state, Data2, [{next_event, internal, decode_step}]}
+    end.
+
+maybe_fire_continued(Data) ->
+    LiveCount = length(Data#data.context_tokens),
+    Should = erllama_cache_policy:should_continued_save(
+        LiveCount, Data#data.last_save_at, Data#data.policy
     ),
-    LiveTokens = Data#data.context_tokens ++ Generated,
-    ok = fire_finish_save(LiveTokens, Data),
-    Reply = stub_detokenize(Generated),
+    case Should of
+        true ->
+            ok = fire_save_if(true, continued, Data#data.context_tokens, Data),
+            Data#data{last_save_at = LiveCount};
+        false ->
+            Data
+    end.
+
+finish_request(Data) ->
+    ok = fire_finish_save(Data#data.context_tokens, Data),
+    Reply = stub_detokenize(Data#data.generated),
+    From = Data#data.caller,
+    Generated = Data#data.generated,
     Data1 = Data#data{
         caller = undefined,
         context_tokens = [],
         prompt_tokens = [],
         generated = [],
-        response_target = 0
+        response_target = 0,
+        last_save_at = 0
     },
-    {next_state, idle, Data1, [{reply, Data#data.caller, {ok, Reply, Generated}}]}.
+    {next_state, idle, Data1, [{reply, From, {ok, Reply, Generated}}]}.
 
 %% =============================================================================
 %% Internal: cache integration
@@ -296,6 +355,19 @@ fire_save_if(true, Reason, Tokens, Data) ->
     ),
     ok.
 
+%% Evict and shutdown saves: fire unconditionally if there is any
+%% live context, regardless of `min_tokens`. The plan's policy
+%% module gates only cold/continued/finish; evict and shutdown are
+%% emergency saves that capture whatever state exists. Update
+%% `last_save_at` so a follow-up continued save inside the same
+%% generation does not double-save the same tokens.
+fire_save_for_reason(_Reason, #data{context_tokens = []} = Data) ->
+    Data;
+fire_save_for_reason(Reason, Data) ->
+    Tokens = Data#data.context_tokens,
+    fire_save_if(true, Reason, Tokens, Data),
+    Data#data{last_save_at = length(Tokens)}.
+
 build_meta_for(SaveReason, Tokens, Data) ->
     #{
         save_reason => SaveReason,
@@ -342,9 +414,8 @@ stub_detokenize(Tokens) ->
 stub_prefill(_Tokens) ->
     ok.
 
-stub_decode(ContextTokens, N) ->
-    Seed = erlang:phash2(ContextTokens),
-    [erlang:phash2({Seed, I}) rem (1 bsl 32) || I <- lists:seq(1, N)].
+stub_decode_one(ContextTokens) ->
+    erlang:phash2({decode, ContextTokens}) rem (1 bsl 32).
 
 stub_kv_pack(Tokens) ->
     erllama_cache_key:encode_tokens(Tokens).
