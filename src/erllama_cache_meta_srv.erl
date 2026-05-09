@@ -95,14 +95,14 @@ start_link() ->
 -spec lookup_exact(erllama_cache:cache_key()) ->
     {ok, tuple()} | miss.
 lookup_exact(Key) ->
-    case ets:lookup(?TBL_META, Key) of
-        [Row] ->
-            case element(?POS_STATUS, Row) of
-                available -> {ok, Row};
-                _ -> miss
-            end;
-        [] ->
+    try ets:lookup_element(?TBL_META, Key, ?POS_STATUS) of
+        available ->
+            [Row] = ets:lookup(?TBL_META, Key),
+            {ok, Row};
+        _ ->
             miss
+    catch
+        error:badarg -> miss
     end.
 
 -spec lookup_exact_or_wait(erllama_cache:cache_key(), non_neg_integer()) ->
@@ -171,6 +171,9 @@ dump(Key) ->
         [Row] -> {ok, Row};
         [] -> miss
     end.
+%% Note: dump/1 wants the full row, so the lookup/2 form is appropriate
+%% here. lookup_element + lookup would be two ETS ops on the hit path
+%% with no benefit.
 
 %% =============================================================================
 %% gen_server callbacks
@@ -196,14 +199,14 @@ init([]) ->
     {ok, State}.
 
 handle_call({checkout, Key, Pid}, _From, S) ->
-    case ets:lookup(?TBL_META, Key) of
-        [Row] ->
-            case element(?POS_STATUS, Row) of
-                available -> do_checkout(Key, Pid, Row, S);
-                _ -> {reply, {error, busy}, S}
-            end;
-        [] ->
-            {reply, miss, S}
+    try ets:lookup_element(?TBL_META, Key, ?POS_STATUS) of
+        available ->
+            [Row] = ets:lookup(?TBL_META, Key),
+            do_checkout(Key, Pid, Row, S);
+        _ ->
+            {reply, {error, busy}, S}
+    catch
+        error:badarg -> {reply, miss, S}
     end;
 handle_call({checkin, MonRef}, _From, S) ->
     case maps:take(MonRef, S#state.holders) of
@@ -215,18 +218,16 @@ handle_call({checkin, MonRef}, _From, S) ->
             {reply, ok, S}
     end;
 handle_call({lookup_or_wait, Key, MaxWaitMs}, From, S) ->
-    case ets:lookup(?TBL_META, Key) of
-        [Row] ->
-            case element(?POS_STATUS, Row) of
-                available ->
-                    {reply, {ok, Row}, S};
-                writing when MaxWaitMs > 0 ->
-                    {noreply, add_waiter(Key, From, MaxWaitMs, S)};
-                _ ->
-                    {reply, miss, S}
-            end;
-        [] ->
+    try ets:lookup_element(?TBL_META, Key, ?POS_STATUS) of
+        available ->
+            [Row] = ets:lookup(?TBL_META, Key),
+            {reply, {ok, Row}, S};
+        writing when MaxWaitMs > 0 ->
+            {noreply, add_waiter(Key, From, MaxWaitMs, S)};
+        _ ->
             {reply, miss, S}
+    catch
+        error:badarg -> {reply, miss, S}
     end;
 handle_call({reserve_save, Key, Tier, Pid}, _From, S) ->
     do_reserve_save(Key, Tier, Pid, S);
@@ -325,23 +326,21 @@ do_checkout(Key, Pid, Row, S) ->
     {reply, {ok, MonRef, Tier, Loc, Header, Tokens}, S#state{holders = Holders1}}.
 
 decrement_refcount(Key) ->
-    case ets:lookup(?TBL_META, Key) of
-        [_Row] ->
-            _ = ets:update_counter(?TBL_META, Key, {?POS_REFCOUNT, -1, 0, 0}),
-            ok;
-        [] ->
-            ok
+    try
+        _ = ets:update_counter(?TBL_META, Key, {?POS_REFCOUNT, -1, 0, 0}),
+        ok
+    catch
+        error:badarg -> ok
     end.
 
 install_available_row(Key, Tier, Size, Header, Location) ->
     NowNs = monotonic_ns(),
     %% If there is an existing row (e.g. placeholder from reservation),
     %% remove its LRU entry first so we do not leave a dead pair.
-    case ets:lookup(?TBL_META, Key) of
-        [Old] ->
-            ets:delete(?TBL_LRU, {element(?POS_LAST_USED, Old), Key});
-        [] ->
-            ok
+    try ets:lookup_element(?TBL_META, Key, ?POS_LAST_USED) of
+        OldLastUsed -> ets:delete(?TBL_LRU, {OldLastUsed, Key})
+    catch
+        error:badarg -> ok
     end,
     Row =
         {Key, Tier, Size, NowNs, 0, available, Header, Location, undefined},
@@ -354,18 +353,15 @@ install_available_row(Key, Tier, Size, Header, Location) ->
 %% =============================================================================
 
 do_reserve_save(Key, Tier, Pid, S) ->
-    case ets:lookup(?TBL_META, Key) of
-        [Row] ->
-            case element(?POS_STATUS, Row) of
-                available ->
-                    {reply, {error, already_present}, S};
-                writing ->
-                    handle_existing_writing_row(Key, Tier, Pid, S);
-                evicting ->
-                    {reply, {error, conflict}, S}
-            end;
-        [] ->
-            create_reservation(Key, Tier, Pid, S)
+    try ets:lookup_element(?TBL_META, Key, ?POS_STATUS) of
+        available ->
+            {reply, {error, already_present}, S};
+        writing ->
+            handle_existing_writing_row(Key, Tier, Pid, S);
+        evicting ->
+            {reply, {error, conflict}, S}
+    catch
+        error:badarg -> create_reservation(Key, Tier, Pid, S)
     end.
 
 handle_existing_writing_row(Key, Tier, Pid, S) ->
@@ -541,22 +537,24 @@ run_eviction('$end_of_table', N) ->
     N;
 run_eviction({_LastUsed, Key} = LruKey, N) ->
     Next = ets:next(?TBL_LRU, LruKey),
-    case ets:lookup(?TBL_META, Key) of
-        [Row] ->
-            case {element(?POS_STATUS, Row), element(?POS_REFCOUNT, Row)} of
-                {available, 0} ->
-                    %% Eviction of available, unreferenced rows.
-                    %% Tier-side delete (file deletes for disk/ram_file
-                    %% and slab-table deletes for ram) lands in step 7
-                    %% when those tiers exist; here we drop the meta
-                    %% row and the LRU entry only.
-                    ets:delete(?TBL_LRU, LruKey),
-                    ets:delete(?TBL_META, Key),
-                    run_eviction(Next, N + 1);
-                _ ->
-                    run_eviction(Next, N)
-            end;
-        [] ->
+    try
+        {
+            ets:lookup_element(?TBL_META, Key, ?POS_STATUS),
+            ets:lookup_element(?TBL_META, Key, ?POS_REFCOUNT)
+        }
+    of
+        {available, 0} ->
+            %% Eviction of available, unreferenced rows. Tier-side
+            %% delete (file deletes for disk/ram_file and slab-table
+            %% deletes for ram) lands in step 7 when those tiers exist;
+            %% here we drop the meta row and the LRU entry only.
+            ets:delete(?TBL_LRU, LruKey),
+            ets:delete(?TBL_META, Key),
+            run_eviction(Next, N + 1);
+        _ ->
+            run_eviction(Next, N)
+    catch
+        error:badarg ->
             ets:delete(?TBL_LRU, LruKey),
             run_eviction(Next, N)
     end.
