@@ -42,6 +42,7 @@
 -export([
     start_link/2,
     start_link/3,
+    start_link/4,
     save/3,
     load/2,
     delete/2,
@@ -54,7 +55,8 @@
 -record(state, {
     name :: atom(),
     tier :: disk | ram_file,
-    root :: file:name()
+    root :: file:name(),
+    disk_io :: read_write | iommap
 }).
 
 -type state() :: #state{}.
@@ -65,12 +67,25 @@
 
 -spec start_link(atom(), file:name()) -> {ok, pid()} | {error, term()}.
 start_link(Name, RootDir) ->
-    start_link(Name, disk, RootDir).
+    start_link(Name, disk, RootDir, read_write).
 
 -spec start_link(atom(), disk | ram_file, file:name()) ->
     {ok, pid()} | {error, term()}.
-start_link(Name, Tier, RootDir) when Tier =:= disk; Tier =:= ram_file ->
-    gen_server:start_link({local, Name}, ?MODULE, [Name, Tier, RootDir], []).
+start_link(Name, Tier, RootDir) ->
+    start_link(Name, Tier, RootDir, read_write).
+
+-spec start_link(atom(), disk | ram_file, file:name(), read_write | iommap) ->
+    {ok, pid()} | {error, term()}.
+start_link(Name, Tier, RootDir, DiskIO) when
+    Tier =:= disk; Tier =:= ram_file
+->
+    case DiskIO of
+        read_write -> ok;
+        iommap -> ok
+    end,
+    gen_server:start_link(
+        {local, Name}, ?MODULE, [Name, Tier, RootDir, DiskIO], []
+    ).
 
 -spec save(atom(), erllama_cache_kvc:build_meta(), binary()) ->
     {ok, erllama_cache:cache_key(), binary(), non_neg_integer()}
@@ -103,8 +118,8 @@ scan(SrvName) ->
 %% gen_server callbacks
 %% =============================================================================
 
--spec init([atom() | file:name()]) -> {ok, state()}.
-init([Name, Tier, Root]) ->
+-spec init([term()]) -> {ok, state()}.
+init([Name, Tier, Root, DiskIO]) ->
     case filelib:ensure_path(Root) of
         ok -> ok;
         {error, Reason} -> erlang:error({cannot_create_dir, Root, Reason})
@@ -113,12 +128,12 @@ init([Name, Tier, Root]) ->
     sweep_tmps(Root),
     %% Register every valid .kvc with the meta server.
     register_existing(Tier, Root),
-    {ok, #state{name = Name, tier = Tier, root = Root}}.
+    {ok, #state{name = Name, tier = Tier, root = Root, disk_io = DiskIO}}.
 
 handle_call({save, BuildMeta, Payload}, _From, S) ->
     {reply, do_save(BuildMeta, Payload, S#state.root), S};
 handle_call({load, Key}, _From, S) ->
-    {reply, do_load(Key, S#state.root), S};
+    {reply, do_load(Key, S#state.root, S#state.disk_io), S};
 handle_call({delete, Key}, _From, S) ->
     {reply, do_delete(Key, S#state.root), S};
 handle_call(dir, _From, S) ->
@@ -234,18 +249,47 @@ finalise(Key, Prefix, _Payload, FinalPath, Root) ->
 %% Internal: load / delete
 %% =============================================================================
 
-do_load(Key, Root) ->
+do_load(Key, Root, DiskIO) ->
     Path = filename:join(Root, bin_to_hex(Key) ++ ".kvc"),
+    case load_bin(Path, DiskIO) of
+        {ok, Bin} -> parse_or_drop(Bin, Key, Path);
+        miss -> miss;
+        {error, _} = E -> E
+    end.
+
+parse_or_drop(Bin, Key, Path) ->
+    case erllama_cache_kvc:parse(Bin, Key) of
+        {ok, Info, Payload} ->
+            {ok, Info, Payload};
+        {error, R} ->
+            %% Corrupt file: drop it so the next request doesn't
+            %% repeat the same failed parse.
+            _ = prim_file:delete(Path),
+            {error, R}
+    end.
+
+load_bin(Path, read_write) ->
     case file:read_file(Path) of
-        {ok, Bin} ->
-            case erllama_cache_kvc:parse(Bin, Key) of
-                {ok, Info, Payload} ->
-                    {ok, Info, Payload};
-                {error, R} ->
-                    %% Corrupt file: drop it so the next request
-                    %% doesn't repeat the same failed parse.
-                    _ = prim_file:delete(Path),
-                    {error, R}
+        {ok, Bin} -> {ok, Bin};
+        {error, enoent} -> miss;
+        {error, _} = E -> E
+    end;
+load_bin(Path, iommap) ->
+    %% Zero-copy disk -> BEAM via iommap:region_binary/3. The handle
+    %% is closed before this function returns; the returned binary is
+    %% a refcounted resource that keeps the underlying mapping alive
+    %% via iommap's two-resource lifetime, so the BEAM owns the
+    %% memory until GC of the (sub-)binaries.
+    case iommap:open(Path, read, []) of
+        {ok, H} ->
+            try
+                Size = file_size(Path),
+                case iommap:region_binary(H, 0, Size) of
+                    {ok, Bin} -> {ok, Bin};
+                    {error, _} = E -> E
+                end
+            after
+                iommap:close(H)
             end;
         {error, enoent} ->
             miss;

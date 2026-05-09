@@ -8,7 +8,8 @@
         kernel,
         stdlib,
         sasl,
-        crypto
+        crypto,
+        iommap
     ]},
     {env, [
         {tiers, [
