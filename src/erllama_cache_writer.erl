@@ -290,7 +290,12 @@ derive_key(BuildMeta) ->
 do_save_reserved(TierSrv, Key, Token, BuildMeta, Payload) ->
     case erllama_cache_disk_srv:save(TierSrv, BuildMeta, Payload) of
         {ok, _SameKey, Header, Size} ->
-            case erllama_cache_meta_srv:announce_saved(Key, Token, Size, Header) of
+            TokensBin = erllama_cache_key:encode_tokens(maps:get(tokens, BuildMeta)),
+            case
+                erllama_cache_meta_srv:announce_saved(
+                    Key, Token, Size, Header, TokensBin
+                )
+            of
                 ok ->
                     bump_save_counter(maps:get(save_reason, BuildMeta, unknown)),
                     {ok, Key};

@@ -52,6 +52,11 @@ init_per_testcase(TC, Config) ->
     PrivDir = ?config(priv_dir, Config),
     Dir = filename:join(PrivDir, atom_to_list(TC) ++ "_dir"),
     ok = filelib:ensure_path(Dir),
+    %% Clear any rows from previous testcases. Cache keys are stable
+    %% across testcases (same fingerprint + ctx + tokens), so a stale
+    %% row would shadow a fresh save and the writer would short-circuit
+    %% on `already_present`.
+    {evicted, _} = erllama_cache_meta_srv:gc(),
     DiskSrv = list_to_atom("ct_disk_" ++ atom_to_list(TC)),
     {ok, _} = erllama_cache_disk_srv:start_link(DiskSrv, Dir),
     Model = list_to_atom("ct_model_" ++ atom_to_list(TC)),

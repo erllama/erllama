@@ -431,6 +431,40 @@ static ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     return atom_ok;
 }
 
+/* Remove the cells in [p0, p1) from the given sequence. p0 < 0 means
+ * 0; p1 < 0 means infinity. Returns ok or {error, partial}. The save
+ * format only stores KV cells; the per-context logits buffer is not
+ * restored. So after kv_unpack the model layer drops the last cell of
+ * the saved sequence and re-prefills the corresponding token to
+ * regenerate logits for the next sample. */
+static ERL_NIF_TERM nif_kv_seq_rm(ErlNifEnv *env, int argc,
+                                  const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    if (!c->ctx) {
+        return enif_make_tuple2(env, atom_error, atom_unpack_failed);
+    }
+    int seq_id, p0, p1;
+    if (!enif_get_int(env, argv[1], &seq_id) ||
+        !enif_get_int(env, argv[2], &p0) ||
+        !enif_get_int(env, argv[3], &p1)) {
+        return enif_make_badarg(env);
+    }
+    llama_memory_t mem = llama_get_memory(c->ctx);
+    if (!mem) {
+        return enif_make_tuple2(env, atom_error, atom_unpack_failed);
+    }
+    bool ok = llama_memory_seq_rm(mem, (llama_seq_id) seq_id,
+                                  (llama_pos) p0, (llama_pos) p1);
+    if (!ok) {
+        return enif_make_tuple2(env, atom_error, atom_unpack_failed);
+    }
+    return atom_ok;
+}
+
 /* =========================================================================
  * Prefill / decode_one / detokenize
  * ========================================================================= */
@@ -656,6 +690,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_crc32c",       1, nif_crc32c,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      3, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_unpack",    3, nif_kv_unpack,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_kv_seq_rm",    4, nif_kv_seq_rm,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_fsync_dir",    1, nif_fsync_dir,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_load_model",   2, nif_load_model,   ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_free_model",   1, nif_free_model,   0},

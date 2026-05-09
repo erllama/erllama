@@ -346,13 +346,15 @@ scan_kvc(Path, Acc) ->
             case erllama_cache_kvc:parse_meta(Bin) of
                 {ok, Info} ->
                     Header = binary:part(Bin, 0, 48),
+                    Tokens = maps:get(tokens, Info),
                     Key = erllama_cache_key:make(#{
                         fingerprint => maps:get(fingerprint, Info),
                         quant_type => maps:get(quant_type, Info),
                         ctx_params_hash => maps:get(ctx_params_hash, Info),
-                        tokens => maps:get(tokens, Info)
+                        tokens => Tokens
                     }),
-                    [{Key, Header, byte_size(Bin)} | Acc];
+                    TokensBin = erllama_cache_key:encode_tokens(Tokens),
+                    [{Key, Header, byte_size(Bin), TokensBin} | Acc];
                 {error, _} ->
                     _ = prim_file:delete(Path),
                     Acc
@@ -364,10 +366,10 @@ scan_kvc(Path, Acc) ->
 register_existing(Tier, Root) ->
     Entries = scan_dir(Root),
     lists:foreach(
-        fun({Key, Header, Size}) ->
+        fun({Key, Header, Size, TokensBin}) ->
             Path = filename:join(Root, bin_to_hex(Key) ++ ".kvc"),
             erllama_cache_meta_srv:insert_available(
-                Key, Tier, Size, Header, {Tier, Path}
+                Key, Tier, Size, Header, {Tier, Path}, TokensBin
             )
         end,
         Entries

@@ -21,7 +21,8 @@
     prefill/2,
     decode_one/2,
     kv_pack/2,
-    kv_unpack/2
+    kv_unpack/2,
+    seq_rm_last/2
 ]).
 
 -record(s, {
@@ -68,3 +69,11 @@ kv_pack(#s{ctx = C}, Tokens) ->
 
 kv_unpack(#s{ctx = C}, Bin) ->
     erllama_nif:kv_unpack(C, Bin, 0).
+
+%% Drop the cell at position N-1 from seq 0 so the model layer can
+%% re-prefill the corresponding token and regenerate logits.
+%% `llama_state_seq_*` only persists KV cells, never the per-context
+%% logits buffer; without this primer the next sample would read stale
+%% (or zero) logits.
+seq_rm_last(#s{ctx = C}, NTokens) when NTokens > 0 ->
+    erllama_nif:kv_seq_rm(C, 0, NTokens - 1, -1).

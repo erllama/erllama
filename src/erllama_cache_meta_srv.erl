@@ -43,6 +43,7 @@
     check_reservation/2,
     mark_published/3,
     announce_saved/4,
+    announce_saved/5,
     cancel_reservation/2,
     %% Operator/test helpers
     gc/0,
@@ -50,7 +51,8 @@
     evict_bytes/2,
     dump/0,
     dump/1,
-    insert_available/5
+    insert_available/5,
+    insert_available/6
 ]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
@@ -138,10 +140,23 @@ check_reservation(Key, Token) when is_reference(Token) ->
 mark_published(Key, Token, Path) when is_reference(Token) ->
     gen_server:call(?SERVER, {mark_published, Key, Token, Path}).
 
--spec announce_saved(erllama_cache:cache_key(), reference(), non_neg_integer(), binary()) ->
-    ok | {error, expired}.
-announce_saved(Key, Token, Size, Header) when is_reference(Token), is_binary(Header) ->
-    gen_server:call(?SERVER, {announce_saved, Key, Token, Size, Header}).
+-spec announce_saved(
+    erllama_cache:cache_key(), reference(), non_neg_integer(), binary()
+) -> ok | {error, expired}.
+announce_saved(Key, Token, Size, Header) ->
+    announce_saved(Key, Token, Size, Header, undefined).
+
+-spec announce_saved(
+    erllama_cache:cache_key(),
+    reference(),
+    non_neg_integer(),
+    binary(),
+    binary() | undefined
+) -> ok | {error, expired}.
+announce_saved(Key, Token, Size, Header, TokensBin) when
+    is_reference(Token), is_binary(Header)
+->
+    gen_server:call(?SERVER, {announce_saved, Key, Token, Size, Header, TokensBin}).
 
 -spec cancel_reservation(erllama_cache:cache_key(), reference()) -> ok.
 cancel_reservation(Key, Token) when is_reference(Token) ->
@@ -158,8 +173,19 @@ cancel_reservation(Key, Token) when is_reference(Token) ->
     term()
 ) -> ok.
 insert_available(Key, Tier, Size, Header, Location) ->
+    insert_available(Key, Tier, Size, Header, Location, undefined).
+
+-spec insert_available(
+    erllama_cache:cache_key(),
+    erllama_cache:tier(),
+    non_neg_integer(),
+    binary(),
+    term(),
+    binary() | undefined
+) -> ok.
+insert_available(Key, Tier, Size, Header, Location, TokensBin) ->
     gen_server:call(
-        ?SERVER, {insert_available, Key, Tier, Size, Header, Location}
+        ?SERVER, {insert_available, Key, Tier, Size, Header, Location, TokensBin}
     ).
 
 -spec gc() -> {evicted, non_neg_integer()}.
@@ -272,12 +298,12 @@ handle_call({mark_published, Key, Token, Path}, _From, S) ->
         _ ->
             {reply, {error, expired}, S}
     end;
-handle_call({announce_saved, Key, Token, Size, Header}, _From, S) ->
+handle_call({announce_saved, Key, Token, Size, Header, TokensBin}, _From, S) ->
     case maps:get(Key, S#state.reservations, undefined) of
         #reservation{token = Token, monref = MonRef, tier = Tier, path = Path} ->
             erlang:demonitor(MonRef, [flush]),
             install_available_row(
-                Key, Tier, Size, Header, location_for(Tier, Path)
+                Key, Tier, Size, Header, location_for(Tier, Path), TokensBin
             ),
             S1 = S#state{reservations = maps:remove(Key, S#state.reservations)},
             S2 = notify_waiters(Key, S1),
@@ -295,8 +321,8 @@ handle_call({cancel_reservation, Key, Token}, _From, S) ->
         _ ->
             {reply, ok, S}
     end;
-handle_call({insert_available, Key, Tier, Size, Header, Location}, _From, S) ->
-    install_available_row(Key, Tier, Size, Header, Location),
+handle_call({insert_available, Key, Tier, Size, Header, Location, TokensBin}, _From, S) ->
+    install_available_row(Key, Tier, Size, Header, Location, TokensBin),
     S1 = notify_waiters(Key, S),
     {reply, ok, S1};
 handle_call(gc, _From, S) ->
@@ -359,17 +385,15 @@ decrement_refcount(Key) ->
         error:badarg -> ok
     end.
 
-install_available_row(Key, Tier, Size, Header, Location) ->
+install_available_row(Key, Tier, Size, Header, Location, TokensBin) ->
     NowNs = monotonic_ns(),
-    %% If there is an existing row (e.g. placeholder from reservation),
-    %% remove its LRU entry first so we do not leave a dead pair.
     try ets:lookup_element(?TBL_META, Key, ?POS_LAST_USED) of
         OldLastUsed -> ets:delete(?TBL_LRU, {OldLastUsed, Key})
     catch
         error:badarg -> ok
     end,
     Row =
-        {Key, Tier, Size, NowNs, 0, available, Header, Location, undefined},
+        {Key, Tier, Size, NowNs, 0, available, Header, Location, TokensBin},
     ets:insert(?TBL_META, Row),
     ets:insert(?TBL_LRU, {{NowNs, Key}, []}),
     ok.
@@ -434,8 +458,10 @@ cleanup_by_stage(Key, #reservation{stage = pre_link}, S) ->
     S#state{reservations = maps:remove(Key, S#state.reservations)};
 cleanup_by_stage(Key, #reservation{stage = post_link, path = Path, tier = Tier}, S) ->
     case validate_and_adopt(Key, Path) of
-        {ok, Size, Header} ->
-            install_available_row(Key, Tier, Size, Header, location_for(Tier, Path)),
+        {ok, Size, Header, TokensBin} ->
+            install_available_row(
+                Key, Tier, Size, Header, location_for(Tier, Path), TokensBin
+            ),
             S1 = S#state{reservations = maps:remove(Key, S#state.reservations)},
             notify_waiters(Key, S1);
         {error, _Reason} ->
@@ -448,8 +474,12 @@ validate_and_adopt(Key, Path) ->
     case file:read_file(Path) of
         {ok, Bin} ->
             case erllama_cache_kvc:parse(Bin, Key) of
-                {ok, _Info, _Payload} -> {ok, byte_size(Bin), header_slice(Bin)};
-                {error, R} -> {error, R}
+                {ok, Info, _Payload} ->
+                    Tokens = maps:get(tokens, Info, []),
+                    TokensBin = erllama_cache_key:encode_tokens(Tokens),
+                    {ok, byte_size(Bin), header_slice(Bin), TokensBin};
+                {error, R} ->
+                    {error, R}
             end;
         {error, R} ->
             {error, R}

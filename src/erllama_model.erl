@@ -170,7 +170,7 @@ idle({call, From}, {complete, Prompt, Opts}, Data) ->
     },
     case lookup_or_resume(PromptTokens, ParentKey, Data1) of
         {warm, ContextTokens, RemainingTokens} ->
-            ok = backend_call(Data1, prefill, [RemainingTokens]),
+            ok = prime_logits(ContextTokens, RemainingTokens, Data1),
             Data2 = Data1#data{
                 context_tokens = ContextTokens ++ RemainingTokens
             },
@@ -358,14 +358,12 @@ load_tokens_from_row(Row, Data) ->
                     _ -> <<>>
                 end
         end,
-    %% Hand the slab to the backend (real kv_unpack for llama; the
-    %% stub backend ignores the bytes and just returns ok). The
-    %% gen_statem also uses the decoded token list to track which
-    %% tokens are now in the context for future prefix checks.
     _ = backend_call(Data, kv_unpack, [Bin]),
-    case Bin of
-        <<>> -> [];
-        _ -> erllama_cache_key:decode_tokens(Bin)
+    case element(?POS_TOKENS_REF, Row) of
+        undefined ->
+            [];
+        TokensBin when is_binary(TokensBin) ->
+            erllama_cache_key:decode_tokens(TokensBin)
     end.
 
 fire_cold_save(TrimmedPrefix, Data) ->
@@ -432,3 +430,25 @@ is_strict_prefix(_, _) -> false.
 
 backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
     apply(Mod, Fn, [S | Args]).
+
+%% After kv_unpack, the per-context logits buffer is stale. To regenerate
+%% it the model layer drops the last cell of the restored sequence and
+%% prefills the corresponding token. If the warm hit also has remaining
+%% tokens (parent_key resume), they are prefilled in the same single
+%% prefill call: the last "context" token gets popped, prepended to the
+%% remaining list, and the whole batch goes through one llama_decode.
+prime_logits([], Remaining, Data) ->
+    backend_call(Data, prefill, [Remaining]);
+prime_logits(ContextTokens, Remaining, #data{backend = Mod} = Data) ->
+    case erlang:function_exported(Mod, seq_rm_last, 2) of
+        true ->
+            N = length(ContextTokens),
+            Last = lists:last(ContextTokens),
+            ok = backend_call(Data, seq_rm_last, [N]),
+            backend_call(Data, prefill, [[Last | Remaining]]);
+        false ->
+            %% Backends without a real KV cache (e.g. the stub) just
+            %% prefill any remaining tokens; the saved "state" carries
+            %% no logits anyway.
+            backend_call(Data, prefill, [Remaining])
+    end.

@@ -32,7 +32,8 @@
     prefill/2,
     decode_one/1,
     kv_pack/3,
-    kv_unpack/3
+    kv_unpack/3,
+    kv_seq_rm/4
 ]).
 
 -on_load(init/0).
@@ -99,6 +100,13 @@ kv_pack(Ctx, Tokens, NTokens) -> nif_kv_pack(Ctx, Tokens, NTokens).
     ok | {error, atom()}.
 kv_unpack(Ctx, Bin, SeqId) -> nif_kv_unpack(Ctx, Bin, SeqId).
 
+%% Remove KV cells in [P0, P1) from sequence SeqId. Use P1 = -1 for
+%% "to infinity". Required after kv_unpack to drop the last cell so
+%% the corresponding token can be re-prefilled to regenerate logits.
+-spec kv_seq_rm(context_ref(), integer(), integer(), integer()) ->
+    ok | {error, atom()}.
+kv_seq_rm(Ctx, SeqId, P0, P1) -> nif_kv_seq_rm(Ctx, SeqId, P0, P1).
+
 %% =============================================================================
 %% NIF stubs (replaced at on_load time)
 %% =============================================================================
@@ -115,3 +123,4 @@ nif_prefill(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_decode_one(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_kv_pack(_Ctx, _Tokens, _NTokens) -> erlang:nif_error(nif_not_loaded).
 nif_kv_unpack(_Ctx, _Bin, _SeqId) -> erlang:nif_error(nif_not_loaded).
+nif_kv_seq_rm(_Ctx, _SeqId, _P0, _P1) -> erlang:nif_error(nif_not_loaded).

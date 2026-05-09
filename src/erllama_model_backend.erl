@@ -37,4 +37,14 @@
 
 -callback kv_unpack(state(), Bin :: binary()) -> ok | {error, term()}.
 
+%% Optional. Drop the last KV cell of the active sequence so the
+%% caller can re-prefill the corresponding token to regenerate logits
+%% after a kv_unpack. Backends that don't carry a real KV cache (the
+%% stub) can omit this — `erllama_model` checks `is_exported/3` and
+%% skips the primer when absent.
+-callback seq_rm_last(state(), NTokens :: pos_integer()) ->
+    ok | {error, term()}.
+
+-optional_callbacks([seq_rm_last/2]).
+
 -export_type([state/0]).
