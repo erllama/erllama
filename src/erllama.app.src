@@ -28,5 +28,41 @@
     ]},
     {modules, []},
     {licenses, ["Apache-2.0"]},
-    {links, []}
+    {links, []},
+    %% Hex package manifest. Whitelist what to include and exclude
+    %% the parts of vendored llama.cpp that are not needed at build
+    %% time (docs, scripts, unused backends already pruned at
+    %% vendor time).
+    {files, [
+        "rebar.config",
+        "rebar.lock",
+        "do_cmake.sh",
+        "do_llama.sh",
+        "README.md",
+        "AGENTS.md",
+        "CLAUDE.md",
+        "LICENSE",
+        "IOMMAP_PREREQUISITE.md",
+        "UPDATE_LLAMA.md",
+        "config",
+        "src",
+        "include",
+        "test",
+        "c_src/CMakeLists.txt",
+        "c_src/erllama_nif.c",
+        "c_src/crc32c.c",
+        "c_src/crc32c.h",
+        "c_src/llama.cpp"
+    ]},
+    {exclude_files, [
+        "c_src/llama.cpp/.git",
+        "c_src/llama.cpp/.github",
+        "c_src/llama.cpp/.devops",
+        "c_src/llama.cpp/.gemini",
+        "c_src/llama.cpp/.pi",
+        "c_src/llama.cpp/.pre-commit-config.yaml",
+        "c_src/llama.cpp/.dockerignore",
+        "c_src/llama.cpp/AUTHORS",
+        "c_src/llama.cpp/build-xcframework.sh"
+    ]}
 ]}.

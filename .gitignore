@@ -1,5 +1,6 @@
 _build/
 .rebar3/
+c_src/llama.cpp/build/
 .eunit/
 *.beam
 *.so
