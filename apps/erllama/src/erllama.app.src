@@ -1,16 +1,16 @@
-{application, erllama,
- [{description, "Native Erlang/OTP wrapper around llama.cpp with OpenAI-compatible API"},
-  {vsn, "0.1.0"},
-  {registered, [erllama_sup]},
-  {mod, {erllama_app, []}},
-  {applications,
-   [kernel,
-    stdlib,
-    sasl,
-    erllama_cache
-   ]},
-  {env, []},
-  {modules, []},
-  {licenses, ["Apache-2.0"]},
-  {links, []}
- ]}.
+{application, erllama, [
+    {description, "Native Erlang/OTP wrapper around llama.cpp with OpenAI-compatible API"},
+    {vsn, "0.1.0"},
+    {registered, [erllama_sup]},
+    {mod, {erllama_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        sasl,
+        erllama_cache
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+]}.

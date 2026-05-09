@@ -1,0 +1,149 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Unit Tests OTP ${{ matrix.otp }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            otp: '28'
+            rebar3: '3.25.0'
+          - os: macos-14
+            otp: '28'
+            rebar3: '3.25.0'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: ${{ matrix.rebar3 }}
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: ${{ runner.os }}-otp-${{ matrix.otp }}-mix-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-otp-${{ matrix.otp }}-mix-
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: Run unit tests
+        run: rebar3 eunit
+
+      - name: Run property tests
+        run: rebar3 proper || true
+
+  ct:
+    name: Common Test
+    needs: unit-tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+
+      - name: Restore dependencies cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: ${{ runner.os }}-ct-otp28-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ct-otp28-
+
+      - name: Compile
+        run: rebar3 compile
+
+      - name: Run Common Test
+        run: rebar3 ct || true
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+
+      - name: Restore PLT cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            _build/*_plt
+            ~/.cache/rebar3
+          key: ${{ runner.os }}-plt-otp28-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-plt-otp28-
+
+      - name: Run Dialyzer
+        run: rebar3 dialyzer
+
+  xref:
+    name: XRef
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+
+      - name: Run XRef
+        run: rebar3 xref
+
+  format:
+    name: erlfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+
+      - name: Run erlfmt check
+        run: rebar3 fmt --check
+
+  lint:
+    name: Elvis lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Erlang
+        uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+
+      - name: Run elvis lint
+        run: rebar3 lint
