@@ -58,17 +58,40 @@ crc32c_badarg_integer_test() ->
     ?assertError(badarg, erllama_nif:crc32c(42)).
 
 %% =============================================================================
-%% kv_pack / kv_unpack stubs (step 2a)
+%% Resource-arg validation
 %% =============================================================================
 
-kv_pack_returns_not_implemented_test() ->
-    ?assertEqual(
-        {error, not_implemented},
-        erllama_nif:kv_pack(make_ref(), [1, 2, 3], 3)
-    ).
+kv_pack_rejects_non_resource_test() ->
+    ?assertError(badarg, erllama_nif:kv_pack(make_ref(), [1, 2, 3], 3)).
 
-kv_unpack_returns_not_implemented_test() ->
-    ?assertEqual(
-        {error, not_implemented},
-        erllama_nif:kv_unpack(make_ref(), <<>>, 0)
-    ).
+kv_unpack_rejects_non_resource_test() ->
+    ?assertError(badarg, erllama_nif:kv_unpack(make_ref(), <<>>, 0)).
+
+load_model_rejects_non_existent_path_test() ->
+    Result = erllama_nif:load_model(<<"/no/such/file.gguf">>, #{}),
+    ?assertMatch({error, _}, Result).
+
+%% =============================================================================
+%% End-to-end smoke (gated by LLAMA_TEST_MODEL env var)
+%% =============================================================================
+
+llama_load_and_tokenize_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping live smoke test", []};
+        Path ->
+            {timeout, 60, fun() -> live_smoke(list_to_binary(Path)) end}
+    end.
+
+live_smoke(Path) ->
+    {ok, Model} = erllama_nif:load_model(Path, #{n_gpu_layers => 0}),
+    Tokens = erllama_nif:tokenize(Model, <<"Hello world">>, #{
+        add_special => true, parse_special => false
+    }),
+    ?assert(is_list(Tokens)),
+    ?assert(length(Tokens) > 0),
+    {ok, Ctx} = erllama_nif:new_context(Model, #{n_ctx => 256}),
+    Bin = erllama_nif:kv_pack(Ctx, Tokens, length(Tokens)),
+    ?assert(is_binary(Bin)),
+    ok = erllama_nif:free_context(Ctx),
+    ok = erllama_nif:free_model(Model).

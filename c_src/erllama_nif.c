@@ -1,47 +1,164 @@
 /*
- * erllama_nif: the single NIF for erllama (cache + future llama.cpp
- * surface).
+ * erllama_nif: single NIF for erllama (cache + llama.cpp surface).
  *
- * v0.1 surface:
- *   crc32c(IoData) -> non_neg_integer()    [dirty CPU]
+ * v0.2 surface:
+ *   crc32c(IoData) -> non_neg_integer()              [dirty CPU]
+ *   fsync_dir(Path) -> ok | {error, atom()}          [dirty IO]
+ *   load_model(Path, Opts) -> {ok, ModelRes} | ...   [dirty IO]
+ *   free_model(ModelRes) -> ok                       [regular]
+ *   new_context(ModelRes, Opts) -> {ok, CtxRes} | .. [dirty CPU]
+ *   free_context(CtxRes) -> ok                       [regular]
+ *   tokenize(ModelRes, Text, Opts) -> [token_id()]   [dirty CPU]
+ *   kv_pack(CtxRes, _Tokens, _NTokens) -> Binary     [dirty CPU]
+ *   kv_unpack(CtxRes, Binary, SeqId) -> ok | err     [dirty CPU]
  *
- * Stubs returning {error, not_implemented} until the llama.cpp
- * wiring lands:
- *   kv_pack(Ctx, Tokens, NTokens) -> Binary
- *   kv_unpack(Ctx, Binary, SeqId) -> ok | {error, _}
- *
- * Future additions live here too (single .so): load_model,
- * free_model, new_context, free_context, tokenize, detokenize,
- * prefill, decode_async.
- *
- * No file I/O happens here; the cache layer assembles framed .kvc
- * files in Erlang and only feeds opaque payload bytes to the NIF.
+ * Resource ownership: model and context resources hold pointers to
+ * llama.cpp objects. Their destructors call llama_model_free /
+ * llama_free. The context resource also holds a refcount on its
+ * model resource via enif_keep_resource so the model survives as
+ * long as any context derived from it does.
  */
 #include <erl_nif.h>
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include "crc32c.h"
+#include "llama.h"
+
+/* =========================================================================
+ * Atoms
+ * ========================================================================= */
 
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_error;
 static ERL_NIF_TERM atom_not_implemented;
+static ERL_NIF_TERM atom_load_failed;
+static ERL_NIF_TERM atom_context_failed;
+static ERL_NIF_TERM atom_tokenize_failed;
+static ERL_NIF_TERM atom_pack_failed;
+static ERL_NIF_TERM atom_unpack_failed;
+static ERL_NIF_TERM atom_true;
+static ERL_NIF_TERM atom_false;
+
+/* =========================================================================
+ * Resource types
+ * ========================================================================= */
+
+typedef struct {
+    struct llama_model *model;
+} erllama_model_t;
+
+typedef struct {
+    struct llama_context *ctx;
+    /* Hold a reference on the model resource so it cannot be GC'd while a
+     * context referencing it is alive. */
+    erllama_model_t *model_res;
+} erllama_context_t;
+
+static ErlNifResourceType *MODEL_RT;
+static ErlNifResourceType *CTX_RT;
+
+static void model_dtor(ErlNifEnv *env, void *obj) {
+    (void) env;
+    erllama_model_t *m = (erllama_model_t *) obj;
+    if (m->model) {
+        llama_model_free(m->model);
+        m->model = NULL;
+    }
+}
+
+static void ctx_dtor(ErlNifEnv *env, void *obj) {
+    (void) env;
+    erllama_context_t *c = (erllama_context_t *) obj;
+    if (c->ctx) {
+        llama_free(c->ctx);
+        c->ctx = NULL;
+    }
+    if (c->model_res) {
+        enif_release_resource(c->model_res);
+        c->model_res = NULL;
+    }
+}
+
+/* =========================================================================
+ * Load callback
+ * ========================================================================= */
 
 static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     (void) priv_data;
     (void) load_info;
 
     erllama_crc32c_init();
+    llama_backend_init();
 
     atom_ok = enif_make_atom(env, "ok");
     atom_error = enif_make_atom(env, "error");
     atom_not_implemented = enif_make_atom(env, "not_implemented");
+    atom_load_failed = enif_make_atom(env, "load_failed");
+    atom_context_failed = enif_make_atom(env, "context_failed");
+    atom_tokenize_failed = enif_make_atom(env, "tokenize_failed");
+    atom_pack_failed = enif_make_atom(env, "pack_failed");
+    atom_unpack_failed = enif_make_atom(env, "unpack_failed");
+    atom_true = enif_make_atom(env, "true");
+    atom_false = enif_make_atom(env, "false");
+
+    MODEL_RT = enif_open_resource_type(
+        env, NULL, "erllama_model", model_dtor, ERL_NIF_RT_CREATE, NULL);
+    if (!MODEL_RT) return -1;
+
+    CTX_RT = enif_open_resource_type(
+        env, NULL, "erllama_context", ctx_dtor, ERL_NIF_RT_CREATE, NULL);
+    if (!CTX_RT) return -1;
 
     return 0;
 }
+
+/* =========================================================================
+ * Helpers
+ * ========================================================================= */
+
+static int copy_path(ErlNifEnv *env, ERL_NIF_TERM term, char *out, size_t cap) {
+    ErlNifBinary bin;
+    if (!enif_inspect_iolist_as_binary(env, term, &bin)) return 0;
+    if (bin.size == 0 || bin.size >= cap) return 0;
+    memcpy(out, bin.data, bin.size);
+    out[bin.size] = '\0';
+    return 1;
+}
+
+static int get_map_uint(
+    ErlNifEnv *env, ERL_NIF_TERM map, const char *key, unsigned int *out
+) {
+    ERL_NIF_TERM v;
+    ERL_NIF_TERM k = enif_make_atom(env, key);
+    if (!enif_get_map_value(env, map, k, &v)) return 0;
+    return enif_get_uint(env, v, out);
+}
+
+static int get_map_bool(
+    ErlNifEnv *env, ERL_NIF_TERM map, const char *key, int *out
+) {
+    ERL_NIF_TERM v;
+    ERL_NIF_TERM k = enif_make_atom(env, key);
+    if (!enif_get_map_value(env, map, k, &v)) return 0;
+    if (enif_compare(v, atom_true) == 0) {
+        *out = 1;
+        return 1;
+    }
+    if (enif_compare(v, atom_false) == 0) {
+        *out = 0;
+        return 1;
+    }
+    return 0;
+}
+
+/* =========================================================================
+ * crc32c
+ * ========================================================================= */
 
 static ERL_NIF_TERM nif_crc32c(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void) argc;
@@ -53,21 +170,271 @@ static ERL_NIF_TERM nif_crc32c(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
     return enif_make_uint(env, crc);
 }
 
+/* =========================================================================
+ * Model
+ * ========================================================================= */
+
+static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    char path[4097];
+    if (!copy_path(env, argv[0], path, sizeof(path))) {
+        return enif_make_badarg(env);
+    }
+    if (!enif_is_map(env, argv[1])) {
+        return enif_make_badarg(env);
+    }
+
+    struct llama_model_params params = llama_model_default_params();
+
+    unsigned int u;
+    if (get_map_uint(env, argv[1], "n_gpu_layers", &u)) {
+        params.n_gpu_layers = (int32_t) u;
+    }
+    int b;
+    if (get_map_bool(env, argv[1], "use_mmap", &b)) params.use_mmap = b ? true : false;
+    if (get_map_bool(env, argv[1], "use_mlock", &b)) params.use_mlock = b ? true : false;
+    if (get_map_bool(env, argv[1], "vocab_only", &b)) params.vocab_only = b ? true : false;
+
+    struct llama_model *model = llama_model_load_from_file(path, params);
+    if (!model) {
+        return enif_make_tuple2(env, atom_error, atom_load_failed);
+    }
+
+    erllama_model_t *res = enif_alloc_resource(MODEL_RT, sizeof(*res));
+    res->model = model;
+
+    ERL_NIF_TERM term = enif_make_resource(env, res);
+    enif_release_resource(res);
+    return enif_make_tuple2(env, atom_ok, term);
+}
+
+static ERL_NIF_TERM nif_free_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    if (m->model) {
+        llama_model_free(m->model);
+        m->model = NULL;
+    }
+    return atom_ok;
+}
+
+/* =========================================================================
+ * Context
+ * ========================================================================= */
+
+static ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    if (!m->model) {
+        return enif_make_tuple2(env, atom_error, atom_load_failed);
+    }
+    if (!enif_is_map(env, argv[1])) {
+        return enif_make_badarg(env);
+    }
+
+    struct llama_context_params params = llama_context_default_params();
+
+    unsigned int u;
+    if (get_map_uint(env, argv[1], "n_ctx", &u)) params.n_ctx = (uint32_t) u;
+    if (get_map_uint(env, argv[1], "n_batch", &u)) params.n_batch = (uint32_t) u;
+    if (get_map_uint(env, argv[1], "n_ubatch", &u)) params.n_ubatch = (uint32_t) u;
+    if (get_map_uint(env, argv[1], "n_seq_max", &u)) params.n_seq_max = (uint32_t) u;
+    if (get_map_uint(env, argv[1], "n_threads", &u)) params.n_threads = (int32_t) u;
+    if (get_map_uint(env, argv[1], "n_threads_batch", &u)) {
+        params.n_threads_batch = (int32_t) u;
+    }
+    int b;
+    if (get_map_bool(env, argv[1], "embeddings", &b)) params.embeddings = b ? true : false;
+    if (get_map_bool(env, argv[1], "offload_kqv", &b)) params.offload_kqv = b ? true : false;
+
+    struct llama_context *ctx = llama_init_from_model(m->model, params);
+    if (!ctx) {
+        return enif_make_tuple2(env, atom_error, atom_context_failed);
+    }
+
+    erllama_context_t *res = enif_alloc_resource(CTX_RT, sizeof(*res));
+    res->ctx = ctx;
+    res->model_res = m;
+    enif_keep_resource(m);
+
+    ERL_NIF_TERM term = enif_make_resource(env, res);
+    enif_release_resource(res);
+    return enif_make_tuple2(env, atom_ok, term);
+}
+
+static ERL_NIF_TERM nif_free_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    if (c->ctx) {
+        llama_free(c->ctx);
+        c->ctx = NULL;
+    }
+    if (c->model_res) {
+        enif_release_resource(c->model_res);
+        c->model_res = NULL;
+    }
+    return atom_ok;
+}
+
+/* =========================================================================
+ * Tokenize
+ * ========================================================================= */
+
+static ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    if (!m->model) {
+        return enif_make_tuple2(env, atom_error, atom_load_failed);
+    }
+    ErlNifBinary text;
+    if (!enif_inspect_iolist_as_binary(env, argv[1], &text)) {
+        return enif_make_badarg(env);
+    }
+    if (!enif_is_map(env, argv[2])) {
+        return enif_make_badarg(env);
+    }
+
+    int add_special = 1;
+    int parse_special = 0;
+    int b;
+    if (get_map_bool(env, argv[2], "add_special", &b)) add_special = b;
+    if (get_map_bool(env, argv[2], "parse_special", &b)) parse_special = b;
+
+    const struct llama_vocab *vocab = llama_model_get_vocab(m->model);
+
+    /* First call: probe size with a zero buffer. */
+    int32_t n_max = (int32_t) text.size + 8;  /* rough upper bound */
+    if (n_max < 16) n_max = 16;
+
+    llama_token *tokens = (llama_token *) enif_alloc(sizeof(llama_token) * (size_t) n_max);
+    if (!tokens) {
+        return enif_make_tuple2(env, atom_error, atom_tokenize_failed);
+    }
+
+    int32_t n = llama_tokenize(
+        vocab, (const char *) text.data, (int32_t) text.size, tokens,
+        n_max, add_special ? true : false, parse_special ? true : false);
+    if (n < 0) {
+        /* The negative return value tells us how many we'd need. */
+        int32_t needed = -n;
+        enif_free(tokens);
+        tokens = (llama_token *) enif_alloc(sizeof(llama_token) * (size_t) needed);
+        if (!tokens) {
+            return enif_make_tuple2(env, atom_error, atom_tokenize_failed);
+        }
+        n = llama_tokenize(
+            vocab, (const char *) text.data, (int32_t) text.size, tokens,
+            needed, add_special ? true : false, parse_special ? true : false);
+    }
+    if (n < 0) {
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_tokenize_failed);
+    }
+
+    /* Build the Erlang list of token ids. */
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    for (int32_t i = n - 1; i >= 0; i--) {
+        list = enif_make_list_cell(env, enif_make_int(env, tokens[i]), list);
+    }
+    enif_free(tokens);
+    return list;
+}
+
+/* =========================================================================
+ * KV pack / unpack
+ *
+ * The 3-arg signatures preserve the v0.1 stub API. The Tokens and
+ * NTokens / SeqId positional args are interpreted as documented in
+ * include/llama.h: NTokens is unused (the in-memory API saves the
+ * full state for the configured seq_id, defaulting to 0); SeqId is
+ * the destination sequence id for unpack.
+ * ========================================================================= */
+
 static ERL_NIF_TERM nif_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void) argc;
-    (void) argv;
-    return enif_make_tuple2(env, atom_error, atom_not_implemented);
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    if (!c->ctx) {
+        return enif_make_tuple2(env, atom_error, atom_pack_failed);
+    }
+
+    /* Tokens (argv[1]) is informational; NTokens (argv[2]) ignored.
+     * The model layer must have prefilled exactly the desired prefix
+     * before calling kv_pack. */
+    llama_seq_id seq_id = 0;
+
+    size_t need = llama_state_seq_get_size(c->ctx, seq_id);
+    if (need == 0) {
+        /* Empty state; return an empty binary. */
+        ErlNifBinary empty;
+        enif_alloc_binary(0, &empty);
+        return enif_make_binary(env, &empty);
+    }
+
+    ErlNifBinary out;
+    if (!enif_alloc_binary(need, &out)) {
+        return enif_make_tuple2(env, atom_error, atom_pack_failed);
+    }
+    size_t written = llama_state_seq_get_data(c->ctx, out.data, out.size, seq_id);
+    if (written == 0 || written > need) {
+        enif_release_binary(&out);
+        return enif_make_tuple2(env, atom_error, atom_pack_failed);
+    }
+    if (written < need) {
+        /* Shrink to the actual size. */
+        if (!enif_realloc_binary(&out, written)) {
+            enif_release_binary(&out);
+            return enif_make_tuple2(env, atom_error, atom_pack_failed);
+        }
+    }
+    return enif_make_binary(env, &out);
 }
 
 static ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void) argc;
-    (void) argv;
-    return enif_make_tuple2(env, atom_error, atom_not_implemented);
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    if (!c->ctx) {
+        return enif_make_tuple2(env, atom_error, atom_unpack_failed);
+    }
+
+    ErlNifBinary in;
+    if (!enif_inspect_binary(env, argv[1], &in)) {
+        return enif_make_badarg(env);
+    }
+    int seq_id;
+    if (!enif_get_int(env, argv[2], &seq_id)) {
+        return enif_make_badarg(env);
+    }
+
+    size_t consumed = llama_state_seq_set_data(
+        c->ctx, in.data, in.size, (llama_seq_id) seq_id);
+    if (consumed == 0) {
+        return enif_make_tuple2(env, atom_error, atom_unpack_failed);
+    }
+    return atom_ok;
 }
 
-/* Map a few common errno values to atoms; everything else maps to
- * `unknown` (the actual integer is not exposed since the NIF doesn't
- * link erl_driver). */
+/* =========================================================================
+ * fsync_dir (existing)
+ * ========================================================================= */
+
 static ERL_NIF_TERM make_errno_atom(ErlNifEnv *env, int e) {
     const char *name;
     switch (e) {
@@ -92,9 +459,6 @@ static ERL_NIF_TERM make_errno_atom(ErlNifEnv *env, int e) {
     return enif_make_atom(env, name);
 }
 
-/* fsync(2) on a directory: opens path read-only, fsyncs the fd, closes.
- * Used by the disk tier to make link(2)/unlink(2) operations on the
- * directory entry durable across a kernel crash. */
 static ERL_NIF_TERM nif_fsync_dir(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     (void) argc;
     ErlNifBinary path_bin;
@@ -121,11 +485,29 @@ static ERL_NIF_TERM nif_fsync_dir(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     return atom_ok;
 }
 
+/* =========================================================================
+ * Suppress unused-stub warning for atom_not_implemented now that the
+ * real API is in place.
+ * ========================================================================= */
+static ERL_NIF_TERM use_atom_not_implemented(void) {
+    return atom_not_implemented;
+}
+
 static ErlNifFunc nif_funcs[] = {
-    {"nif_crc32c", 1, nif_crc32c, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_kv_pack", 3, nif_kv_pack, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_kv_unpack", 3, nif_kv_unpack, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_fsync_dir", 1, nif_fsync_dir, ERL_NIF_DIRTY_JOB_IO_BOUND}
+    {"nif_crc32c",       1, nif_crc32c,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_kv_pack",      3, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_kv_unpack",    3, nif_kv_unpack,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_fsync_dir",    1, nif_fsync_dir,    ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_load_model",   2, nif_load_model,   ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_free_model",   1, nif_free_model,   0},
+    {"nif_new_context",  2, nif_new_context,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_free_context", 1, nif_free_context, 0},
+    {"nif_tokenize",     3, nif_tokenize,     ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, NULL)
+
+/* The unused_stub function is referenced once to satisfy -Wunused. */
+__attribute__((unused)) static void *_unused_anchor(void) {
+    return (void *) use_atom_not_implemented;
+}
