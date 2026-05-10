@@ -22,15 +22,15 @@ with_app(Body) ->
 
 minimal_config() ->
     #{
-        backend          => erllama_model_stub,
-        tier_srv         => erllama_cache_disk_default,
-        tier             => disk,
-        fingerprint      => binary:copy(<<16#11>>, 32),
+        backend => erllama_model_stub,
+        tier_srv => erllama_cache_disk_default,
+        tier => disk,
+        fingerprint => binary:copy(<<16#11>>, 32),
         fingerprint_mode => safe,
-        quant_type       => f16,
-        quant_bits       => 16,
-        ctx_params_hash  => binary:copy(<<16#22>>, 32),
-        context_size     => 1024,
+        quant_type => f16,
+        quant_bits => 16,
+        ctx_params_hash => binary:copy(<<16#22>>, 32),
+        context_size => 1024,
         policy => #{
             min_tokens => 4,
             cold_min_tokens => 4,
@@ -89,8 +89,10 @@ load_same_id_returns_already_loaded_test() ->
     with_app(fun() ->
         {ok, _} = erllama:load_model(<<"dup">>, minimal_config()),
         try
-            ?assertEqual({error, already_loaded},
-                         erllama:load_model(<<"dup">>, minimal_config()))
+            ?assertEqual(
+                {error, already_loaded},
+                erllama:load_model(<<"dup">>, minimal_config())
+            )
         after
             erllama:unload(<<"dup">>)
         end

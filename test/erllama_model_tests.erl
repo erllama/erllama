@@ -140,7 +140,7 @@ detokenize_roundtrip_test() ->
     %% types should line up: tokenize -> [int], detokenize -> binary.
     with_model(#{}, fun(_) ->
         {ok, Tokens} = erllama_model:tokenize(<<"test_model">>, <<"hi there">>),
-        {ok, Bin}    = erllama_model:detokenize(<<"test_model">>, Tokens),
+        {ok, Bin} = erllama_model:detokenize(<<"test_model">>, Tokens),
         ?assert(is_binary(Bin))
     end).
 

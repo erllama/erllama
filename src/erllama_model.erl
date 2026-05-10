@@ -49,32 +49,38 @@ stubs get replaced; the cache integration is unaffected.
     embed/2
 ]).
 
--export_type([model/0, model_info/0, stats/0, cache_hit_kind/0,
-              finish_reason/0, infer_params/0]).
+-export_type([
+    model/0,
+    model_info/0,
+    stats/0,
+    cache_hit_kind/0,
+    finish_reason/0,
+    infer_params/0
+]).
 
 -type model() :: erllama_registry:model_id() | pid().
 -type model_info() :: #{
-    id            := binary(),
-    pid           := pid(),
-    status        := idle | prefilling | generating,
-    backend       := module(),
-    context_size  := non_neg_integer(),
-    quant_type    := atom(),
-    quant_bits    := non_neg_integer(),
-    tier          := disk | ram_file,
-    fingerprint   := binary()
+    id := binary(),
+    pid := pid(),
+    status := idle | prefilling | generating,
+    backend := module(),
+    context_size := non_neg_integer(),
+    quant_type := atom(),
+    quant_bits := non_neg_integer(),
+    tier := disk | ram_file,
+    fingerprint := binary()
 }.
 
 -type cache_hit_kind() :: exact | partial | cold.
 -type finish_reason() :: stop | length | cancelled.
 -type stats() :: #{
-    prompt_tokens     := non_neg_integer(),
+    prompt_tokens := non_neg_integer(),
     completion_tokens := non_neg_integer(),
-    prefill_ms        := non_neg_integer(),
-    generation_ms     := non_neg_integer(),
-    cache_hit_kind    := cache_hit_kind(),
-    finish_reason     := finish_reason(),
-    cancelled         := boolean()
+    prefill_ms := non_neg_integer(),
+    generation_ms := non_neg_integer(),
+    cache_hit_kind := cache_hit_kind(),
+    finish_reason := finish_reason(),
+    cancelled := boolean()
 }.
 
 %% Optional fields the caller may set on `infer/4`. `parent_key` and
@@ -83,15 +89,15 @@ stubs get replaced; the cache integration is unaffected.
 %% the llama.cpp sampler.
 -type infer_params() :: #{
     response_tokens => pos_integer(),
-    parent_key      => term(),
-    temperature     => float(),
-    top_p           => float(),
-    top_k           => pos_integer(),
-    min_p           => float(),
-    seed            => integer(),
-    stop            => [binary()],
-    grammar         => binary(),
-    _               => _
+    parent_key => term(),
+    temperature => float(),
+    top_p => float(),
+    top_k => pos_integer(),
+    min_p => float(),
+    seed => integer(),
+    stop => [binary()],
+    grammar => binary(),
+    _ => _
 }.
 
 -export([
@@ -179,8 +185,9 @@ request.
 """.
 -spec infer(model(), [non_neg_integer()], infer_params(), pid()) ->
     {ok, reference()} | {error, term()}.
-infer(Model, Tokens, Params, CallerPid)
-  when is_list(Tokens), is_map(Params), is_pid(CallerPid) ->
+infer(Model, Tokens, Params, CallerPid) when
+    is_list(Tokens), is_map(Params), is_pid(CallerPid)
+->
     gen_statem:call(via(Model), {infer, Tokens, Params, CallerPid}, infinity).
 
 -doc """
@@ -442,16 +449,18 @@ handle_common(State, {call, From}, model_info, Data) ->
     Reply = build_model_info(State, Data),
     {keep_state, Data, [{reply, From, Reply}]};
 handle_common(_State, {call, From}, {tokenize, Text}, Data) ->
-    Reply = case backend_call(Data, tokenize, [Text]) of
-                {error, _} = E -> E;
-                Tokens when is_list(Tokens) -> {ok, Tokens}
-            end,
+    Reply =
+        case backend_call(Data, tokenize, [Text]) of
+            {error, _} = E -> E;
+            Tokens when is_list(Tokens) -> {ok, Tokens}
+        end,
     {keep_state, Data, [{reply, From, Reply}]};
 handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
-    Reply = case backend_call(Data, detokenize, [Tokens]) of
-                {error, _} = E -> E;
-                Bin when is_binary(Bin) -> {ok, Bin}
-            end,
+    Reply =
+        case backend_call(Data, detokenize, [Tokens]) of
+            {error, _} = E -> E;
+            Bin when is_binary(Bin) -> {ok, Bin}
+        end,
     {keep_state, Data, [{reply, From, Reply}]};
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
     Reply = optional_backend_call(Data, apply_chat_template, [Request]),
@@ -468,21 +477,21 @@ handle_common(_State, _EventType, _EventContent, Data) ->
 optional_backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
     Arity = length(Args) + 1,
     case erlang:function_exported(Mod, Fn, Arity) of
-        true  -> apply(Mod, Fn, [S | Args]);
+        true -> apply(Mod, Fn, [S | Args]);
         false -> {error, not_supported}
     end.
 
 build_model_info(State, Data) ->
     #{
-        id           => Data#data.model_id,
-        pid          => self(),
-        status       => State,
-        backend      => Data#data.backend,
+        id => Data#data.model_id,
+        pid => self(),
+        status => State,
+        backend => Data#data.backend,
         context_size => Data#data.context_size,
-        quant_type   => Data#data.quant_type,
-        quant_bits   => Data#data.quant_bits,
-        tier         => Data#data.tier,
-        fingerprint  => Data#data.fingerprint
+        quant_type => Data#data.quant_type,
+        quant_bits => Data#data.quant_bits,
+        tier => Data#data.tier,
+        fingerprint => Data#data.fingerprint
     }.
 
 %% =============================================================================
@@ -556,8 +565,14 @@ advance_with(Token, Data) ->
 %% text fragment. In standard mode this is a no-op; the full reply is
 %% built in finish_request via detokenize on the whole `generated`
 %% list.
-stream_emit(Token, Data = #data{mode = streaming, caller_pid = Pid,
-                                request_ref = Ref}) ->
+stream_emit(
+    Token,
+    Data = #data{
+        mode = streaming,
+        caller_pid = Pid,
+        request_ref = Ref
+    }
+) ->
     case backend_call(Data, detokenize, [[Token]]) of
         Bin when is_binary(Bin), Bin =/= <<>> ->
             Pid ! {erllama_token, Ref, Bin};
@@ -651,7 +666,7 @@ set_grammar(Grammar, Data = #data{backend = Mod, backend_state = S}) when is_bin
     case erlang:function_exported(Mod, set_grammar, 2) of
         true ->
             case Mod:set_grammar(S, Grammar) of
-                {ok, S1}    -> {ok, Data#data{backend_state = S1}};
+                {ok, S1} -> {ok, Data#data{backend_state = S1}};
                 {error, _} = E -> E
             end;
         false ->
@@ -662,7 +677,7 @@ clear_grammar(Data = #data{backend = Mod, backend_state = S}) ->
     case erlang:function_exported(Mod, clear_sampler, 1) of
         true ->
             case Mod:clear_sampler(S) of
-                {ok, S1}    -> {ok, Data#data{backend_state = S1}};
+                {ok, S1} -> {ok, Data#data{backend_state = S1}};
                 {error, _} = E -> E
             end;
         false ->
@@ -673,23 +688,25 @@ build_stats(FinishReason, Cancelled, Data) ->
     Now = erlang:monotonic_time(millisecond),
     PrefillStart = Data#data.prefill_started_at,
     GenStart = Data#data.generation_started_at,
-    PrefillMs = case {PrefillStart, GenStart} of
-                    {undefined, _} -> 0;
-                    {_, undefined} -> max(0, Now - PrefillStart);
-                    _              -> max(0, GenStart - PrefillStart)
-                end,
-    GenMs = case GenStart of
-                undefined -> 0;
-                _         -> max(0, Now - GenStart)
-            end,
+    PrefillMs =
+        case {PrefillStart, GenStart} of
+            {undefined, _} -> 0;
+            {_, undefined} -> max(0, Now - PrefillStart);
+            _ -> max(0, GenStart - PrefillStart)
+        end,
+    GenMs =
+        case GenStart of
+            undefined -> 0;
+            _ -> max(0, Now - GenStart)
+        end,
     #{
-        prompt_tokens     => length(Data#data.prompt_tokens),
+        prompt_tokens => length(Data#data.prompt_tokens),
         completion_tokens => length(Data#data.generated),
-        prefill_ms        => PrefillMs,
-        generation_ms     => GenMs,
-        cache_hit_kind    => Data#data.cache_hit_kind,
-        finish_reason     => FinishReason,
-        cancelled         => Cancelled
+        prefill_ms => PrefillMs,
+        generation_ms => GenMs,
+        cache_hit_kind => Data#data.cache_hit_kind,
+        finish_reason => FinishReason,
+        cancelled => Cancelled
     }.
 
 %% =============================================================================
@@ -907,7 +924,7 @@ via(Pid) when is_pid(Pid) ->
 via(ModelId) when is_binary(ModelId) ->
     case erllama_registry:whereis_name(ModelId) of
         Pid when is_pid(Pid) -> Pid;
-        undefined            -> exit({noproc, {?MODULE, not_found, ModelId}})
+        undefined -> exit({noproc, {?MODULE, not_found, ModelId}})
     end.
 
 %% After kv_unpack, the per-context logits buffer is stale. To regenerate

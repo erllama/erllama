@@ -32,7 +32,7 @@ start_model(ModelId, Config) when is_binary(ModelId), is_map(Config) ->
 stop_model(ModelOrPid) ->
     case pid_of(ModelOrPid) of
         undefined -> {error, not_found};
-        Pid       -> supervisor:terminate_child(?SERVER, Pid)
+        Pid -> supervisor:terminate_child(?SERVER, Pid)
     end.
 
 -doc "List currently-supervised model pids (raw supervisor view).".

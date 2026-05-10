@@ -93,7 +93,7 @@ embed(#s{ctx = C}, Tokens) ->
 
 set_grammar(#s{ctx = C} = S, Grammar) when is_binary(Grammar) ->
     case erllama_nif:set_grammar(C, Grammar) of
-        ok           -> {ok, S};
+        ok -> {ok, S};
         {error, _} = E -> E
     end;
 set_grammar(#s{} = S, undefined) ->

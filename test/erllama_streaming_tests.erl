@@ -29,15 +29,15 @@ with_app(Body) ->
 
 minimal_config(DiskSrv) ->
     #{
-        backend          => erllama_model_stub,
-        tier_srv         => DiskSrv,
-        tier             => disk,
-        fingerprint      => binary:copy(<<16#33>>, 32),
+        backend => erllama_model_stub,
+        tier_srv => DiskSrv,
+        tier => disk,
+        fingerprint => binary:copy(<<16#33>>, 32),
         fingerprint_mode => safe,
-        quant_type       => f16,
-        quant_bits       => 16,
-        ctx_params_hash  => binary:copy(<<16#44>>, 32),
-        context_size     => 1024,
+        quant_type => f16,
+        quant_bits => 16,
+        ctx_params_hash => binary:copy(<<16#44>>, 32),
+        context_size => 1024,
         policy => #{
             min_tokens => 4,
             cold_min_tokens => 4,
@@ -56,7 +56,11 @@ with_model(Body) ->
             integer_to_binary(erlang:unique_integer([positive]))
         ]),
         {ok, _} = erllama:load_model(Id, minimal_config(DiskSrv)),
-        try Body(Id) after erllama:unload(Id) end
+        try
+            Body(Id)
+        after
+            erllama:unload(Id)
+        end
     end).
 
 make_tmp_dir() ->
@@ -73,7 +77,8 @@ rm_rf(Dir) ->
     case file:list_dir(Dir) of
         {ok, Entries} ->
             [file:delete(filename:join(Dir, E)) || E <- Entries];
-        _ -> ok
+        _ ->
+            ok
     end,
     file:del_dir(Dir),
     ok.
@@ -154,22 +159,34 @@ second_infer_while_busy_returns_error_busy_test() ->
         %% first token to confirm the model is in `generating` state
         %% before issuing the second call.
         {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
-        receive {erllama_token, Ref, _} -> ok after 5000 -> ?assert(false) end,
+        receive
+            {erllama_token, Ref, _} -> ok
+        after 5000 -> ?assert(false)
+        end,
         Result = erllama:infer(Id, Tokens, #{response_tokens => 1}, self()),
         ?assertEqual({error, busy}, Result),
         %% Cancel and drain so unload is clean and quick.
         ok = erllama:cancel(Ref),
-        receive {erllama_done, Ref, _} -> ok after 5000 -> ok end
+        receive
+            {erllama_done, Ref, _} -> ok
+        after 5000 -> ok
+        end
     end).
 
 complete_while_streaming_returns_error_busy_test() ->
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hi">>),
         {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
-        receive {erllama_token, Ref, _} -> ok after 5000 -> ?assert(false) end,
+        receive
+            {erllama_token, Ref, _} -> ok
+        after 5000 -> ?assert(false)
+        end,
         ?assertEqual({error, busy}, erllama:complete(Id, <<"another">>)),
         ok = erllama:cancel(Ref),
-        receive {erllama_done, Ref, _} -> ok after 5000 -> ok end
+        receive
+            {erllama_done, Ref, _} -> ok
+        after 5000 -> ok
+        end
     end).
 
 %% =============================================================================
@@ -195,7 +212,10 @@ cancel_in_flight_marks_done_cancelled_test() ->
         %% before completion. Wait for the first token so we know we
         %% are mid-stream before cancelling.
         {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
-        receive {erllama_token, Ref, _} -> ok after 5000 -> ?assert(false) end,
+        receive
+            {erllama_token, Ref, _} -> ok
+        after 5000 -> ?assert(false)
+        end,
         ok = erllama:cancel(Ref),
         case collect_stream(Ref, 5000) of
             {timeout, _} ->
@@ -210,7 +230,10 @@ cancelled_stream_releases_model_for_next_request_test() ->
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hi">>),
         {ok, Ref1} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
-        receive {erllama_token, Ref1, _} -> ok after 5000 -> ?assert(false) end,
+        receive
+            {erllama_token, Ref1, _} -> ok
+        after 5000 -> ?assert(false)
+        end,
         ok = erllama:cancel(Ref1),
         _ = collect_stream(Ref1, 5000),
         %% After cancel-flushed-done, the model should be idle and
@@ -229,7 +252,10 @@ inflight_registers_and_unregisters_test() ->
         {ok, Tokens} = erllama:tokenize(Id, <<"x">>),
         Pre = length(erllama_inflight:all()),
         {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
-        receive {erllama_token, Ref, _} -> ok after 5000 -> ?assert(false) end,
+        receive
+            {erllama_token, Ref, _} -> ok
+        after 5000 -> ?assert(false)
+        end,
         ?assertMatch({ok, _Pid}, erllama_inflight:lookup(Ref)),
         ?assert(length(erllama_inflight:all()) >= Pre + 1),
         ok = erllama:cancel(Ref),

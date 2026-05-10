@@ -82,19 +82,19 @@ inference, etc.) can plug in via this same surface.
 
 -type chat_request() :: #{
     messages := [chat_message()],
-    system   => binary() | undefined,
-    tools    => [chat_tool()] | undefined
+    system => binary() | undefined,
+    tools => [chat_tool()] | undefined
 }.
 
 -type chat_message() :: #{
-    role    := binary(),
+    role := binary(),
     content := binary() | [map()]
 }.
 
 -type chat_tool() :: #{
-    name        := binary(),
+    name := binary(),
     description => binary(),
-    schema      => map()
+    schema => map()
 }.
 
 -export_type([chat_request/0, chat_message/0, chat_tool/0]).

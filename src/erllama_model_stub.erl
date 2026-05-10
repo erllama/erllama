@@ -65,8 +65,8 @@ kv_unpack(_S, _Bin) ->
 %% enough for tests.
 apply_chat_template(S, Request) when is_map(Request) ->
     Messages = maps:get(messages, Request, []),
-    System   = maps:get(system,   Request, undefined),
-    Tools    = maps:get(tools,    Request, undefined),
+    System = maps:get(system, Request, undefined),
+    Tools = maps:get(tools, Request, undefined),
     Rendered = render(System, Tools, Messages),
     {ok, tokenize(S, Rendered)}.
 
@@ -74,32 +74,37 @@ apply_chat_template(S, Request) when is_map(Request) ->
 %% list. Useful for /v1/embeddings shape testing without a real model.
 embed(_S, Tokens) when is_list(Tokens) ->
     Seed = erlang:phash2({embed, Tokens}),
-    Vec = [float((Seed bsr (I * 4)) band 16#FFFF) / 65535.0
-           || I <- lists:seq(0, 15)],
+    Vec = [
+        float((Seed bsr (I * 4)) band 16#FFFF) / 65535.0
+     || I <- lists:seq(0, 15)
+    ],
     {ok, Vec}.
 
 %% Stub backend doesn't sample (decode_one returns a phash2-derived
 %% token deterministically), so grammar is ignored. Return ok so the
 %% gen_statem keeps going.
 set_grammar(S, _Grammar) -> {ok, S}.
-clear_sampler(S)         -> {ok, S}.
+clear_sampler(S) -> {ok, S}.
 
 %% =============================================================================
 %% Internal: chat-template rendering
 %% =============================================================================
 
 render(System, Tools, Messages) ->
-    Header = case System of
-                 undefined -> [];
-                 <<>>      -> [];
-                 _         -> [<<"system: ">>, System, <<"\n">>]
-             end,
+    Header =
+        case System of
+            undefined -> [];
+            <<>> -> [];
+            _ -> [<<"system: ">>, System, <<"\n">>]
+        end,
     ToolsBlob = render_tools(Tools),
     Body = [render_message(M) || M <- Messages],
     iolist_to_binary([Header, ToolsBlob, Body]).
 
-render_tools(undefined) -> [];
-render_tools([])        -> [];
+render_tools(undefined) ->
+    [];
+render_tools([]) ->
+    [];
 render_tools(Tools) when is_list(Tools) ->
     Lines = [render_tool(T) || T <- Tools],
     [<<"tools:\n">>, Lines].

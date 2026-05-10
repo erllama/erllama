@@ -30,15 +30,15 @@ with_app(Body) ->
 
 minimal_config(DiskSrv) ->
     #{
-        backend          => erllama_model_stub,
-        tier_srv         => DiskSrv,
-        tier             => disk,
-        fingerprint      => binary:copy(<<16#55>>, 32),
+        backend => erllama_model_stub,
+        tier_srv => DiskSrv,
+        tier => disk,
+        fingerprint => binary:copy(<<16#55>>, 32),
         fingerprint_mode => safe,
-        quant_type       => f16,
-        quant_bits       => 16,
-        ctx_params_hash  => binary:copy(<<16#66>>, 32),
-        context_size     => 1024,
+        quant_type => f16,
+        quant_bits => 16,
+        ctx_params_hash => binary:copy(<<16#66>>, 32),
+        context_size => 1024,
         policy => #{
             min_tokens => 4,
             cold_min_tokens => 4,
@@ -57,7 +57,11 @@ with_model(Body) ->
             integer_to_binary(erlang:unique_integer([positive]))
         ]),
         {ok, _} = erllama:load_model(Id, minimal_config(DiskSrv)),
-        try Body(Id) after erllama:unload(Id) end
+        try
+            Body(Id)
+        after
+            erllama:unload(Id)
+        end
     end).
 
 make_tmp_dir() ->
@@ -74,7 +78,8 @@ rm_rf(Dir) ->
     case file:list_dir(Dir) of
         {ok, Entries} ->
             [file:delete(filename:join(Dir, E)) || E <- Entries];
-        _ -> ok
+        _ ->
+            ok
     end,
     file:del_dir(Dir),
     ok.
@@ -109,11 +114,16 @@ apply_chat_template_with_system_test() ->
 
 apply_chat_template_with_tools_test() ->
     with_model(fun(Id) ->
-        Tools = [#{name => <<"search">>, description => <<"web search">>,
-                   schema => #{}}],
+        Tools = [
+            #{
+                name => <<"search">>,
+                description => <<"web search">>,
+                schema => #{}
+            }
+        ],
         Request = #{
             messages => [#{role => <<"user">>, content => <<"hi">>}],
-            tools    => Tools
+            tools => Tools
         },
         {ok, Tokens} = erllama:apply_chat_template(Id, Request),
         ?assert(is_list(Tokens))
@@ -123,9 +133,9 @@ apply_chat_template_multi_turn_test() ->
     with_model(fun(Id) ->
         Request = #{
             messages => [
-                #{role => <<"user">>,      content => <<"hi">>},
+                #{role => <<"user">>, content => <<"hi">>},
                 #{role => <<"assistant">>, content => <<"hello">>},
-                #{role => <<"user">>,      content => <<"who are you">>}
+                #{role => <<"user">>, content => <<"who are you">>}
             ]
         },
         {ok, Tokens} = erllama:apply_chat_template(Id, Request),
@@ -182,8 +192,10 @@ grammar_in_params_does_not_break_streaming_test() ->
     %% crashing the gen_statem.
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hi">>),
-        Params = #{response_tokens => 4,
-                   grammar => <<"root ::= \"a\" | \"b\"">>},
+        Params = #{
+            response_tokens => 4,
+            grammar => <<"root ::= \"a\" | \"b\"">>
+        },
         {ok, Ref} = erllama:infer(Id, Tokens, Params, self()),
         ?assert(is_reference(Ref)),
         Result = drain(Ref, 5000),
@@ -193,9 +205,13 @@ grammar_in_params_does_not_break_streaming_test() ->
 grammar_undefined_is_no_op_test() ->
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hi">>),
-        Params = #{response_tokens => 2},  %% no grammar key
+        %% no grammar key
+        Params = #{response_tokens => 2},
         {ok, _Ref} = erllama:infer(Id, Tokens, Params, self()),
-        receive {erllama_done, _, _} -> ok after 5000 -> ?assert(false) end
+        receive
+            {erllama_done, _, _} -> ok
+        after 5000 -> ?assert(false)
+        end
     end).
 
 %% =============================================================================
@@ -214,9 +230,13 @@ unsupported_apply_chat_template_returns_error_test() ->
     %% can't easily simulate this without a third backend module.
     %% Instead, just sanity-check the stub returns {ok, _}.
     with_model(fun(Id) ->
-        ?assertMatch({ok, _},
-            erllama:apply_chat_template(Id,
-                #{messages => [#{role => <<"u">>, content => <<"x">>}]}))
+        ?assertMatch(
+            {ok, _},
+            erllama:apply_chat_template(
+                Id,
+                #{messages => [#{role => <<"u">>, content => <<"x">>}]}
+            )
+        )
     end).
 
 %% =============================================================================
@@ -228,9 +248,9 @@ drain(Ref, TimeoutMs) ->
 
 drain(Ref, TimeoutMs, Acc) ->
     receive
-        {erllama_token, Ref, B}  -> drain(Ref, TimeoutMs, [B | Acc]);
-        {erllama_done, Ref, S}   -> {lists:reverse(Acc), S};
-        {erllama_error, Ref, R}  -> {error, R}
+        {erllama_token, Ref, B} -> drain(Ref, TimeoutMs, [B | Acc]);
+        {erllama_done, Ref, S} -> {lists:reverse(Acc), S};
+        {erllama_error, Ref, R} -> {error, R}
     after TimeoutMs ->
         timeout
     end.

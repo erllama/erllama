@@ -18,11 +18,13 @@ model dies unexpectedly.
 """.
 -behaviour(gen_server).
 
--export([start_link/0,
-         register/2,
-         unregister/1,
-         lookup/1,
-         all/0]).
+-export([
+    start_link/0,
+    register/2,
+    unregister/1,
+    lookup/1,
+    all/0
+]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -49,7 +51,7 @@ unregister(Ref) when is_reference(Ref) ->
 lookup(Ref) when is_reference(Ref) ->
     case ets:lookup(?TABLE, Ref) of
         [{Ref, Pid}] -> {ok, Pid};
-        []           -> {error, not_found}
+        [] -> {error, not_found}
     end.
 
 -spec all() -> [{reference(), pid()}].
@@ -64,16 +66,21 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
-    _ = ets:new(?TABLE, [named_table, public, set,
-                         {read_concurrency, true},
-                         {write_concurrency, true}]),
+    _ = ets:new(?TABLE, [
+        named_table,
+        public,
+        set,
+        {read_concurrency, true},
+        {write_concurrency, true}
+    ]),
     {ok, #{monitors => #{}}}.
 
 handle_call(_, _, S) -> {reply, {error, unknown_call}, S}.
 
 handle_cast({monitor_model, Pid}, S = #{monitors := M}) ->
     case maps:is_key(Pid, M) of
-        true  -> {noreply, S};
+        true ->
+            {noreply, S};
         false ->
             Ref = monitor(process, Pid),
             {noreply, S#{monitors := M#{Pid => Ref}}}

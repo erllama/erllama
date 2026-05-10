@@ -299,8 +299,7 @@ apply_chat_template_includes_system(Config) ->
     Model = ?config(model, Config),
     Without = #{messages => [#{role => <<"user">>, content => <<"hi">>}]},
     With = Without#{system => <<"You speak only in haiku.">>},
-    case {erllama:apply_chat_template(Model, Without),
-          erllama:apply_chat_template(Model, With)} of
+    case {erllama:apply_chat_template(Model, Without), erllama:apply_chat_template(Model, With)} of
         {{ok, A}, {ok, B}} ->
             %% System content lands in the rendered prompt; longer.
             ?assert(length(B) > length(A));
@@ -345,12 +344,20 @@ clear_sampler_resets_to_greedy(Config) ->
     %% The second run should be free to produce any output, so it
     %% must complete without {error, grammar_failed}.
     Grammar = <<"root ::= \"a\" | \"b\"">>,
-    {ok, R1} = erllama:infer(Model, PromptTokens,
-        #{response_tokens => 2, grammar => Grammar}, self()),
+    {ok, R1} = erllama:infer(
+        Model,
+        PromptTokens,
+        #{response_tokens => 2, grammar => Grammar},
+        self()
+    ),
     _ = drain(R1, 60000),
     %% Second run, no grammar.
-    {ok, R2} = erllama:infer(Model, PromptTokens,
-        #{response_tokens => 2}, self()),
+    {ok, R2} = erllama:infer(
+        Model,
+        PromptTokens,
+        #{response_tokens => 2},
+        self()
+    ),
     case drain(R2, 60000) of
         {Texts, _Stats} ->
             ?assert(iolist_size(Texts) >= 0);
@@ -361,9 +368,9 @@ clear_sampler_resets_to_greedy(Config) ->
 drain(Ref, TimeoutMs) -> drain(Ref, TimeoutMs, []).
 drain(Ref, TimeoutMs, Acc) ->
     receive
-        {erllama_token, Ref, B}  -> drain(Ref, TimeoutMs, [B | Acc]);
-        {erllama_done, Ref, S}   -> {lists:reverse(Acc), S};
-        {erllama_error, Ref, R}  -> {error, R}
+        {erllama_token, Ref, B} -> drain(Ref, TimeoutMs, [B | Acc]);
+        {erllama_done, Ref, S} -> {lists:reverse(Acc), S};
+        {erllama_error, Ref, R} -> {error, R}
     after TimeoutMs ->
         timeout
     end.

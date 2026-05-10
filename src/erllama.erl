@@ -56,8 +56,8 @@ an explicit `model_id` in the config map.
 
 -export_type([model/0, model_id/0, model_info/0]).
 
--type model_id()   :: erllama_registry:model_id().
--type model()      :: erllama_model:model().
+-type model_id() :: erllama_registry:model_id().
+-type model() :: erllama_model:model().
 -type model_info() :: erllama_model:model_info().
 
 %% =============================================================================
@@ -112,8 +112,12 @@ complete(Model, Prompt, Opts) ->
 %% `Tokens` is the prompt as a list of token ids; tokenisation is the
 %% caller's responsibility (use `tokenize/2` or apply a chat template
 %% first).
--spec infer(model(), [erllama_nif:token_id()],
-            erllama_model:infer_params(), pid()) ->
+-spec infer(
+    model(),
+    [erllama_nif:token_id()],
+    erllama_model:infer_params(),
+    pid()
+) ->
     {ok, reference()} | {error, term()}.
 infer(Model, Tokens, Params, CallerPid) ->
     erllama_model:infer(Model, Tokens, Params, CallerPid).
