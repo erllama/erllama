@@ -196,6 +196,17 @@ Per-model config (passed to `erllama:load_model/1,2`):
 | `longest_prefix_ns` | Cumulative time spent in the longest-prefix walk. With `longest_prefix_probes` gives ns/probe. |
 | `bytes_ram`, `bytes_ramfile`, `bytes_disk` | Reserved for tier byte accounting. |
 
+**Metrics are always on.** Per-counter cost is `persistent_term:get/2`
+(single pointer deref) + `atomics:add/3` (lock-free CAS) ≈ 10–20 ns;
+`erlang:monotonic_time(nanosecond)` adds another 10–50 ns. Net
+overhead per `pin_and_load` or `lookup_longest_prefix` call is on
+the order of 70–200 ns, against operations that cost 100–1000× more
+(meta_srv hop, tier load, kv_unpack, SHA-256 over multi-KB
+prefixes). Counter slots are `u64`; `longest_prefix_ns` would need
+>580 years at 1 ns/probe to wrap. Don't disable metrics without
+profiler evidence that they're a hot spot — they essentially can't
+be at these ratios.
+
 ### `erllama_scheduler` — memory-pressure-driven eviction
 
 A `gen_server` under `erllama_sup`. Polls a pluggable pressure source
