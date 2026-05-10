@@ -158,6 +158,11 @@ typedef struct {
     erllama_model_t *model_res;    /* keep_resource'd by new_context */
     int decode_ready;              /* set after llama_decode; cleared after kv ops */
     int release_failed;            /* llama_free threw; pointer is poisoned */
+    /* Sampler chain cached on the first nif_decode_one call. The
+     * chain is greedy-only and lives for the resource's lifetime;
+     * a future sampler-config NIF would free + rebuild this under
+     * the resource lock. */
+    struct llama_sampler *smpl;
 } erllama_context_t;
 
 static ErlNifResourceType *MODEL_RT;
@@ -207,6 +212,10 @@ static void model_dtor(ErlNifEnv *env, void *obj) {
 static void ctx_dtor(ErlNifEnv *env, void *obj) {
     (void) env;
     erllama_context_t *c = (erllama_context_t *) obj;
+    if (c->smpl) {
+        (void) erllama_safe_sampler_free(c->smpl);
+        c->smpl = NULL;
+    }
     if (c->ctx && !c->release_failed) {
         (void) erllama_safe_free(c->ctx);
         c->ctx = NULL;
@@ -541,6 +550,10 @@ static ERL_NIF_TERM nif_free_context(ErlNifEnv *env, int argc, const ERL_NIF_TER
      * pointer mid-teardown. On exception we still NULL the pointer
      * to avoid a double-free path through the destructor; the native
      * object is leaked rather than risking UB. */
+    if (c->smpl) {
+        (void) erllama_safe_sampler_free(c->smpl);
+        c->smpl = NULL;
+    }
     int free_rc = erllama_safe_free(c->ctx);
     c->ctx = NULL;
     c->decode_ready = 0;
@@ -908,36 +921,37 @@ static ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         return enif_make_tuple2(env, atom_error, atom_no_logits);
     }
 
-    struct llama_sampler_chain_params sp = llama_sampler_chain_default_params();
-    struct llama_sampler *smpl = erllama_safe_sampler_chain_init(sp);
-    if (!smpl) {
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_oom);
-    }
-    struct llama_sampler *greedy = erllama_safe_sampler_init_greedy();
-    if (!greedy) {
-        (void) erllama_safe_sampler_free(smpl);
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_oom);
-    }
-    if (erllama_safe_sampler_chain_add(smpl, greedy) != 0) {
-        (void) erllama_safe_sampler_free(greedy);
-        (void) erllama_safe_sampler_free(smpl);
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_oom);
+    /* Lazy-init the sampler chain on first use; subsequent calls
+     * reuse it. Re-allocating chain + greedy + add per token costs
+     * ~1 us each on macOS but adds up across long generations. */
+    if (!c->smpl) {
+        struct llama_sampler_chain_params sp =
+            llama_sampler_chain_default_params();
+        struct llama_sampler *chain = erllama_safe_sampler_chain_init(sp);
+        if (!chain) {
+            pthread_mutex_unlock(&c->mu);
+            return enif_make_tuple2(env, atom_error, atom_oom);
+        }
+        struct llama_sampler *greedy = erllama_safe_sampler_init_greedy();
+        if (!greedy) {
+            (void) erllama_safe_sampler_free(chain);
+            pthread_mutex_unlock(&c->mu);
+            return enif_make_tuple2(env, atom_error, atom_oom);
+        }
+        if (erllama_safe_sampler_chain_add(chain, greedy) != 0) {
+            (void) erllama_safe_sampler_free(greedy);
+            (void) erllama_safe_sampler_free(chain);
+            pthread_mutex_unlock(&c->mu);
+            return enif_make_tuple2(env, atom_error, atom_oom);
+        }
+        c->smpl = chain;
     }
 
-    llama_token tok = erllama_safe_sampler_sample(smpl, c->ctx, -1);
+    /* llama_sampler_sample calls llama_sampler_accept on the chain
+     * internally; the chain stays cached, so accept lands on the
+     * cached object. */
+    llama_token tok = erllama_safe_sampler_sample(c->smpl, c->ctx, -1);
     if (tok < 0) {
-        (void) erllama_safe_sampler_free(smpl);
-        pthread_mutex_unlock(&c->mu);
-        return enif_make_tuple2(env, atom_error, atom_exception);
-    }
-    /* llama_sampler_sample already calls llama_sampler_accept on the
-     * chain internally; calling it again here would double-advance
-     * any sampler with non-NULL accept (greedy is a no-op, but
-     * future sampler swaps would silently regress). */
-    if (erllama_safe_sampler_free(smpl) != 0) {
         pthread_mutex_unlock(&c->mu);
         return enif_make_tuple2(env, atom_error, atom_exception);
     }
