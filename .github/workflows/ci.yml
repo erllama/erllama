@@ -12,12 +12,12 @@ jobs:
     name: XRef
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '28'
           rebar3-version: '3.25.0'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             _build
@@ -32,13 +32,13 @@ jobs:
     name: Dialyzer
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '28'
           rebar3-version: '3.25.0'
       - name: Restore PLT cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             _build/*_plt
@@ -54,7 +54,7 @@ jobs:
     name: erlfmt
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '28'
@@ -66,7 +66,7 @@ jobs:
     name: Elvis lint
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '28'
@@ -86,7 +86,7 @@ jobs:
         otp: ['28']
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Erlang
         uses: erlef/setup-beam@v1
@@ -95,7 +95,7 @@ jobs:
           rebar3-version: '3.25.0'
 
       - name: Restore build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             _build
@@ -118,7 +118,7 @@ jobs:
         otp: ['28']
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Erlang
         uses: erlef/setup-beam@v1
@@ -127,7 +127,7 @@ jobs:
           rebar3-version: '3.25.0'
 
       - name: Restore build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             _build
@@ -144,12 +144,12 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '28'
           rebar3-version: '3.25.0'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             _build
@@ -165,12 +165,12 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '28'
           rebar3-version: '3.25.0'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             _build
@@ -190,7 +190,7 @@ jobs:
       matrix:
         release: ['14.2', '14.4']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build + test in FreeBSD VM
         uses: vmactions/freebsd-vm@v1
         with:
