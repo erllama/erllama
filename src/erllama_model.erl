@@ -330,9 +330,16 @@ terminate(_Reason, _State, _Data) ->
 %% =============================================================================
 
 idle({call, From}, {complete, Prompt, Opts}, Data) ->
+    start_complete(From, Prompt, Opts, Data);
+idle({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
+    start_infer(From, Tokens, Params, CallerPid, Data);
+idle({call, From}, status, Data) ->
+    {keep_state, Data, [{reply, From, idle}]};
+idle(EventType, EventContent, Data) ->
+    handle_common(idle, EventType, EventContent, Data).
+
+start_complete(From, Prompt, Opts, Data) ->
     PromptTokens = backend_call(Data, tokenize, [Prompt]),
-    ResponseTarget = maps:get(response_tokens, Opts, 4),
-    ParentKey = maps:get(parent_key, Opts, undefined),
     Data1 = Data#data{
         mode = standard,
         caller = From,
@@ -340,15 +347,14 @@ idle({call, From}, {complete, Prompt, Opts}, Data) ->
         request_ref = undefined,
         cancel_pending = false,
         prompt_tokens = PromptTokens,
-        response_target = ResponseTarget,
+        response_target = maps:get(response_tokens, Opts, 4),
         generated = [],
         prefill_started_at = erlang:monotonic_time(millisecond)
     },
-    enter_after_lookup(ParentKey, Data1);
-idle({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
+    enter_after_lookup(maps:get(parent_key, Opts, undefined), Data1).
+
+start_infer(From, Tokens, Params, CallerPid, Data) ->
     Ref = make_ref(),
-    ResponseTarget = maps:get(response_tokens, Params, 64),
-    ParentKey = maps:get(parent_key, Params, undefined),
     Grammar = maps:get(grammar, Params, undefined),
     case set_grammar(Grammar, Data) of
         {ok, Data0} ->
@@ -360,32 +366,24 @@ idle({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
                 request_ref = Ref,
                 cancel_pending = false,
                 prompt_tokens = Tokens,
-                response_target = ResponseTarget,
+                response_target = maps:get(response_tokens, Params, 64),
                 generated = [],
                 prefill_started_at = erlang:monotonic_time(millisecond)
             },
             %% Reply with the ref before kicking off prefill so the caller is
             %% guaranteed to have it before any erllama_token messages land.
+            ParentKey = maps:get(parent_key, Params, undefined),
             add_reply_action(From, {ok, Ref}, enter_after_lookup(ParentKey, Data1));
         {error, _} = E ->
             {keep_state, Data, [{reply, From, E}]}
-    end;
-idle({call, From}, status, Data) ->
-    {keep_state, Data, [{reply, From, idle}]};
-idle(EventType, EventContent, Data) ->
-    handle_common(idle, EventType, EventContent, Data).
+    end.
 
-%% Tack a {reply, From, Reply} action onto a gen_statem transition
-%% returned by enter_after_lookup, regardless of whether the original
-%% transition carried an actions list or not.
+%% Tack a {reply, From, Reply} action onto the gen_statem transition
+%% returned by enter_after_lookup. The lookup path always lands in
+%% enter_generating which returns the 3-tuple form; if that ever
+%% changes, add the corresponding clauses here.
 add_reply_action(From, Reply, {next_state, NextState, NewData}) ->
-    {next_state, NextState, NewData, [{reply, From, Reply}]};
-add_reply_action(From, Reply, {next_state, NextState, NewData, Actions}) ->
-    {next_state, NextState, NewData, [{reply, From, Reply} | Actions]};
-add_reply_action(From, Reply, {keep_state, NewData}) ->
-    {keep_state, NewData, [{reply, From, Reply}]};
-add_reply_action(From, Reply, {keep_state, NewData, Actions}) ->
-    {keep_state, NewData, [{reply, From, Reply} | Actions]}.
+    {next_state, NextState, NewData, [{reply, From, Reply}]}.
 
 %% Branches the lookup result into the correct gen_statem transition.
 %% Used by both complete/2,3 and infer/4 paths.
@@ -428,15 +426,11 @@ generating(EventType, EventContent, Data) ->
 %% =============================================================================
 
 handle_common(_State, {call, From}, {complete, _, _}, Data) ->
-    %% Reject concurrent complete calls; only one in flight.
-    %% In idle this clause is unreachable: idle/3 matches the event
-    %% first. From prefilling/generating it surfaces here.
-    {keep_state, Data, [{reply, From, {error, busy}}]};
+    %% Reject concurrent complete/infer calls; only one in flight.
+    reply(From, {error, busy}, Data);
 handle_common(_State, {call, From}, {infer, _, _, _}, Data) ->
-    %% Reject concurrent infer calls; only one in flight per model.
-    {keep_state, Data, [{reply, From, {error, busy}}]};
+    reply(From, {error, busy}, Data);
 handle_common(_State, cast, {cancel, Ref}, Data = #data{request_ref = Ref}) ->
-    %% Set the cancel flag; the next decode_step honours it.
     {keep_state, Data#data{cancel_pending = true}};
 handle_common(_State, cast, {cancel, _OtherRef}, Data) ->
     %% Stale cancel for a previous request. Ignore.
@@ -446,30 +440,26 @@ handle_common(_State, {call, From}, evict, Data) ->
 handle_common(_State, {call, From}, shutdown, Data) ->
     {keep_state, fire_save_for_reason(shutdown, Data), [{reply, From, ok}]};
 handle_common(State, {call, From}, model_info, Data) ->
-    Reply = build_model_info(State, Data),
-    {keep_state, Data, [{reply, From, Reply}]};
+    reply(From, build_model_info(State, Data), Data);
 handle_common(_State, {call, From}, {tokenize, Text}, Data) ->
-    Reply =
-        case backend_call(Data, tokenize, [Text]) of
-            {error, _} = E -> E;
-            Tokens when is_list(Tokens) -> {ok, Tokens}
-        end,
-    {keep_state, Data, [{reply, From, Reply}]};
+    reply(From, wrap_ok(backend_call(Data, tokenize, [Text])), Data);
 handle_common(_State, {call, From}, {detokenize, Tokens}, Data) ->
-    Reply =
-        case backend_call(Data, detokenize, [Tokens]) of
-            {error, _} = E -> E;
-            Bin when is_binary(Bin) -> {ok, Bin}
-        end,
-    {keep_state, Data, [{reply, From, Reply}]};
+    reply(From, wrap_ok(backend_call(Data, detokenize, [Tokens])), Data);
 handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
-    Reply = optional_backend_call(Data, apply_chat_template, [Request]),
-    {keep_state, Data, [{reply, From, Reply}]};
+    reply(From, optional_backend_call(Data, apply_chat_template, [Request]), Data);
 handle_common(_State, {call, From}, {embed, Tokens}, Data) ->
-    Reply = optional_backend_call(Data, embed, [Tokens]),
-    {keep_state, Data, [{reply, From, Reply}]};
+    reply(From, optional_backend_call(Data, embed, [Tokens]), Data);
 handle_common(_State, _EventType, _EventContent, Data) ->
     {keep_state, Data}.
+
+%% Helper: synchronous reply with no state change.
+reply(From, Reply, Data) ->
+    {keep_state, Data, [{reply, From, Reply}]}.
+
+%% Wrap a backend tokenize/detokenize raw result in `{ok, _}` so the
+%% public API surface stays uniform across backends.
+wrap_ok({error, _} = E) -> E;
+wrap_ok(Result) -> {ok, Result}.
 
 %% Like backend_call/3, but for callbacks declared optional in the
 %% behaviour. If the backend module does not export the function
