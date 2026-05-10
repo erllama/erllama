@@ -120,7 +120,6 @@ extern int erllama_safe_memory_seq_rm(struct llama_context *c, int seq_id,
 
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_error;
-static ERL_NIF_TERM atom_not_implemented;
 static ERL_NIF_TERM atom_load_failed;
 static ERL_NIF_TERM atom_context_failed;
 static ERL_NIF_TERM atom_tokenize_failed;
@@ -271,7 +270,6 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
 
     atom_ok = enif_make_atom(env, "ok");
     atom_error = enif_make_atom(env, "error");
-    atom_not_implemented = enif_make_atom(env, "not_implemented");
     atom_load_failed = enif_make_atom(env, "load_failed");
     atom_context_failed = enif_make_atom(env, "context_failed");
     atom_tokenize_failed = enif_make_atom(env, "tokenize_failed");
@@ -1045,7 +1043,16 @@ static ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
      * enough (it returns the negative needed size). The safe wrapper
      * returns INT32_MIN on a thrown C++ exception. */
     char small_piece[256];
-    size_t cap = (size_t) n * 32 + 16;
+    /* Guard the size computation: clamp n to a sane upper bound so
+     * gcc's range analysis can prove cap fits. 16M tokens is far
+     * beyond any realistic prompt; reject earlier rather than
+     * overflow. */
+    if (n < 0 || n > (1 << 24)) {
+        pthread_mutex_unlock(&m->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_too_large);
+    }
+    size_t cap = (size_t) n * 32u + 16u;
     char *out = enif_alloc(cap);
     if (!out) {
         pthread_mutex_unlock(&m->mu);
@@ -1164,14 +1171,6 @@ static ERL_NIF_TERM nif_fsync_dir(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     return atom_ok;
 }
 
-/* =========================================================================
- * Suppress unused-stub warning for atom_not_implemented now that the
- * real API is in place.
- * ========================================================================= */
-static ERL_NIF_TERM use_atom_not_implemented(void) {
-    return atom_not_implemented;
-}
-
 static ErlNifFunc nif_funcs[] = {
     {"nif_crc32c",       1, nif_crc32c,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      3, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
@@ -1189,8 +1188,3 @@ static ErlNifFunc nif_funcs[] = {
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, unload)
-
-/* The unused_stub function is referenced once to satisfy -Wunused. */
-__attribute__((unused)) static void *_unused_anchor(void) {
-    return (void *) use_atom_not_implemented;
-}
