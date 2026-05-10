@@ -143,23 +143,25 @@ status() ->
 
 -spec init([config()]) -> {ok, state()} | {stop, term()}.
 init([Config]) ->
-    Source = maps:get(pressure_source, Config, noop),
-    maybe_start_os_mon(Source),
-    S0 = #state{
-        enabled = maps:get(enabled, Config, false),
-        pressure_source = Source,
-        interval_ms = maps:get(interval_ms, Config, ?DEFAULT_INTERVAL_MS),
-        high_watermark = maps:get(high_watermark, Config, ?DEFAULT_HIGH),
-        low_watermark = maps:get(low_watermark, Config, ?DEFAULT_LOW),
-        min_evict_bytes = maps:get(min_evict_bytes, Config, ?DEFAULT_MIN_EVICT),
-        evict_tiers = maps:get(evict_tiers, Config, ?DEFAULT_EVICT_TIERS),
-        last_used = 0,
-        last_total = 1,
-        last_evicted_bytes = 0
-    },
-    case validate(S0) of
-        ok -> {ok, schedule_next(S0)};
-        {error, Reason} -> {stop, Reason}
+    case validate_config(Config) of
+        {error, Reason} ->
+            {stop, Reason};
+        ok ->
+            Source = maps:get(pressure_source, Config, noop),
+            maybe_start_os_mon(Source),
+            S0 = #state{
+                enabled = maps:get(enabled, Config, false),
+                pressure_source = Source,
+                interval_ms = maps:get(interval_ms, Config, ?DEFAULT_INTERVAL_MS),
+                high_watermark = maps:get(high_watermark, Config, ?DEFAULT_HIGH),
+                low_watermark = maps:get(low_watermark, Config, ?DEFAULT_LOW),
+                min_evict_bytes = maps:get(min_evict_bytes, Config, ?DEFAULT_MIN_EVICT),
+                evict_tiers = maps:get(evict_tiers, Config, ?DEFAULT_EVICT_TIERS),
+                last_used = 0,
+                last_total = 1,
+                last_evicted_bytes = 0
+            },
+            {ok, schedule_next(S0)}
     end.
 
 handle_call({enable, Bool}, _From, S) ->
@@ -208,20 +210,30 @@ env_config() ->
         _ -> #{}
     end.
 
-validate(#state{
-    high_watermark = H,
-    low_watermark = L,
-    interval_ms = I
-}) when
-    H > L, H =< 1.0, L >= 0.0, is_integer(I), I > 0
-->
-    ok;
-validate(#state{high_watermark = H, low_watermark = L}) when
-    not (H > L andalso H =< 1.0 andalso L >= 0.0)
-->
-    {error, {invalid_config, {watermarks, "require 0.0 <= low < high <= 1.0"}}};
-validate(_) ->
-    {error, {invalid_config, {interval_ms, "must be a positive integer"}}}.
+%% Validate raw config map before constructing the state record.
+%% Defaults pass through unchanged; only user-supplied values are
+%% type-checked. We validate before record construction so dialyzer's
+%% pos_integer()/float() field types stay accurate.
+validate_config(Cfg) ->
+    H = maps:get(high_watermark, Cfg, ?DEFAULT_HIGH),
+    L = maps:get(low_watermark, Cfg, ?DEFAULT_LOW),
+    I = maps:get(interval_ms, Cfg, ?DEFAULT_INTERVAL_MS),
+    case watermarks_ok(H, L) of
+        false ->
+            {error, {invalid_config, {watermarks, "require 0.0 <= low < high <= 1.0"}}};
+        true ->
+            case is_integer(I) andalso I > 0 of
+                true ->
+                    ok;
+                false ->
+                    {error, {invalid_config, {interval_ms, "must be a positive integer"}}}
+            end
+    end.
+
+watermarks_ok(H, L) when is_number(H), is_number(L), H > L, H =< 1.0, L >= 0.0 ->
+    true;
+watermarks_ok(_, _) ->
+    false.
 
 maybe_start_os_mon(system) ->
     _ = application:ensure_all_started(os_mon),

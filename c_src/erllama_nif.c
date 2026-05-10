@@ -190,7 +190,24 @@ static void context_drops_model(erllama_model_t *m) {
  * They must tolerate partial init: if alloc succeeded but mutex_init
  * failed, the dtor sees mu_inited=0 and skips pthread_mutex_destroy.
  * Pointer fields are zero-init'd by the allocation path so freeing a
- * NULL is a no-op here. */
+ * NULL is a no-op here.
+ *
+ * Two accepted tradeoffs callers should know about:
+ *
+ *  1. A throwing llama destructor leaks the native object. C++
+ *     destructors are required to be `noexcept`; if one throws
+ *     anyway, the safe wrapper catches the exception and returns
+ *     -1 but we still NULL the pointer so the destructor cannot
+ *     be called twice. The native model/context is leaked rather
+ *     than risking UB. Fix lives upstream in llama.cpp.
+ *
+ *  2. GC-triggered dtors run on the scheduler thread that
+ *     triggered GC, not on a dirty scheduler. For prompt cleanup
+ *     of a multi-MB model, callers should prefer
+ *     `erllama:unload/1` (which terminates the per-model
+ *     gen_statem and goes through `nif_free_context` -- a dirty
+ *     CPU NIF) over relying on Erlang GC to destruct the
+ *     resource. */
 static void model_dtor(ErlNifEnv *env, void *obj) {
     (void) env;
     erllama_model_t *m = (erllama_model_t *) obj;

@@ -24,9 +24,9 @@ prefixed `erllama_cache_*`) but lives in the same OTP application as
 the rest of erllama. There is one NIF (`erllama_nif`) that holds the
 entire native surface (cache pipeline + future llama.cpp wrappers).
 
-Authoritative design: `plans/golden-finding-horizon.md`. The
-implementation roadmap at the bottom of the plan defines the build
-order; do not skip ahead.
+Authoritative behaviour is encoded in the test suites under `test/`
+(EUnit, PropEr, and Common Test) and the module docstrings. The
+README has the public-API tables and configuration reference.
 
 ## Required Checks
 
@@ -173,7 +173,9 @@ The atom naming regex allows `_SUITE` suffix for CT suites:
 
 ## When in doubt
 
-Re-read `plans/golden-finding-horizon.md` and the current step's
-review gate before extending behaviour. The plan went through nine
-review revisions before implementation; surface any tension with it
-to the human reviewer rather than improvising.
+Re-read the test suite for the area you're touching — every
+non-obvious invariant in the cache publish protocol, the
+reservation state machine, the warm-restore logits primer, and the
+NIF safety wrappers has a dedicated case. Surface tension with
+existing tests to the human reviewer before changing the
+behaviour.

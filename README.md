@@ -88,9 +88,10 @@ publish protocol is `meta-reserve → temp write → datasync → link(2)`
 (atomic create-if-not-exists), with stage-aware cleanup if the writer
 crashes.
 
-For full design, see `plans/golden-finding-horizon.md` (the
-implementation plan that drove the build) and `AGENTS.md` (the
-contributor guide).
+See `AGENTS.md` for the contributor guide. Behaviour invariants are
+encoded in the EUnit, PropEr, and Common Test suites — the cache
+publish protocol in particular has dedicated tests for stage-aware
+cleanup, EEXIST adopt/replace, and TTL refresh.
 
 ## Configuration
 
