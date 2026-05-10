@@ -113,7 +113,7 @@ jobs:
         run: rebar3 ct
 
   freebsd:
-    name: FreeBSD build + EUnit
+    name: FreeBSD
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -130,13 +130,33 @@ jobs:
             # binaries dir; prepend to PATH.
             pkg install -y erlang-runtime28 cmake bash gmake
           run: |
+            set -e
             export PATH="/usr/local/lib/erlang28/bin:/usr/local/bin:$PATH"
+            export ERL_CRASH_DUMP_SECONDS=0
             erl -eval 'io:format("OTP ~s~n", [erlang:system_info(otp_release)]), halt().' -noshell
             fetch https://github.com/erlang/rebar3/releases/download/3.25.0/rebar3 -o rebar3
             chmod +x rebar3
+
             ./rebar3 compile
-            ./rebar3 eunit
+
+            # Run each EUnit module in isolation. A segfault in BEAM
+            # teardown on one module does not contaminate the next,
+            # and a per-module failure points at the culprit.
+            FAILED=""
+            for m in $(ls test/*_tests.erl | sed 's|test/||;s|\.erl||'); do
+              echo "=== eunit: $m ==="
+              if ! ./rebar3 eunit --module=$m; then
+                FAILED="$FAILED $m"
+              fi
+            done
+
             ./rebar3 xref
+            ./rebar3 dialyzer
+
+            if [ -n "$FAILED" ]; then
+              echo "EUnit failures on FreeBSD:$FAILED"
+              exit 1
+            fi
 
   dialyzer:
     name: Dialyzer
