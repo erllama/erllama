@@ -28,7 +28,7 @@ Typical usage:
   }).
   {ok, Reply, _Tokens} = erllama:complete(Model, <<"hello">>).
   ok = erllama:unload(Model).
-'''
+```
 
 Models are dynamic children of `erllama_model_sup` (simple_one_for_one).
 A registered name is auto-generated when the caller does not provide
