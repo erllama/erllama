@@ -65,6 +65,7 @@ extern int32_t erllama_safe_token_to_piece(const struct llama_vocab *vocab,
                                            int32_t lstrip,
                                            bool special);
 extern int erllama_safe_backend_init(void);
+extern int erllama_safe_backend_init_once(void);
 extern int erllama_safe_backend_free(void);
 extern struct llama_model *erllama_safe_model_load_from_file(
     const char *path, struct llama_model_params params);
@@ -260,9 +261,13 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     if (erllama_crc32c_init() != 0) {
         return -1;
     }
-    if (erllama_safe_backend_init() != 0) {
-        return -1;
-    }
+    /* llama_backend_init() is deferred to first model load via
+     * erllama_safe_backend_init_once(). NIF load only sets up
+     * resources and atoms. Cache-only and cache-test workloads
+     * never invoke ggml_backend_load_all, which on some platforms
+     * (notably FreeBSD when paired with another NIF that uses
+     * mmap and signal handlers) perturbs process state in ways
+     * that break unrelated code paths. */
 
     atom_ok = enif_make_atom(env, "ok");
     atom_error = enif_make_atom(env, "error");
@@ -285,14 +290,12 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     MODEL_RT = enif_open_resource_type(
         env, NULL, "erllama_model", model_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!MODEL_RT) {
-        (void) erllama_safe_backend_free();
         return -1;
     }
 
     CTX_RT = enif_open_resource_type(
         env, NULL, "erllama_context", ctx_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!CTX_RT) {
-        (void) erllama_safe_backend_free();
         return -1;
     }
 
@@ -302,10 +305,9 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
 static void unload(ErlNifEnv *env, void *priv_data) {
     (void) env;
     (void) priv_data;
-    /* Counterpart to llama_backend_init in load(). Lets the BEAM
-     * reload the NIF (e.g. on hot upgrade) without leaking llama
-     * global state. We can't surface a failure from unload, but the
-     * exception is at least caught by the safe wrapper. */
+    /* If backend_init_once ran, free the global llama state so a
+     * NIF reload (hot upgrade, test runner) doesn't leak. If it
+     * never ran, llama_backend_free is a no-op. */
     (void) erllama_safe_backend_free();
 }
 
@@ -393,6 +395,10 @@ static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     }
     if (!enif_is_map(env, argv[1])) {
         return enif_make_badarg(env);
+    }
+
+    if (erllama_safe_backend_init_once() != 0) {
+        return enif_make_tuple2(env, atom_error, atom_load_failed);
     }
 
     struct llama_model_params params = llama_model_default_params();
