@@ -124,6 +124,12 @@ lookup_exact_or_wait(Key, MaxWaitMs) ->
 %% Stops at `MinTokens` floor and returns `miss` if nothing matches.
 %% Walks at most `length(Tokens) / Stride` rows; with the default
 %% 2048-token stride that's ~15 lookups for a 30k-token prompt.
+%%
+%% Encodes the full token list to a binary once at entry, then passes
+%% `binary:part(TokensBin, 0, N*4)` sub-binaries (O(1) views) to
+%% `erllama_cache_key:make/4` per probe. Avoids re-traversing the
+%% list and re-allocating the binary on every step; the only
+%% per-probe cost is the SHA-256 over N*4 bytes plus the ETS lookup.
 -spec lookup_longest_prefix(map(), [erllama_nif:token_id()], pos_integer(), pos_integer()) ->
     {ok, pos_integer(), tuple()} | miss.
 lookup_longest_prefix(KeyMeta, Tokens, Stride, MinTokens) when
@@ -132,16 +138,18 @@ lookup_longest_prefix(KeyMeta, Tokens, Stride, MinTokens) when
     Len = length(Tokens),
     Start = (Len div Stride) * Stride,
     Floor = max(MinTokens, Stride),
-    walk_prefix(KeyMeta, Tokens, Start, Stride, Floor).
+    AllTokensBin = erllama_cache_key:encode_tokens(Tokens),
+    #{fingerprint := Fp, quant_type := QT, ctx_params_hash := CtxHash} = KeyMeta,
+    walk_prefix(Fp, QT, CtxHash, AllTokensBin, Start, Stride, Floor).
 
-walk_prefix(_KeyMeta, _Tokens, N, _Stride, Floor) when N < Floor ->
+walk_prefix(_Fp, _QT, _CtxHash, _Bin, N, _Stride, Floor) when N < Floor ->
     miss;
-walk_prefix(KeyMeta, Tokens, N, Stride, Floor) ->
-    Prefix = lists:sublist(Tokens, N),
-    Key = erllama_cache_key:make(KeyMeta#{tokens => Prefix}),
+walk_prefix(Fp, QT, CtxHash, Bin, N, Stride, Floor) ->
+    PrefixBin = binary:part(Bin, 0, N * 4),
+    Key = erllama_cache_key:make(Fp, QT, CtxHash, PrefixBin),
     case lookup_exact(Key) of
         {ok, Row} -> {ok, N, Row};
-        miss -> walk_prefix(KeyMeta, Tokens, N - Stride, Stride, Floor)
+        miss -> walk_prefix(Fp, QT, CtxHash, Bin, N - Stride, Stride, Floor)
     end.
 
 -spec checkout(erllama_cache:cache_key(), pid()) ->

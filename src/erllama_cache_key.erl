@@ -15,6 +15,7 @@
 
 -export([
     make/1,
+    make/4,
     quant_byte/1,
     quant_atom/1,
     encode_tokens/1,
@@ -59,8 +60,24 @@ make(#{
     byte_size(CtxHash) =:= 32,
     is_list(Tokens)
 ->
+    make(Fp, QT, CtxHash, encode_tokens(Tokens)).
+
+%% @doc Variant taking a pre-encoded TokensBin (u32-LE per token,
+%% matching `encode_tokens/1`). Used by the longest-prefix walk so a
+%% caller can encode once and pass `binary:part(AllTokensBin, 0, N*4)`
+%% sub-binaries per probe, avoiding the per-attempt list traversal +
+%% list comprehension allocation. Sub-binaries are O(1) views, so
+%% this turns the per-probe cost into just the SHA-256 work.
+-spec make(<<_:256>>, quant_type(), <<_:256>>, binary()) -> key().
+make(Fp, QT, CtxHash, TokensBin) when
+    is_binary(Fp),
+    byte_size(Fp) =:= 32,
+    is_binary(CtxHash),
+    byte_size(CtxHash) =:= 32,
+    is_binary(TokensBin),
+    byte_size(TokensBin) rem 4 =:= 0
+->
     QuantByte = quant_byte(QT),
-    TokensBin = encode_tokens(Tokens),
     crypto:hash(sha256, [Fp, <<QuantByte:8>>, CtxHash, TokensBin]).
 
 -spec quant_byte(quant_type()) -> 0..255.
