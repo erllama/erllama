@@ -14,7 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-13, macos-14]
-        otp: ['28', '29']
+        otp: ['28']
 
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +46,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, ubuntu-24.04-arm, macos-13, macos-14]
-        otp: ['28', '29']
+        otp: ['28']
 
     steps:
       - uses: actions/checkout@v4
@@ -78,16 +78,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: '29'
+          otp-version: '28'
           rebar3-version: '3.25.0'
       - uses: actions/cache@v4
         with:
           path: |
             _build
             ~/.cache/rebar3
-          key: build-ubuntu-24.04-otp-29-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
+          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
           restore-keys: |
-            build-ubuntu-24.04-otp-29-
+            build-ubuntu-24.04-otp-28-
       - name: Run PropEr
         run: rebar3 proper
 
@@ -99,16 +99,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: '29'
+          otp-version: '28'
           rebar3-version: '3.25.0'
       - uses: actions/cache@v4
         with:
           path: |
             _build
             ~/.cache/rebar3
-          key: build-ubuntu-24.04-otp-29-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
+          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
           restore-keys: |
-            build-ubuntu-24.04-otp-29-
+            build-ubuntu-24.04-otp-28-
       - name: Run Common Test
         run: rebar3 ct
 
@@ -137,7 +137,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: '29'
+          otp-version: '28'
           rebar3-version: '3.25.0'
       - name: Restore PLT cache
         uses: actions/cache@v4
@@ -146,9 +146,9 @@ jobs:
             _build/*_plt
             _build/*/rebar3_*_plt
             ~/.cache/rebar3
-          key: plt-otp-29-${{ hashFiles('rebar.lock') }}
+          key: plt-otp-28-${{ hashFiles('rebar.lock') }}
           restore-keys: |
-            plt-otp-29-
+            plt-otp-28-
       - name: Run Dialyzer
         run: rebar3 dialyzer
 
@@ -159,7 +159,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: '29'
+          otp-version: '28'
           rebar3-version: '3.25.0'
       - name: Run erlfmt --check
         run: rebar3 fmt --check
@@ -171,7 +171,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: '29'
+          otp-version: '28'
           rebar3-version: '3.25.0'
       - name: Run Elvis
         run: rebar3 lint
@@ -184,15 +184,15 @@ jobs:
       - uses: actions/checkout@v4
       - uses: erlef/setup-beam@v1
         with:
-          otp-version: '29'
+          otp-version: '28'
           rebar3-version: '3.25.0'
       - uses: actions/cache@v4
         with:
           path: |
             _build
             ~/.cache/rebar3
-          key: build-ubuntu-24.04-otp-29-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
+          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
           restore-keys: |
-            build-ubuntu-24.04-otp-29-
+            build-ubuntu-24.04-otp-28-
       - name: Run XRef
         run: rebar3 xref
