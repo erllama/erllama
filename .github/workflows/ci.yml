@@ -197,11 +197,15 @@ jobs:
           release: ${{ matrix.release }}
           usesh: true
           prepare: |
+            # Refresh pcre2 first: the cached VM image ships an older
+            # libpcre2 than the `git` package in the latest repo
+            # expects (otherwise git fails with PCRE2_10.47 not
+            # defined, which breaks rebar3 git deps).
+            pkg install -y pcre2
             # The base `erlang` package on FreeBSD lags upstream
-            # (26.x as of 14.4); we require OTP >= 28. The ports
-            # tree ships per-major runtime packages — use the 28
-            # runtime directly. /usr/local/lib/erlang28/bin is its
-            # binaries dir; prepend to PATH.
+            # (26.x as of 14.4); we require OTP >= 28. Use the
+            # per-major runtime package; its binaries live under
+            # /usr/local/lib/erlang28/bin.
             pkg install -y erlang-runtime28 cmake bash gmake git
           run: |
             set -e
