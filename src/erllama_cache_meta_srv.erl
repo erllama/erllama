@@ -368,14 +368,26 @@ do_checkout(Key, Pid, Row, S) ->
     OldLastUsed = element(?POS_LAST_USED, Row),
     ets:delete(?TBL_LRU, {OldLastUsed, Key}),
     ets:insert(?TBL_LRU, {{NowNs, Key}, []}),
-    ets:update_counter(?TBL_META, Key, {?POS_REFCOUNT, +1}),
+    [NewHits] = ets:update_counter(?TBL_META, Key, [{?POS_HITS, +1}]),
+    _ = ets:update_counter(?TBL_META, Key, {?POS_REFCOUNT, +1}),
     ets:update_element(?TBL_META, Key, {?POS_LAST_USED, NowNs}),
     Tier = element(?POS_TIER, Row),
     Loc = element(?POS_LOCATION, Row),
     Header = element(?POS_HEADER_BIN, Row),
     Tokens = element(?POS_TOKENS_REF, Row),
+    %% Persist the bumped hit count for restart-survival. Best-effort:
+    %% a failed write only loses the increment, with no behavioural
+    %% impact this run. RAM tier has no persistent file.
+    persist_hits(Loc, NewHits),
     Holders1 = (S#state.holders)#{MonRef => {Pid, Key}},
     {reply, {ok, MonRef, Tier, Loc, Header, Tokens}, S#state{holders = Holders1}}.
+
+persist_hits({disk, Path}, Hits) ->
+    erllama_cache_disk_srv:touch_hits(Path, Hits);
+persist_hits({ram_file, Path}, Hits) ->
+    erllama_cache_disk_srv:touch_hits(Path, Hits);
+persist_hits(_, _) ->
+    ok.
 
 decrement_refcount(Key) ->
     try
@@ -392,11 +404,27 @@ install_available_row(Key, Tier, Size, Header, Location, TokensBin) ->
     catch
         error:badarg -> ok
     end,
+    Hits = hits_from_header(Header),
+    %% Bias last_used by accumulated hits so a high-hit row survives
+    %% an LRU walk on a freshly-restarted server, where every row's
+    %% natural last_used would otherwise collapse to ~NowNs and leave
+    %% the order effectively random. Each accumulated hit pushes the
+    %% row 1 second forward in the LRU. Once a row is actively
+    %% checked out at runtime, recency takes over.
+    LastUsed = NowNs + Hits * 1_000_000_000,
     Row =
-        {Key, Tier, Size, NowNs, 0, available, Header, Location, TokensBin},
+        {Key, Tier, Size, LastUsed, 0, available, Header, Location, TokensBin, Hits},
     ets:insert(?TBL_META, Row),
-    ets:insert(?TBL_LRU, {{NowNs, Key}, []}),
+    ets:insert(?TBL_LRU, {{LastUsed, Key}, []}),
     ok.
+
+%% Extract the u32 hit_count from the on-disk header. RAM tier saves
+%% pass a placeholder header so we treat a too-short header as "no
+%% prior hits".
+hits_from_header(<<_:?KVC_HEADER_HITS_OFFSET/binary, Hits:32/little, _/binary>>) ->
+    Hits;
+hits_from_header(_) ->
+    0.
 
 %% =============================================================================
 %% Internal: reservation

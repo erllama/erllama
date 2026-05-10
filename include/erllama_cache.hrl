@@ -7,7 +7,10 @@
 -define(ERLLAMA_CACHE_HRL, true).
 
 %% Meta row position constants. Layout:
-%%   {Key, Tier, Size, LastUsedNs, Refcount, Status, HeaderBin, Location, TokensRef}
+%%   {Key, Tier, Size, LastUsedNs, Refcount, Status, HeaderBin, Location,
+%%    TokensRef, Hits}
+%% Hits is a per-row count of warm reuses. Persisted at offset 12 of
+%% the on-disk KVC header so eviction scoring survives restarts.
 -define(POS_KEY, 1).
 -define(POS_TIER, 2).
 -define(POS_SIZE, 3).
@@ -17,6 +20,12 @@
 -define(POS_HEADER_BIN, 7).
 -define(POS_LOCATION, 8).
 -define(POS_TOKENS_REF, 9).
+-define(POS_HITS, 10).
+
+%% Offset of the u32 hit_count inside the 48-byte KVC header.
+%% magic(3) + version(1) + quant(1) + reason(1) + reserved(2) +
+%% token_count(4) = 12.
+-define(KVC_HEADER_HITS_OFFSET, 12).
 
 %% Atomics counter slots. See plans/golden-finding-horizon.md Q10.
 -define(C_HITS_EXACT, 1).

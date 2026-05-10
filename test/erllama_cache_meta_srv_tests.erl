@@ -86,6 +86,30 @@ checkout_misses_unknown_key_test() ->
         ?assertEqual(miss, erllama_cache_meta_srv:checkout(key(999), self()))
     end).
 
+checkout_bumps_hit_counter_test() ->
+    with_srv(fun() ->
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        {ok, Row0} = erllama_cache_meta_srv:dump(key(1)),
+        ?assertEqual(0, element(?POS_HITS, Row0)),
+        {ok, Ref1, _, _, _, _} = erllama_cache_meta_srv:checkout(key(1), self()),
+        ok = erllama_cache_meta_srv:checkin(Ref1),
+        {ok, Ref2, _, _, _, _} = erllama_cache_meta_srv:checkout(key(1), self()),
+        ok = erllama_cache_meta_srv:checkin(Ref2),
+        {ok, Row1} = erllama_cache_meta_srv:dump(key(1)),
+        ?assertEqual(2, element(?POS_HITS, Row1))
+    end).
+
+install_restores_hits_from_header_test() ->
+    with_srv(fun() ->
+        %% A 48-byte KVC header with hit_count = 7 at offset 12.
+        Header =
+            <<"KVC", 1:8, 16:8, 1:8, 0:16, 12:32/little, 7:32/little, 4096:32/little, 0:32, 0:64,
+                0:64, 0:64>>,
+        ok = erllama_cache_meta_srv:insert_available(key(1), disk, 100, Header, {disk, "x"}),
+        {ok, Row} = erllama_cache_meta_srv:dump(key(1)),
+        ?assertEqual(7, element(?POS_HITS, Row))
+    end).
+
 checkout_two_holders_independent_refcounts_test() ->
     with_srv(fun() ->
         ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),

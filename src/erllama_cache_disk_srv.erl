@@ -47,7 +47,8 @@
     load/2,
     delete/2,
     dir/1,
-    scan/1
+    scan/1,
+    touch_hits/2
 ]).
 
 -export([init/1, handle_call/3, handle_cast/2]).
@@ -113,6 +114,25 @@ dir(SrvName) ->
     [{erllama_cache:cache_key(), binary(), non_neg_integer()}].
 scan(SrvName) ->
     gen_server:call(SrvName, scan, infinity).
+
+%% Best-effort in-place rewrite of the u32 hit_count at offset 12 of
+%% the on-disk header. No server hop: the meta server is the sole
+%% caller, the write is exactly 4 bytes (atomic at the OS level), and
+%% the file's other bytes are immutable post-publish. ENOENT (file
+%% just got evicted) is silently ignored.
+-spec touch_hits(file:name(), non_neg_integer()) -> ok.
+touch_hits(Path, Hits) ->
+    case prim_file:open(Path, [write, read, raw, binary]) of
+        {ok, Fd} ->
+            try
+                _ = prim_file:pwrite(Fd, ?KVC_HEADER_HITS_OFFSET, <<Hits:32/little>>)
+            after
+                prim_file:close(Fd)
+            end,
+            ok;
+        {error, _} ->
+            ok
+    end.
 
 %% =============================================================================
 %% gen_server callbacks
