@@ -617,7 +617,7 @@ static ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     if (get_map_bool(env, argv[2], "parse_special", &b)) parse_special = b;
 
     pthread_mutex_lock(&m->mu);
-    if (!m->model) {
+    if (!m->model || m->release_pending) {
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
@@ -1015,7 +1015,7 @@ static ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     }
 
     pthread_mutex_lock(&m->mu);
-    if (!m->model) {
+    if (!m->model || m->release_pending) {
         pthread_mutex_unlock(&m->mu);
         enif_free(tokens);
         return enif_make_tuple2(env, atom_error, atom_released);
@@ -1027,10 +1027,19 @@ static ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         return enif_make_tuple2(env, atom_error, atom_exception);
     }
     int32_t n_vocab = erllama_safe_vocab_n_tokens(vocab);
+    /* Fail closed if the vocab lookup gave us no usable size: without
+     * n_vocab we cannot validate token IDs, and an out-of-range
+     * positive ID would reach `id_to_token.at(id)` deep inside llama
+     * and throw across the C ABI. Mirrors the prefill path. */
+    if (n_vocab <= 0) {
+        pthread_mutex_unlock(&m->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_invalid_token);
+    }
     /* Validate before any token_to_piece call so out-of-range IDs do
      * not reach `id_to_token.at(id)` and trigger an internal throw. */
     for (int32_t i = 0; i < n; i++) {
-        if (n_vocab > 0 && tokens[i] >= n_vocab) {
+        if (tokens[i] >= n_vocab) {
             pthread_mutex_unlock(&m->mu);
             enif_free(tokens);
             return enif_make_tuple2(env, atom_error, atom_invalid_token);
