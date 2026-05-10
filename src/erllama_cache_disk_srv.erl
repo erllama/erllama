@@ -1,42 +1,42 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% Disk tier server (read_write mode).
-%%
-%% One server per disk root directory. Owns no ETS tables; the disk
-%% itself is the source of truth for slabs. Reads, writes, and deletes
-%% all funnel through the gen_server, which keeps file ordering
-%% sequential per directory.
-%%
-%% Save pipeline (`save/3`):
-%%
-%%   1. Build framed bytes via `erllama_cache_kvc:build/2`.
-%%   2. Open writer-unique temp file `<hex>.kvc.<writer_id>.tmp`
-%%      with O_EXCL.
-%%   3. `prim_file:write/2` an iolist of `[Prefix, Payload]`. Multi-GB
-%%      payloads are not concatenated in BEAM memory; the IO subsystem
-%%      uses writev under the hood.
-%%   4. `prim_file:datasync/1`, then close.
-%%   5. `prim_file:make_link/2` to publish at `<hex>.kvc`. EEXIST is
-%%      handled: if the existing file is a valid KVC for this Key, we
-%%      adopt it (delete our temp). Otherwise we delete the corrupt
-%%      file and retry once.
-%%   6. `erllama_nif:fsync_dir/1` on the root.
-%%   7. Reopen the published file and parse it (validation belt-and-
-%%      braces against FS bugs).
-%%
-%% Returns `{ok, Header, Size}` on success. The caller is responsible
-%% for the `meta_srv:reserve_save -> check_reservation -> mark_published
-%% -> announce_saved` protocol around this call (the writer pool in
-%% step 10 wires that up).
-%%
-%% On startup, the server scans its directory: deletes any `*.tmp`
-%% files (interrupted writes; safe to drop), parses every `<hex>.kvc`
-%% header, and registers each valid file with the meta server. Files
-%% that fail to parse are deleted.
-%% @end
 -module(erllama_cache_disk_srv).
+-moduledoc """
+Disk tier server (read_write mode).
+
+One server per disk root directory. Owns no ETS tables; the disk
+itself is the source of truth for slabs. Reads, writes, and deletes
+all funnel through the gen_server, which keeps file ordering
+sequential per directory.
+
+Save pipeline (`save/3`):
+
+  1. Build framed bytes via `erllama_cache_kvc:build/2`.
+  2. Open writer-unique temp file `<hex>.kvc.<writer_id>.tmp`
+     with O_EXCL.
+  3. `prim_file:write/2` an iolist of `[Prefix, Payload]`. Multi-GB
+     payloads are not concatenated in BEAM memory; the IO subsystem
+     uses writev under the hood.
+  4. `prim_file:datasync/1`, then close.
+  5. `prim_file:make_link/2` to publish at `<hex>.kvc`. EEXIST is
+     handled: if the existing file is a valid KVC for this Key, we
+     adopt it (delete our temp). Otherwise we delete the corrupt
+     file and retry once.
+  6. `erllama_nif:fsync_dir/1` on the root.
+  7. Reopen the published file and parse it (validation belt-and-
+     braces against FS bugs).
+
+Returns `{ok, Header, Size}` on success. The caller is responsible
+for the `meta_srv:reserve_save -> check_reservation -> mark_published
+-> announce_saved` protocol around this call (the writer pool in
+step 10 wires that up).
+
+On startup, the server scans its directory: deletes any `*.tmp`
+files (interrupted writes; safe to drop), parses every `<hex>.kvc`
+header, and registers each valid file with the meta server. Files
+that fail to parse are deleted.
+""".
 -behaviour(gen_server).
 
 -include("erllama_cache.hrl").

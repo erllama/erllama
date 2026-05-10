@@ -1,33 +1,33 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% Per-model gen_statem that drives the request flow and wires the
-%% cache subsystem into the model lifecycle.
-%%
-%% State machine (v0.1):
-%%
-%% ```
-%%   idle ──complete──▶ prefilling ──prefill_done──▶ generating ──finish──▶ idle
-%% ```
-%%
-%% On the `prefilling → generating` transition the model fires a
-%% **cold** save (boundary-trimmed prefix, async). Inside `generating`
-%% it fires a **finish** save (full live token list, async) just
-%% before returning to `idle`.
-%%
-%% The `continued` save reason (every N tokens of new generation),
-%% the `evict` save reason (driven by an external scheduler), and the
-%% `shutdown` save reason (driven by `application:prep_stop`) are
-%% defined in `erllama_cache_policy` but not yet wired here; they
-%% land in follow-up steps.
-%%
-%% Model operations (tokenize, prefill, decode, kv_pack, kv_unpack)
-%% are stubbed — the gen_statem's `tokens` field IS the "context".
-%% When step 2b lands the real `erllama_nif` for llama.cpp, those
-%% stubs get replaced; the cache integration is unaffected.
-%% @end
 -module(erllama_model).
+-moduledoc """
+Per-model gen_statem that drives the request flow and wires the
+cache subsystem into the model lifecycle.
+
+State machine (v0.1):
+
+```
+  idle ──complete──▶ prefilling ──prefill_done──▶ generating ──finish──▶ idle
+```
+
+On the `prefilling → generating` transition the model fires a
+**cold** save (boundary-trimmed prefix, async). Inside `generating`
+it fires a **finish** save (full live token list, async) just
+before returning to `idle`.
+
+The `continued` save reason (every N tokens of new generation),
+the `evict` save reason (driven by an external scheduler), and the
+`shutdown` save reason (driven by `application:prep_stop`) are
+defined in `erllama_cache_policy` but not yet wired here; they
+land in follow-up steps.
+
+Model operations (tokenize, prefill, decode, kv_pack, kv_unpack)
+are stubbed — the gen_statem's `tokens` field IS the "context".
+When step 2b lands the real `erllama_nif` for llama.cpp, those
+stubs get replaced; the cache integration is unaffected.
+""".
 -behaviour(gen_statem).
 
 -include("erllama_cache.hrl").
@@ -101,18 +101,22 @@ complete(Model, Prompt, Opts) ->
 status(Model) ->
     gen_statem:call(Model, status).
 
-%% @doc Request that the model evict its current state. Fires an
-%% `evict` save synchronously if there is anything in the context.
-%% Called by `erllama_scheduler` (future) when GPU memory pressure
-%% requires this model to release its context handle. No-op when
-%% the model is idle with no live context.
+-doc """
+Request that the model evict its current state. Fires an `evict`
+save synchronously if there is anything in the context. Called by
+`erllama_scheduler` (future) when GPU memory pressure requires this
+model to release its context handle. No-op when the model is idle
+with no live context.
+""".
 -spec evict(atom() | pid()) -> ok.
 evict(Model) ->
     gen_statem:call(Model, evict).
 
-%% @doc Fire a `shutdown` save synchronously and return. Called from
-%% the application's `prep_stop` hook so live state survives a
-%% graceful restart.
+-doc """
+Fire a `shutdown` save synchronously and return. Called from the
+application's `prep_stop` hook so live state survives a graceful
+restart.
+""".
 -spec shutdown(atom() | pid()) -> ok.
 shutdown(Model) ->
     gen_statem:call(Model, shutdown).

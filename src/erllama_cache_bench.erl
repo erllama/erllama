@@ -1,23 +1,23 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% Microbench helpers for the cache subsystem.
-%%
-%% These do NOT measure realistic prefill / decode latency — that
-%% requires the real `erllama_nif` against llama.cpp (step 2b).
-%% What they do measure: framing / CRC / link-publish / iommap-load
-%% latency. Useful as a regression guard on the I/O path and as a
-%% template for the post-2b benchmark that will assert the >=10x
-%% cold-vs-warm speedup target on NVMe.
-%%
-%% Usage from the shell:
-%%
-%%   1> application:ensure_all_started(erllama).
-%%   2> {ok, _} = erllama_cache_disk_srv:start_link(b_disk, "/tmp/b").
-%%   3> erllama_cache_bench:save_load(b_disk, 100, 4096).
-%% @end
 -module(erllama_cache_bench).
+-moduledoc """
+Microbench helpers for the cache subsystem.
+
+These do NOT measure realistic prefill / decode latency — that
+requires the real `erllama_nif` against llama.cpp (step 2b).
+What they do measure: framing / CRC / link-publish / iommap-load
+latency. Useful as a regression guard on the I/O path and as a
+template for the post-2b benchmark that will assert the >=10x
+cold-vs-warm speedup target on NVMe.
+
+Usage from the shell:
+
+  1> application:ensure_all_started(erllama).
+  2> {ok, _} = erllama_cache_disk_srv:start_link(b_disk, "/tmp/b").
+  3> erllama_cache_bench:save_load(b_disk, 100, 4096).
+""".
 
 -export([save_load/3]).
 

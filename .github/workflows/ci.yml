@@ -123,14 +123,20 @@ jobs:
           release: '14.4'
           usesh: true
           prepare: |
-            pkg install -y erlang cmake bash gmake
+            # The base `erlang` package on FreeBSD lags upstream
+            # (26.x as of 14.4); we require OTP >= 28. The ports
+            # tree ships per-major runtime packages — use the 28
+            # runtime directly. /usr/local/lib/erlang28/bin is its
+            # binaries dir; prepend to PATH.
+            pkg install -y erlang-runtime28 cmake bash gmake
           run: |
-            export PATH="/usr/local/bin:$PATH"
+            export PATH="/usr/local/lib/erlang28/bin:/usr/local/bin:$PATH"
             erl -eval 'io:format("OTP ~s~n", [erlang:system_info(otp_release)]), halt().' -noshell
             fetch https://github.com/erlang/rebar3/releases/download/3.25.0/rebar3 -o rebar3
             chmod +x rebar3
             ./rebar3 compile
             ./rebar3 eunit
+            ./rebar3 xref
 
   dialyzer:
     name: Dialyzer

@@ -16,3 +16,4 @@ log/
 erl_crash.dump
 priv/erllama_nif.so
 rebar3.crashdump
+doc/

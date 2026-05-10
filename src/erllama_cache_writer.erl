@@ -1,41 +1,41 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% File-tier save orchestrator with a leak-proof ETS counting
-%% semaphore.
-%%
-%% Modelled on `py_semaphore` from erlang-python (Discord pattern):
-%% one ETS table holding `{running, N}` and `{max, M}` counters;
-%% atomic `update_counter` for fast inspection from any process.
-%%
-%% Unlike the bare ETS pattern, this module also runs a small
-%% gen_server that owns the holders map and monitors every active
-%% acquirer. If a holder dies between acquire and release (SIGKILL,
-%% process crash, etc.), the gen_server's `'DOWN'` handler releases
-%% the slot. No leaks.
-%%
-%% Hot path:
-%%
-%%   `current/0` and `max_concurrent/0` read ETS directly
-%%   (no server hop).
-%%   `acquire/1` and `release/0` go through this gen_server, which
-%%   serialises monitor bookkeeping. Per-call overhead is roughly
-%%   one gen_server hop (~1 us); for save paths measured in
-%%   seconds this is invisible.
-%%
-%% Save pipeline run by `save/4` in the caller's process:
-%%
-%%   acquire (with backoff up to AcquireTimeoutMs)
-%%   meta_srv:reserve_save -> Token
-%%   disk_srv:save (returns once the file is linked + validated)
-%%   meta_srv:announce_saved -> available
-%%   release (try/after)
-%%
-%% A `try/after` releases on normal exits and exceptions; the
-%% gen_server's monitor catches everything else.
-%% @end
 -module(erllama_cache_writer).
+-moduledoc """
+File-tier save orchestrator with a leak-proof ETS counting
+semaphore.
+
+Modelled on `py_semaphore` from erlang-python (Discord pattern):
+one ETS table holding `{running, N}` and `{max, M}` counters;
+atomic `update_counter` for fast inspection from any process.
+
+Unlike the bare ETS pattern, this module also runs a small
+gen_server that owns the holders map and monitors every active
+acquirer. If a holder dies between acquire and release (SIGKILL,
+process crash, etc.), the gen_server's `'DOWN'` handler releases
+the slot. No leaks.
+
+Hot path:
+
+  `current/0` and `max_concurrent/0` read ETS directly
+  (no server hop).
+  `acquire/1` and `release/0` go through this gen_server, which
+  serialises monitor bookkeeping. Per-call overhead is roughly
+  one gen_server hop (~1 us); for save paths measured in
+  seconds this is invisible.
+
+Save pipeline run by `save/4` in the caller's process:
+
+  acquire (with backoff up to AcquireTimeoutMs)
+  meta_srv:reserve_save -> Token
+  disk_srv:save (returns once the file is linked + validated)
+  meta_srv:announce_saved -> available
+  release (try/after)
+
+A `try/after` releases on normal exits and exceptions; the
+gen_server's monitor catches everything else.
+""".
 -behaviour(gen_server).
 
 -include("erllama_cache.hrl").
@@ -105,9 +105,11 @@ set_max_concurrent(Max) when is_integer(Max), Max > 0 ->
 %% Public API: semaphore
 %% =============================================================================
 
-%% @doc Try to acquire a slot. Blocks with exponential backoff up
-%% to `Timeout` milliseconds. On success the holder ref is stashed
-%% in the process dictionary so `release/0` finds it.
+-doc """
+Try to acquire a slot. Blocks with exponential backoff up to
+Timeout milliseconds. On success the holder ref is stashed in the
+process dictionary so `release/0` finds it.
+""".
 -spec acquire(timeout()) -> ok | {error, max_concurrent}.
 acquire(infinity) ->
     acquire_loop(infinity, 0, ?BACKOFF_MS);

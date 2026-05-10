@@ -1,20 +1,20 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% RAM tier slab store.
-%%
-%% Owns the `erllama_cache_ram_slabs` ETS table. Reads and deletes
-%% are direct ETS operations from any process; puts go through this
-%% module's `put/3` because they need to atomically (a) insert the
-%% slab and (b) register the meta row via the meta server.
-%%
-%% Slab binaries above 64 bytes live off-heap as refcounted ProcBins
-%% so `ets:lookup` returns a binary reference, not a copy. There is
-%% no slab fragmentation to worry about; eviction frees the slab
-%% binary by deleting its row.
-%% @end
 -module(erllama_cache_ram).
+-moduledoc """
+RAM tier slab store.
+
+Owns the `erllama_cache_ram_slabs` ETS table. Reads and deletes
+are direct ETS operations from any process; puts go through this
+module's `put/3` because they need to atomically (a) insert the
+slab and (b) register the meta row via the meta server.
+
+Slab binaries above 64 bytes live off-heap as refcounted ProcBins
+so `ets:lookup` returns a binary reference, not a copy. There is
+no slab fragmentation to worry about; eviction frees the slab
+binary by deleting its row.
+""".
 -behaviour(gen_server).
 
 -export([start_link/0, put/3, load/1, delete/1, size_bytes/0]).

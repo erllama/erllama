@@ -1,39 +1,39 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% Public façade for the erllama application.
-%%
-%% The cache subsystem (`erllama_cache`) is independent. This module
-%% is the user-facing surface for loading and running models.
-%%
-%% Typical usage:
-%%
-%% ```
-%%   ok = application:ensure_all_started(erllama).
-%%   {ok, Model} = erllama:load_model(#{
-%%       backend => erllama_model_llama,
-%%       model_path => "/srv/models/tinyllama-1.1b-q4_k_m.gguf",
-%%       %% cache configuration:
-%%       tier_srv => default_disk,
-%%       tier => disk,
-%%       fingerprint => Fp,
-%%       fingerprint_mode => safe,
-%%       quant_type => q4_k_m,
-%%       quant_bits => 4,
-%%       ctx_params_hash => CtxHash,
-%%       context_size => 4096,
-%%       policy => Policy
-%%   }).
-%%   {ok, Reply, _Tokens} = erllama:complete(Model, <<"hello">>).
-%%   ok = erllama:unload(Model).
-%% '''
-%%
-%% Models are dynamic children of `erllama_model_sup` (simple_one_for_one).
-%% A registered name is auto-generated when the caller does not provide
-%% an explicit `model_id` in the config map.
-%% @end
 -module(erllama).
+-moduledoc """
+Public façade for the erllama application.
+
+The cache subsystem (`erllama_cache`) is independent. This module
+is the user-facing surface for loading and running models.
+
+Typical usage:
+
+```
+  ok = application:ensure_all_started(erllama).
+  {ok, Model} = erllama:load_model(#{
+      backend => erllama_model_llama,
+      model_path => "/srv/models/tinyllama-1.1b-q4_k_m.gguf",
+      %% cache configuration:
+      tier_srv => default_disk,
+      tier => disk,
+      fingerprint => Fp,
+      fingerprint_mode => safe,
+      quant_type => q4_k_m,
+      quant_bits => 4,
+      ctx_params_hash => CtxHash,
+      context_size => 4096,
+      policy => Policy
+  }).
+  {ok, Reply, _Tokens} = erllama:complete(Model, <<"hello">>).
+  ok = erllama:unload(Model).
+'''
+
+Models are dynamic children of `erllama_model_sup` (simple_one_for_one).
+A registered name is auto-generated when the caller does not provide
+an explicit `model_id` in the config map.
+""".
 
 -export([
     load_model/1,

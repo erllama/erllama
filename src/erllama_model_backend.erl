@@ -1,20 +1,20 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% Behaviour describing the operations the `erllama_model` gen_statem
-%% needs from a backing inference engine.
-%%
-%% Two backends ship in v0.2:
-%%
-%%   `erllama_model_stub` — deterministic phash2-based stubs; used
-%%       by tests that don't have a GGUF on disk.
-%%   `erllama_model_llama` — real llama.cpp via the NIF.
-%%
-%% Future backends (mock for fault injection, remote for distributed
-%% inference, etc.) can plug in via this same surface.
-%% @end
 -module(erllama_model_backend).
+-moduledoc """
+Behaviour describing the operations the `erllama_model` gen_statem
+needs from a backing inference engine.
+
+Two backends ship in v0.2:
+
+  `erllama_model_stub` — deterministic phash2-based stubs; used
+      by tests that don't have a GGUF on disk.
+  `erllama_model_llama` — real llama.cpp via the NIF.
+
+Future backends (mock for fault injection, remote for distributed
+inference, etc.) can plug in via this same surface.
+""".
 
 -type state() :: term().
 

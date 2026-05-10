@@ -1,44 +1,44 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% Memory-pressure-driven cache eviction.
-%%
-%% Periodically polls a pluggable pressure source (`erllama_pressure`)
-%% and, when the used/total ratio crosses `high_watermark`, asks the
-%% cache to evict slabs until the ratio would drop below
-%% `low_watermark`. The eviction call is `erllama_cache:evict_bytes/2`
-%% with a target of `(high - low) * Total` bytes; the cache may free
-%% less if no evictable slabs remain.
-%%
-%% Tier policy: by default the scheduler evicts only `ram` and
-%% `ram_file` slabs. Disk-tier slabs are left in place — disk is the
-%% cheap tier, and the deployment usually wants to keep as much warm
-%% state as possible there. Disk eviction happens via the cache's own
-%% per-tier quota or via an explicit `erllama_cache:gc/0` call.
-%% Override with `evict_tiers => all` (or a custom list) to include
-%% disk in scheduler-driven eviction.
-%%
-%% Disabled by default. Enable via the `erllama` app environment:
-%%
-%% ```
-%% {erllama, [
-%%   {scheduler, #{
-%%     enabled         => true,
-%%     pressure_source => system,    %% noop | system | nvidia_smi | {module, M}
-%%     interval_ms     => 5000,
-%%     high_watermark  => 0.85,
-%%     low_watermark   => 0.75,
-%%     min_evict_bytes => 1048576,   %% don't bother with sub-MB targets
-%%     evict_tiers     => [ram, ram_file]
-%%   }}
-%% ]}
-%% ```
-%%
-%% The scheduler always starts (so it can be enabled at runtime via
-%% `enable/1`), but its timer only fires when `enabled = true`.
-%% @end
 -module(erllama_scheduler).
+-moduledoc """
+Memory-pressure-driven cache eviction.
+
+Periodically polls a pluggable pressure source (`erllama_pressure`)
+and, when the used/total ratio crosses `high_watermark`, asks the
+cache to evict slabs until the ratio would drop below
+`low_watermark`. The eviction call is `erllama_cache:evict_bytes/2`
+with a target of `(high - low) * Total` bytes; the cache may free
+less if no evictable slabs remain.
+
+Tier policy: by default the scheduler evicts only `ram` and
+`ram_file` slabs. Disk-tier slabs are left in place — disk is the
+cheap tier, and the deployment usually wants to keep as much warm
+state as possible there. Disk eviction happens via the cache's own
+per-tier quota or via an explicit `erllama_cache:gc/0` call.
+Override with `evict_tiers => all` (or a custom list) to include
+disk in scheduler-driven eviction.
+
+Disabled by default. Enable via the `erllama` app environment:
+
+```
+{erllama, [
+  {scheduler, #{
+    enabled         => true,
+    pressure_source => system,    %% noop | system | nvidia_smi | {module, M}
+    interval_ms     => 5000,
+    high_watermark  => 0.85,
+    low_watermark   => 0.75,
+    min_evict_bytes => 1048576,   %% don't bother with sub-MB targets
+    evict_tiers     => [ram, ram_file]
+  }}
+]}
+```
+
+The scheduler always starts (so it can be enabled at runtime via
+`enable/1`), but its timer only fires when `enabled = true`.
+""".
 -behaviour(gen_server).
 
 -export([
@@ -128,8 +128,10 @@ set_thresholds(_, _) ->
 sample() ->
     gen_server:call(?SERVER, sample).
 
-%% @doc Force a check now (sample + maybe evict). Returns the eviction
-%% result if one was triggered, `{skipped, Reason}` otherwise.
+-doc """
+Force a check now (sample + maybe evict). Returns the eviction
+result if one was triggered, `{skipped, Reason}` otherwise.
+""".
 -spec force_check() ->
     {evicted, non_neg_integer(), non_neg_integer()}
     | {skipped, below_watermark | disabled | nothing_to_evict}.

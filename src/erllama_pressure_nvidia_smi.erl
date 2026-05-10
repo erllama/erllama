@@ -1,16 +1,16 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% NVIDIA GPU memory-pressure sampler. Aggregates VRAM usage across
-%% every GPU on the host via `nvidia-smi --query-gpu=memory.used,
-%% memory.total --format=csv,noheader,nounits`.
-%%
-%% Returns `{TotalUsedBytes, TotalCapacityBytes}` summed over all GPUs.
-%% A host with no GPU or where `nvidia-smi` is missing reports
-%% `{0, 1}` so the scheduler treats it as zero pressure.
-%% @end
 -module(erllama_pressure_nvidia_smi).
+-moduledoc """
+NVIDIA GPU memory-pressure sampler. Aggregates VRAM usage across
+every GPU on the host via `nvidia-smi --query-gpu=memory.used,
+memory.total --format=csv,noheader,nounits`.
+
+Returns `{TotalUsedBytes, TotalCapacityBytes}` summed over all GPUs.
+A host with no GPU or where `nvidia-smi` is missing reports
+`{0, 1}` so the scheduler treats it as zero pressure.
+""".
 -behaviour(erllama_pressure).
 
 -export([sample/0]).

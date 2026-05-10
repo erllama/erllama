@@ -1,19 +1,19 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% Behaviour and helpers for memory-pressure samplers used by
-%% `erllama_scheduler`. A sampler is a stateless module that returns
-%% the current `{Used, Total}` byte tuple for the resource it tracks
-%% (system RAM, GPU VRAM, or a custom source).
-%%
-%% A sampler MUST be cheap. The scheduler invokes `sample/0` on every
-%% tick (default 5 s); slow samplers will block the scheduler's mailbox.
-%% If a sampler needs to spawn a port (e.g. `nvidia-smi`), it should
-%% cache the previous reading and return it when the call would block,
-%% or run its own background poller.
-%% @end
 -module(erllama_pressure).
+-moduledoc """
+Behaviour and helpers for memory-pressure samplers used by
+`erllama_scheduler`. A sampler is a stateless module that returns
+the current `{Used, Total}` byte tuple for the resource it tracks
+(system RAM, GPU VRAM, or a custom source).
+
+A sampler MUST be cheap. The scheduler invokes `sample/0` on every
+tick (default 5 s); slow samplers will block the scheduler's mailbox.
+If a sampler needs to spawn a port (e.g. `nvidia-smi`), it should
+cache the previous reading and return it when the call would block,
+or run its own background poller.
+""".
 
 -export([sample/1, available_sources/0]).
 

@@ -1,20 +1,20 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% RAM-file tier server.
-%%
-%% Identical mechanics to `erllama_cache_disk_srv` (same KVC framing,
-%% same temp+datasync+link+fsync_dir publish protocol) — the only
-%% difference is the root directory points at a tmpfs mount such as
-%% `/dev/shm` so the bytes never touch a spinning disk. The tier
-%% label `ram_file` is what the meta server records, which lets the
-%% scheduler reason about durability separately from latency.
-%%
-%% Implementation is a delegating wrapper; all real work lives in
-%% `erllama_cache_disk_srv`.
-%% @end
 -module(erllama_cache_ramfile_srv).
+-moduledoc """
+RAM-file tier server.
+
+Identical mechanics to `erllama_cache_disk_srv` (same KVC framing,
+same temp+datasync+link+fsync_dir publish protocol) — the only
+difference is the root directory points at a tmpfs mount such as
+`/dev/shm` so the bytes never touch a spinning disk. The tier
+label `ram_file` is what the meta server records, which lets the
+scheduler reason about durability separately from latency.
+
+Implementation is a delegating wrapper; all real work lives in
+`erllama_cache_disk_srv`.
+""".
 
 -export([start_link/2, save/3, load/2, delete/2, dir/1, scan/1]).
 

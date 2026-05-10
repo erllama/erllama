@@ -65,12 +65,14 @@ make(#{
 ->
     make(Fp, QT, CtxHash, encode_tokens(Tokens)).
 
-%% @doc Variant taking a pre-encoded TokensBin (u32-LE per token,
-%% matching `encode_tokens/1`). Used by the longest-prefix walk so a
-%% caller can encode once and pass `binary:part(AllTokensBin, 0, N*4)`
-%% sub-binaries per probe, avoiding the per-attempt list traversal +
-%% list comprehension allocation. Sub-binaries are O(1) views, so
-%% this turns the per-probe cost into just the SHA-256 work.
+-doc """
+Variant taking a pre-encoded TokensBin (u32-LE per token, matching
+`encode_tokens/1`). Used by the longest-prefix walk so a caller can
+encode once and pass `binary:part(AllTokensBin, 0, N*4)`
+sub-binaries per probe, avoiding the per-attempt list traversal +
+list comprehension allocation. Sub-binaries are O(1) views, so this
+turns the per-probe cost into just the SHA-256 work.
+""".
 -spec make(<<_:256>>, quant_type(), <<_:256>>, binary()) -> key().
 make(Fp, QT, CtxHash, TokensBin) when
     is_binary(Fp),

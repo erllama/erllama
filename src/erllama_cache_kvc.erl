@@ -1,68 +1,68 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% KVC v2 file framing and TLV codec.
-%%
-%% File layout (little-endian throughout):
-%%
-%% ```
-%% [0..47]    Header (48 bytes, ds4-compatible):
-%%               u8[3]  magic = "KVC"
-%%               u8     version = 1
-%%               u8     quant_bits
-%%               u8     save_reason (0..5)
-%%               u8[2]  reserved
-%%               u32    cached_token_count
-%%               u32    hit_count
-%%               u32    context_size
-%%               u8[4]  reserved
-%%               u64    creation_time (unix seconds)
-%%               u64    last_used_time (unix seconds)
-%%               u64    payload_byte_count
-%%
-%% [48..71]   Trailer (24 bytes, erllama-specific):
-%%               u64    payload_offset
-%%               u64    payload_length
-%%               u32    payload_crc32c
-%%               u32    reserved
-%%
-%% [72..]     Prompt section: u32_le length, then UTF-8 bytes
-%%            (observability only; untrusted on load)
-%%
-%% [..]       TLV section: u32_le length, then a sequence of
-%%            (u8 tag, u32_le length, value) records
-%%
-%% [..end]    Payload: opaque bytes (raw llama_state_seq blob)
-%% ```
-%%
-%% TLV tags:
-%%
-%% ```
-%% 0x01 fingerprint        32 bytes
-%% 0x02 fingerprint_mode   1 byte (0=safe, 1=gguf_chunked, 2=fast_unsafe)
-%% 0x03 quant_type         1 byte (cache-internal byte; see erllama_cache_key)
-%% 0x04 ctx_params_hash    32 bytes
-%% 0x05 hostname           variable
-%% 0x06 erllama_version    variable
-%% 0x07 save_reason_detail variable
-%% 0x08 token_id_count     u32_le
-%% 0x09 token_ids          variable (u32_le * count)
-%% ```
-%%
-%% Build path is split: callers pass the payload binary separately so
-%% it never gets concatenated into a larger BEAM allocation. The
-%% returned prefix is the bytes preceding the payload; combined with
-%% the payload they form a complete file.
-%%
-%% Parse paths come in two flavours:
-%%   parse_meta/1 - header + trailer + TLV only, no payload CRC.
-%%                  Used by tier on-start scans which defer CRC
-%%                  verification until the file is actually loaded.
-%%   parse/2      - full validation including payload CRC32C and
-%%                  cache_key replay against an expected key.
-%% @end
 -module(erllama_cache_kvc).
+-moduledoc """
+KVC v2 file framing and TLV codec.
+
+File layout (little-endian throughout):
+
+```
+[0..47]    Header (48 bytes, ds4-compatible):
+              u8[3]  magic = "KVC"
+              u8     version = 1
+              u8     quant_bits
+              u8     save_reason (0..5)
+              u8[2]  reserved
+              u32    cached_token_count
+              u32    hit_count
+              u32    context_size
+              u8[4]  reserved
+              u64    creation_time (unix seconds)
+              u64    last_used_time (unix seconds)
+              u64    payload_byte_count
+
+[48..71]   Trailer (24 bytes, erllama-specific):
+              u64    payload_offset
+              u64    payload_length
+              u32    payload_crc32c
+              u32    reserved
+
+[72..]     Prompt section: u32_le length, then UTF-8 bytes
+           (observability only; untrusted on load)
+
+[..]       TLV section: u32_le length, then a sequence of
+           (u8 tag, u32_le length, value) records
+
+[..end]    Payload: opaque bytes (raw llama_state_seq blob)
+```
+
+TLV tags:
+
+```
+0x01 fingerprint        32 bytes
+0x02 fingerprint_mode   1 byte (0=safe, 1=gguf_chunked, 2=fast_unsafe)
+0x03 quant_type         1 byte (cache-internal byte; see erllama_cache_key)
+0x04 ctx_params_hash    32 bytes
+0x05 hostname           variable
+0x06 erllama_version    variable
+0x07 save_reason_detail variable
+0x08 token_id_count     u32_le
+0x09 token_ids          variable (u32_le * count)
+```
+
+Build path is split: callers pass the payload binary separately so
+it never gets concatenated into a larger BEAM allocation. The
+returned prefix is the bytes preceding the payload; combined with
+the payload they form a complete file.
+
+Parse paths come in two flavours:
+  parse_meta/1 - header + trailer + TLV only, no payload CRC.
+                 Used by tier on-start scans which defer CRC
+                 verification until the file is actually loaded.
+  parse/2      - full validation including payload CRC32C and
+                 cache_key replay against an expected key.
+""".
 
 -include("erllama_cache.hrl").
 

@@ -1,19 +1,19 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% Real-llama.cpp backend for `erllama_model`.
-%%
-%% Owns a `model_ref` and a `context_ref` from `erllama_nif`. The
-%% gen_statem hands its decode/kv operations through this module;
-%% this module forwards to the NIF.
-%%
-%% Config (passed through `erllama_model:start_link/2`):
-%%   model_path :: file:name() | binary()  (required)
-%%   model_opts :: map()  (forwarded to erllama_nif:load_model/2)
-%%   context_opts :: map()  (forwarded to erllama_nif:new_context/2)
-%% @end
 -module(erllama_model_llama).
+-moduledoc """
+Real-llama.cpp backend for `erllama_model`.
+
+Owns a `model_ref` and a `context_ref` from `erllama_nif`. The
+gen_statem hands its decode/kv operations through this module;
+this module forwards to the NIF.
+
+Config (passed through `erllama_model:start_link/2`):
+  model_path :: file:name() | binary()  (required)
+  model_opts :: map()  (forwarded to erllama_nif:load_model/2)
+  context_opts :: map()  (forwarded to erllama_nif:new_context/2)
+""".
 -behaviour(erllama_model_backend).
 
 -export([

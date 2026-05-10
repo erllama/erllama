@@ -1,12 +1,12 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% Dynamic supervisor for `erllama_model` gen_statems. Each loaded
-%% model is one child started via `start_model/2`. simple_one_for_one
-%% strategy: children are spawned on demand from a single child spec.
-%% @end
 -module(erllama_model_sup).
+-moduledoc """
+Dynamic supervisor for `erllama_model` gen_statems. Each loaded
+model is one child started via `start_model/2`. simple_one_for_one
+strategy: children are spawned on demand from a single child spec.
+""".
 -behaviour(supervisor).
 
 -export([start_link/0, start_model/2, stop_model/1, models/0]).
@@ -18,13 +18,15 @@
 start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
-%% @doc Start a model under this supervisor with `ModelId` as the
-%% local registered name. Returns the started pid.
+-doc """
+Start a model under this supervisor with ModelId as the local
+registered name. Returns the started pid.
+""".
 -spec start_model(atom(), map()) -> {ok, pid()} | {error, term()}.
 start_model(ModelId, Config) when is_atom(ModelId), is_map(Config) ->
     supervisor:start_child(?SERVER, [ModelId, Config]).
 
-%% @doc Terminate a previously started model.
+-doc "Terminate a previously started model.".
 -spec stop_model(atom() | pid()) -> ok | {error, term()}.
 stop_model(ModelOrPid) ->
     Pid = pid_of(ModelOrPid),
@@ -33,7 +35,7 @@ stop_model(ModelOrPid) ->
         _ -> supervisor:terminate_child(?SERVER, Pid)
     end.
 
-%% @doc List currently-supervised model pids.
+-doc "List currently-supervised model pids.".
 -spec models() -> [{undefined, pid(), worker, [module()]}].
 models() ->
     supervisor:which_children(?SERVER).

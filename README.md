@@ -4,7 +4,9 @@
 
 Native Erlang/OTP wrapper around `llama.cpp` with a **token-exact,
 multi-tier, supervised KV cache** that turns a multi-second prefill
-into a millisecond restore.
+into a millisecond restore — **and lets you cache more warm state
+than fits in RAM** by promoting cold-but-popular prefixes down to
+the disk tier.
 
 ## Why the cache matters
 
@@ -22,9 +24,18 @@ What the cache subsystem gives you:
   Same tokens → same key → guaranteed-correct restore. No
   approximate matching, no chance of "I think this is the same
   prompt".
-- **Three tiers** — `ram` (ETS slabs), `ram_file` (`/dev/shm`),
-  `disk` (read+write or zero-copy `iommap`). Each tier is an
-  independently-supervised gen_server with its own quota.
+- **Multi-tier storage that lets you run models bigger than RAM.**
+  Three tiers — `ram` (ETS slabs, lowest latency), `ram_file`
+  (`/dev/shm`, fast and unlimited by process address space), and
+  `disk` (read+write or zero-copy `iommap`, terabytes-scale on
+  modern NVMe). Each tier is an independently-supervised gen_server
+  with its own byte quota. The disk tier is **a first-class
+  citizen**: large models that wouldn't fit alongside a working set
+  of warm KV state in RAM can let the disk tier hold most of the
+  cache, and warm-restore in milliseconds when a hit comes in.
+  This is the same idea ds4 uses to make on-disk KV cache the
+  resume mechanism between sessions; we generalise it to any GGUF
+  llama.cpp can load.
 - **Stateless-client friendly.** A bare `erllama:complete/2` with
   no `parent_key` walks the cache backward by the configured
   stride to find the longest cached prefix of the request — same
@@ -96,6 +107,105 @@ rebar3 shell            # boots the umbrella
 
 Vendored llama.cpp lives at `c_src/llama.cpp` (see
 `UPDATE_LLAMA.md` for the bump procedure).
+
+## Guide
+
+### Loading a model
+
+```erlang
+{ok, _} = application:ensure_all_started(erllama).
+{ok, Bin} = file:read_file("/srv/models/llama-3.1-8b.Q4_K_M.gguf").
+Fp = crypto:hash(sha256, Bin).
+{ok, M} = erllama:load_model(#{
+    backend         => erllama_model_llama,
+    model_path      => "/srv/models/llama-3.1-8b.Q4_K_M.gguf",
+    model_opts      => #{n_gpu_layers => 99},  % offload to Metal/CUDA when available
+    context_opts    => #{n_ctx => 8192, n_batch => 4096},
+    tier_srv        => default_disk,
+    tier            => disk,
+    fingerprint     => Fp,
+    fingerprint_mode=> safe,
+    quant_type      => q4_k_m,
+    quant_bits      => 4,
+    ctx_params_hash => crypto:hash(sha256, term_to_binary({8192, 4096})),
+    context_size    => 8192,
+    policy => #{
+        min_tokens => 256,
+        cold_min_tokens => 256,
+        cold_max_tokens => 8192,
+        continued_interval => 256,
+        boundary_trim_tokens => 32,
+        boundary_align_tokens => 256,
+        session_resume_wait_ms => 500
+    }
+}).
+```
+
+### One-shot completion
+
+```erlang
+{ok, Reply, Tokens} = erllama:complete(M, <<"Explain monads in 3 sentences.">>).
+```
+
+The first call cold-prefills the prompt and async-saves the cold +
+finish rows. Any subsequent call with **the same prompt or any
+prompt that starts with the same tokens** hits the cache via the
+exact-key path or the longest-prefix walk.
+
+### Multi-turn chat (stateful)
+
+If your driver is in Erlang and can thread state across turns, use
+`parent_key`:
+
+```erlang
+{ok, Reply1, _} = erllama:complete(M, <<"User: hello\nAssistant:">>).
+%% Save the cache key your turn ended at (the cache layer doesn't
+%% return it directly today; track it from the last save in
+%% erllama_cache:get_counters() or via dump/0). Pass it as parent_key
+%% to skip the longest-prefix walk on the next turn:
+{ok, Reply2, _} = erllama:complete(M,
+    <<"User: hello\nAssistant: hi\nUser: tell me a joke\nAssistant:">>,
+    #{parent_key => PrevKey}).
+```
+
+### Stateless OpenAI/Anthropic-style clients
+
+If your driver is an HTTP server fronting a stateless protocol
+(every request resends the full conversation), do **nothing
+special**. Skip `parent_key`. The longest-prefix walk finds the
+right cached row automatically.
+
+### Memory-pressure-driven eviction
+
+Off by default. Enable in `sys.config`:
+
+```erlang
+{erllama, [
+  {scheduler, #{
+    enabled         => true,
+    pressure_source => system,        %% memsup-backed, portable
+    interval_ms     => 5000,
+    high_watermark  => 0.85,
+    low_watermark   => 0.75,
+    evict_tiers     => [ram, ram_file] %% disk fills to its own quota
+  }}
+]}.
+```
+
+### Inspecting the cache
+
+```erlang
+erllama_cache:get_counters().    %% hits/misses/saves/evictions/timing
+erllama_cache_meta_srv:dump().   %% all rows with tier/size/last_used/refcount
+erllama_cache:gc().              %% synchronous full eviction pass
+erllama_cache:evict_bytes(Mib * 1024 * 1024). %% target a byte budget
+erllama:unload(M).               %% terminate the model gen_statem
+```
+
+### Benchmarking
+
+`bench/run.sh tiny` (or `large`) drives a `cold_vs_warm` matrix
+plus a 4-agent shared-prefix scenario; see `bench/README.md`.
 
 ## Architecture
 
@@ -335,6 +445,20 @@ green on machines without a GGUF on hand.
 - Cache directory is `flock(LOCK_EX)`-protected when `disk_io =
   iommap`. External truncation of cached files would otherwise SIGBUS
   the BEAM during sub-binary or message access.
+
+## Acknowledgements
+
+The on-disk `KVC` file format (48-byte header, `"KVC"` magic, the
+ds4 trailer remains byte-compatible up to that point), the
+save-reasons taxonomy (`cold`, `continued`, `evict`, `shutdown`),
+and the `boundary_trim_tokens` / `boundary_align_tokens` defaults
+are direct ports from [antirez/ds4](https://github.com/antirez/ds4).
+ds4 pioneered the "disk KV cache as a first-class resume mechanism"
+idea for DeepSeek V4; erllama generalises that pattern as an
+Erlang/OTP library across any GGUF llama.cpp can load. The rest —
+multi-tier storage, supervised writer pool, longest-prefix walk
+indexing, memory-pressure scheduler, exception-safe NIF — is
+erllama's own.
 
 ## License
 

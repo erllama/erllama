@@ -1,33 +1,33 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
 %%
-%% @doc
-%% Sole writer for the cache meta and LRU ETS tables; arbitrates
-%% claim/release and the reservation state machine for save
-%% publication.
-%%
-%% Two read-mostly ETS tables, owned by this process and `protected`
-%% so any caller can read them without a server hop:
-%%
-%%   erllama_cache_meta : set, key = cache_key, row layout per
-%%                        include/erllama_cache.hrl ?POS_* constants
-%%   erllama_cache_lru  : ordered_set, key = {LastUsedNs, cache_key},
-%%                        value = []
-%%
-%% Two server-internal maps in process state:
-%%
-%%   holders      : MonRef -> {Pid, Key}; one entry per active claim
-%%   reservations : Key -> #reservation{}; one entry per in-flight save
-%%
-%% Plus a waiters map for `lookup_exact_or_wait/2` which defers replies
-%% until the in-flight save publishes (or the per-call deadline fires).
-%%
-%% The reservation state machine has two stages, `pre_link` and
-%% `post_link`, to make crash cleanup correct: a writer that died
-%% before `link/2` leaves no file; a writer that died after `link/2`
-%% may have left a valid `.kvc` we can validate-and-adopt.
-%% @end
 -module(erllama_cache_meta_srv).
+-moduledoc """
+Sole writer for the cache meta and LRU ETS tables; arbitrates
+claim/release and the reservation state machine for save
+publication.
+
+Two read-mostly ETS tables, owned by this process and `protected`
+so any caller can read them without a server hop:
+
+  erllama_cache_meta : set, key = cache_key, row layout per
+                       include/erllama_cache.hrl ?POS_* constants
+  erllama_cache_lru  : ordered_set, key = {LastUsedNs, cache_key},
+                       value = []
+
+Two server-internal maps in process state:
+
+  holders      : MonRef -> {Pid, Key}; one entry per active claim
+  reservations : Key -> #reservation{}; one entry per in-flight save
+
+Plus a waiters map for `lookup_exact_or_wait/2` which defers replies
+until the in-flight save publishes (or the per-call deadline fires).
+
+The reservation state machine has two stages, `pre_link` and
+`post_link`, to make crash cleanup correct: a writer that died
+before `link/2` leaves no file; a writer that died after `link/2`
+may have left a valid `.kvc` we can validate-and-adopt.
+""".
 -behaviour(gen_server).
 
 -include("erllama_cache.hrl").
@@ -118,21 +118,22 @@ lookup_exact(Key) ->
 lookup_exact_or_wait(Key, MaxWaitMs) ->
     gen_server:call(?SERVER, {lookup_or_wait, Key, MaxWaitMs}, infinity).
 
-%% @doc Walk `Tokens` backward in `Stride` steps and return the row
-%% for the longest cached prefix. Pure ETS reads, no server hop. Used
-%% by stateless callers (HTTP front-end, agent loops) that resend a
-%% full conversation each turn and don't have a `parent_key` to
-%% thread.
-%%
-%% Stops at `MinTokens` floor and returns `miss` if nothing matches.
-%% Walks at most `length(Tokens) / Stride` rows; with the default
-%% 2048-token stride that's ~15 lookups for a 30k-token prompt.
-%%
-%% Encodes the full token list to a binary once at entry, then passes
-%% `binary:part(TokensBin, 0, N*4)` sub-binaries (O(1) views) to
-%% `erllama_cache_key:make/4` per probe. Avoids re-traversing the
-%% list and re-allocating the binary on every step; the only
-%% per-probe cost is the SHA-256 over N*4 bytes plus the ETS lookup.
+-doc """
+Walk Tokens backward in Stride steps and return the row for the
+longest cached prefix. Pure ETS reads, no server hop. Used by
+stateless callers (HTTP front-end, agent loops) that resend a full
+conversation each turn and don't have a parent_key to thread.
+
+Stops at MinTokens floor and returns `miss` if nothing matches.
+Walks at most `length(Tokens) / Stride` rows; with the default
+2048-token stride that's ~15 lookups for a 30k-token prompt.
+
+Encodes the full token list to a binary once at entry, then passes
+`binary:part(TokensBin, 0, N*4)` sub-binaries (O(1) views) to
+`erllama_cache_key:make/4` per probe. Avoids re-traversing the list
+and re-allocating the binary on every step; the only per-probe cost
+is the SHA-256 over N*4 bytes plus the ETS lookup.
+""".
 -spec lookup_longest_prefix(map(), [erllama_nif:token_id()], pos_integer(), pos_integer()) ->
     {ok, pos_integer(), tuple()} | miss.
 lookup_longest_prefix(KeyMeta, Tokens, Stride, MinTokens) when
@@ -241,17 +242,21 @@ insert_available(Key, Tier, Size, Header, Location, TokensBin) ->
 gc() ->
     gen_server:call(?SERVER, gc).
 
-%% @doc Evict oldest available rows until at least `TargetBytes` have
-%% been freed (or no more candidates remain). Returns the number of
-%% rows evicted and the bytes actually freed.
+-doc """
+Evict oldest available rows until at least TargetBytes have been
+freed (or no more candidates remain). Returns the number of rows
+evicted and the bytes actually freed.
+""".
 -spec evict_bytes(non_neg_integer()) ->
     {evicted, non_neg_integer(), non_neg_integer()}.
 evict_bytes(TargetBytes) ->
     evict_bytes(TargetBytes, all).
 
-%% @doc Evict oldest available rows whose tier is in `Tiers` until at
-%% least `TargetBytes` have been freed. `Tiers = all` matches every
-%% tier; otherwise it must be a list drawn from `[ram, ram_file, disk]`.
+-doc """
+Evict oldest available rows whose tier is in Tiers until at least
+TargetBytes have been freed. `Tiers = all` matches every tier;
+otherwise it must be a list drawn from `[ram, ram_file, disk]`.
+""".
 -spec evict_bytes(non_neg_integer(), all | [erllama_cache:tier()]) ->
     {evicted, non_neg_integer(), non_neg_integer()}.
 evict_bytes(TargetBytes, Tiers) when is_integer(TargetBytes), TargetBytes >= 0 ->

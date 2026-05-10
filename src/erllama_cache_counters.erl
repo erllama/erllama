@@ -1,22 +1,21 @@
 %% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
 %% See the LICENSE file at the project root.
-%%
-%% @doc
-%% Cache subsystem operational counters.
-%%
-%% A single `atomics` array (one slot per metric) lives in
-%% `persistent_term` keyed by this module. Hot paths bump slots via
-%% `incr/1,2`; readers take a snapshot via `snapshot/0`.
-%%
-%% Slot indices are defined in `include/erllama_cache.hrl` as
-%% `?C_*` macros so callers can pass the symbolic constant rather
-%% than a magic integer.
-%%
-%% Adapter integrations (Prometheus, statsd, OpenTelemetry, etc.)
-%% read `snapshot/0` periodically; this module does not depend on
-%% any external metrics framework.
-%% @end
 -module(erllama_cache_counters).
+-moduledoc """
+Cache subsystem operational counters.
+
+A single `atomics` array (one slot per metric) lives in
+`persistent_term` keyed by this module. Hot paths bump slots via
+`incr/1,2`; readers take a snapshot via `snapshot/0`.
+
+Slot indices are defined in `include/erllama_cache.hrl` as `?C_*`
+macros so callers can pass the symbolic constant rather than a
+magic integer.
+
+Adapter integrations (Prometheus, statsd, OpenTelemetry, etc.) read
+`snapshot/0` periodically; this module does not depend on any
+external metrics framework.
+""".
 
 -include("erllama_cache.hrl").
 
