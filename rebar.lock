@@ -1,4 +1,4 @@
 [{<<"iommap">>,
   {git,"https://github.com/benoitc/erlang-iommap.git",
-       {ref,"c5ed20e2aed5d0deb710c58adf2ebc14a7a57959"}},
+       {ref,"4962553c052af47693b82beb0bf76b2844d6cc14"}},
   0}].
