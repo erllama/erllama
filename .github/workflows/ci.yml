@@ -113,14 +113,18 @@ jobs:
         run: rebar3 ct
 
   freebsd:
-    name: FreeBSD
+    name: FreeBSD ${{ matrix.release }}
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.2', '14.4']
     steps:
       - uses: actions/checkout@v4
       - name: Build + test in FreeBSD VM
         uses: vmactions/freebsd-vm@v1
         with:
-          release: '14.4'
+          release: ${{ matrix.release }}
           usesh: true
           prepare: |
             # The base `erlang` package on FreeBSD lags upstream
