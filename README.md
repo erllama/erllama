@@ -1,5 +1,7 @@
 # erllama
 
+[![CI](https://github.com/erllama/erllama/actions/workflows/ci.yml/badge.svg)](https://github.com/erllama/erllama/actions/workflows/ci.yml)
+
 Native Erlang/OTP wrapper around `llama.cpp` with full supervision, a
 tiered KV cache, and memory-pressure-aware eviction.
 
