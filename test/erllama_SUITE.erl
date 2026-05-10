@@ -9,6 +9,7 @@
 -module(erllama_SUITE).
 -include_lib("common_test/include/ct.hrl").
 -include_lib("stdlib/include/assert.hrl").
+-include("erllama_cache.hrl").
 
 -export([
     all/0,
@@ -22,6 +23,7 @@
     cold_then_warm_counters/1,
     multi_turn_session_resume/1,
     longest_prefix_resume_without_parent_key/1,
+    warm_read_pins_via_checkout/1,
     eviction_drops_files_and_meta/1,
     concurrent_complete_under_writer_cap/1,
     counters_visible_via_facade/1
@@ -36,6 +38,7 @@ all() ->
         cold_then_warm_counters,
         multi_turn_session_resume,
         longest_prefix_resume_without_parent_key,
+        warm_read_pins_via_checkout,
         eviction_drops_files_and_meta,
         concurrent_complete_under_writer_cap,
         counters_visible_via_facade
@@ -182,6 +185,27 @@ longest_prefix_resume_without_parent_key(Config) ->
     After = erllama_cache:get_counters(),
     Resumed = maps:get(hits_resume, After) - maps:get(hits_resume, Before),
     ?assert(Resumed >= 1),
+    ok.
+
+%% Warm reads must go through checkout/checkin, not raw lookup +
+%% load, so eviction can't delete the file mid-load. Asserts that a
+%% completion run after a warm cache hit bumps both ?POS_HITS (only
+%% bumped inside do_checkout) and ?C_HITS_EXACT.
+warm_read_pins_via_checkout(Config) ->
+    Model = ?config(model, Config),
+    Prompt = long_prompt(),
+    {ok, _, _} = erllama_model:complete(Model, Prompt, #{response_tokens => 2}),
+    timer:sleep(100),
+    Before = erllama_cache:get_counters(),
+    {ok, _, _} = erllama_model:complete(Model, Prompt, #{response_tokens => 2}),
+    After = erllama_cache:get_counters(),
+    ?assertEqual(
+        1,
+        maps:get(hits_exact, After) - maps:get(hits_exact, Before)
+    ),
+    %% Find the cold-save row in the meta and confirm hits >= 1.
+    [Row | _] = erllama_cache_meta_srv:dump(),
+    ?assert(element(?POS_HITS, Row) >= 1),
     ok.
 
 eviction_drops_files_and_meta(Config) ->

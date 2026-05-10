@@ -305,12 +305,17 @@ finish_request(Data) ->
 %% =============================================================================
 
 lookup_or_resume(PromptTokens, ParentKey, Data) ->
-    %% Exact-key fast path.
+    %% Exact-key fast path. checkout pins the row so eviction can't
+    %% delete the underlying file/slab between the lookup and the
+    %% load. The pin is released right after kv_unpack copies the
+    %% bytes into our live context (claim → unpack → checkin), so
+    %% the slab stays evictable while the user reads the streamed
+    %% response.
     Key = make_key(PromptTokens, Data),
-    case erllama_cache_meta_srv:lookup_exact(Key) of
-        {ok, Row} ->
+    case pin_and_load(Key, Data) of
+        {ok, ContextTokens} ->
             erllama_cache_counters:incr(?C_HITS_EXACT),
-            {warm, load_tokens_from_row(Row, Data), []};
+            {warm, ContextTokens, []};
         miss when ParentKey =/= undefined ->
             try_session_resume(PromptTokens, ParentKey, Data);
         miss ->
@@ -331,19 +336,28 @@ try_longest_prefix(PromptTokens, Data) ->
     Min = maps:get(min_tokens, Data#data.policy, 512),
     case erllama_cache_meta_srv:lookup_longest_prefix(KeyMeta, PromptTokens, Stride, Min) of
         {ok, PrefixLen, Row} ->
-            ParentTokens = load_tokens_from_row(Row, Data),
-            %% Belt-and-braces: the cache key encodes the tokens, so
-            %% a hit at PrefixLen implies the row's tokens equal the
-            %% first PrefixLen of the prompt. Verify before trusting.
-            case
-                length(ParentTokens) =:= PrefixLen andalso
-                    is_strict_prefix(ParentTokens, PromptTokens)
-            of
-                true ->
-                    Remaining = lists:nthtail(PrefixLen, PromptTokens),
-                    erllama_cache_counters:incr(?C_HITS_RESUME),
-                    {warm, ParentTokens, Remaining};
-                false ->
+            FoundKey = element(?POS_KEY, Row),
+            case pin_and_load(FoundKey, Data) of
+                {ok, ParentTokens} ->
+                    %% Belt-and-braces: the cache key encodes the
+                    %% tokens, so a hit at PrefixLen implies the
+                    %% row's tokens equal the first PrefixLen of the
+                    %% prompt. Verify before trusting.
+                    case
+                        length(ParentTokens) =:= PrefixLen andalso
+                            is_strict_prefix(ParentTokens, PromptTokens)
+                    of
+                        true ->
+                            Remaining = lists:nthtail(PrefixLen, PromptTokens),
+                            erllama_cache_counters:incr(?C_HITS_RESUME),
+                            {warm, ParentTokens, Remaining};
+                        false ->
+                            erllama_cache_counters:incr(?C_MISSES),
+                            cold
+                    end;
+                miss ->
+                    %% Race: row was evicted between the longest-prefix
+                    %% scan and our checkout. Treat as cold.
                     erllama_cache_counters:incr(?C_MISSES),
                     cold
             end;
@@ -357,17 +371,22 @@ try_longest_prefix(PromptTokens, Data) ->
 
 try_session_resume(PromptTokens, ParentKey, Data) ->
     Wait = maps:get(session_resume_wait_ms, Data#data.policy, 500),
+    %% First wait for the row to publish (the previous turn's
+    %% finish-save may still be in flight), then pin via checkout.
     case erllama_cache_meta_srv:lookup_exact_or_wait(ParentKey, Wait) of
-        {ok, Row} ->
-            ParentTokens = load_tokens_from_row(Row, Data),
-            case is_strict_prefix(ParentTokens, PromptTokens) of
-                true ->
-                    %% Slab covers the first length(ParentTokens) tokens;
-                    %% prefill the remainder.
-                    Remaining = lists:nthtail(length(ParentTokens), PromptTokens),
-                    erllama_cache_counters:incr(?C_HITS_RESUME),
-                    {warm, ParentTokens, Remaining};
-                false ->
+        {ok, _Row} ->
+            case pin_and_load(ParentKey, Data) of
+                {ok, ParentTokens} ->
+                    case is_strict_prefix(ParentTokens, PromptTokens) of
+                        true ->
+                            Remaining = lists:nthtail(length(ParentTokens), PromptTokens),
+                            erllama_cache_counters:incr(?C_HITS_RESUME),
+                            {warm, ParentTokens, Remaining};
+                        false ->
+                            erllama_cache_counters:incr(?C_MISSES),
+                            cold
+                    end;
+                miss ->
                     erllama_cache_counters:incr(?C_MISSES),
                     cold
             end;
@@ -376,28 +395,44 @@ try_session_resume(PromptTokens, ParentKey, Data) ->
             cold
     end.
 
-load_tokens_from_row(Row, Data) ->
-    Tier = element(?POS_TIER, Row),
-    Key = element(?POS_KEY, Row),
-    Bin =
-        case Tier of
-            ram ->
-                case erllama_cache_ram:load(Key) of
-                    {ok, B} -> B;
-                    miss -> <<>>
-                end;
-            _ ->
-                case erllama_cache_disk_srv:load(Data#data.tier_srv, Key) of
-                    {ok, _Info, Payload} -> Payload;
-                    _ -> <<>>
-                end
-        end,
-    _ = backend_call(Data, kv_unpack, [Bin]),
-    case element(?POS_TOKENS_REF, Row) of
-        undefined ->
-            [];
-        TokensBin when is_binary(TokensBin) ->
-            erllama_cache_key:decode_tokens(TokensBin)
+%% checkout the row, load + unpack the payload under the pin, then
+%% checkin. Returns the row's stored token list on success or `miss`
+%% if the row was evicted between the prior lookup and our checkout.
+%% Eviction never selects a refcount > 0 row, so the load itself is
+%% safe; the only failure mode is the row already being gone.
+pin_and_load(Key, Data) ->
+    case erllama_cache_meta_srv:checkout(Key, self()) of
+        {ok, HolderRef, Tier, Loc, _Header, TokensBin} ->
+            Bin = load_payload(Tier, Loc, Key, Data),
+            case Bin of
+                <<>> ->
+                    ok = erllama_cache_meta_srv:checkin(HolderRef),
+                    miss;
+                _ ->
+                    ok = backend_call(Data, kv_unpack, [Bin]),
+                    ok = erllama_cache_meta_srv:checkin(HolderRef),
+                    Tokens =
+                        case TokensBin of
+                            undefined -> [];
+                            _ -> erllama_cache_key:decode_tokens(TokensBin)
+                        end,
+                    {ok, Tokens}
+            end;
+        {error, busy} ->
+            miss;
+        miss ->
+            miss
+    end.
+
+load_payload(ram, _Loc, Key, _Data) ->
+    case erllama_cache_ram:load(Key) of
+        {ok, B} -> B;
+        miss -> <<>>
+    end;
+load_payload(_Tier, _Loc, Key, Data) ->
+    case erllama_cache_disk_srv:load(Data#data.tier_srv, Key) of
+        {ok, _Info, Payload} -> Payload;
+        _ -> <<>>
     end.
 
 fire_cold_save(TrimmedPrefix, Data) ->
