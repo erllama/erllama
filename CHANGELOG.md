@@ -6,6 +6,71 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Removed
+
+- **mmap from the disk tier.** The cache now reads files via plain
+  `file:read_file/1` into a fresh BEAM heap binary; the `iommap`
+  dependency, the `disk_io` configuration option, and the
+  `erllama_cache_disk_srv:start_link/4` form are gone. The process
+  already mmaps multi-GB GGUF weights, and a region binary that
+  outlived its closing NIF call would have exposed the BEAM to
+  SIGBUS from any external truncation. ds4 makes the same choice.
+
+### Changed
+
+- **NIF hardening.**
+  - `llama_backend_init` is deferred to the first `nif_load_model`
+    via `pthread_once`. Cache-only and unit-test workloads no
+    longer pay the `ggml_backend_load_all` cost at NIF load.
+  - `nif_tokenize` and `nif_detokenize` honour `release_pending`,
+    so a model returned by `free_model/1` as `{ok, deferred}`
+    cannot be reused via tokenize.
+  - `nif_detokenize` fails closed on `n_vocab <= 0` (matches
+    `nif_prefill`); 16 M-token cap on the size computation
+    silences gcc `-Walloc-size`.
+  - Dead `atom_not_implemented` and the `_unused_anchor` hack
+    removed (`-Wpedantic`).
+  - `make_errno_atom` now maps FreeBSD's `EINTEGRITY` to
+    `eintegrity` instead of `unknown`.
+
+- **Build.**
+  - `FindErlang.cmake` adopted from erlang-rocksdb; replaces the
+    inline `erl -noshell -eval` snippet that detected
+    `ERTS_INCLUDE_DIR`.
+  - `set(GGML_CCACHE OFF CACHE BOOL "" FORCE)` silences the
+    "ccache not found" diagnostic ggml emits on every build.
+
+- **Scheduler tests.** Three bad-config cases now call
+  `erllama_scheduler:validate_config/1` directly (now exported)
+  instead of spawning a `gen_server` with bad config, so eunit no
+  longer prints `=CRASH REPORT=` SASL output.
+
+- **Dialyzer.** `response_target` typed `non_neg_integer()` (idle
+  state holds 0); `inet:gethostname` and `application:get_key`
+  pattern-match directly. `erllama.erl` moduledoc fence closer
+  fixed.
+
+### CI
+
+- `actions/checkout` and `actions/cache` bumped to `@v5`
+  (Node.js 24).
+- `xref`, `dialyzer`, `erlfmt`, `elvis` promoted to gate jobs;
+  `build`, `eunit`, `proper`, `ct`, `freebsd` depend on them.
+- macOS matrix is `macos-14, macos-15`.
+- FreeBSD matrix added: `release: ['14.2', '14.4']`. Inside the
+  VM: refresh `pcre2` so git can run, install `git`, set
+  `git config --global --add safe.directory '*'` so llama.cpp's
+  build-info `git rev-parse` succeeds.
+- `erllama_nif_tests:load_model_rejects_non_existent_path_test` is
+  now a generator with a 60 s timeout to absorb the lazy Metal
+  init on macOS.
+
+### Documentation
+
+- New [building guide](guides/building.md): platform-specific build
+  notes for Linux, macOS, FreeBSD, including the OTP runtime
+  package on FreeBSD and the `safe.directory` workaround.
+
 ## [0.1.0] — 2026-05-10
 
 Initial public release.

@@ -100,6 +100,8 @@ for the toolchain.
 | [Loading a model](guides/loading.md) | Every option to `erllama:load_model/1,2`, with examples and pitfalls. |
 | [Caching](guides/caching.md) | Tiers, save reasons, lookup paths, watermarks. The operator's manual. |
 | [Configuration](guides/configuration.md) | Full `sys.config` and per-model option reference. |
+| [Building](guides/building.md) | Platform-specific build notes (Linux, macOS, FreeBSD), CUDA/Metal toggles, common build issues. |
+| [Examples](guides/examples.md) | Drop-in patterns for one-shot completion, stateless HTTP servers, multi-turn sessions, concurrent agents, cache inspection. |
 
 For the API reference (`erllama`, `erllama_cache`, `erllama_scheduler`,
 `erllama_nif`), see the **[generated module docs on

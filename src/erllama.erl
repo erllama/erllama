@@ -83,9 +83,11 @@ load_model(ModelId, Config) when is_binary(ModelId), is_map(Config) ->
 unload(Model) ->
     erllama_model_sup:stop_model(Model).
 
-%% @doc Alias for `unload/1`. Provided for API symmetry with
-%% `load_model/1,2` and the OpenAI/Ollama-style naming used by
-%% downstream HTTP servers.
+-doc """
+Alias for `unload/1`. Provided for API symmetry with
+`load_model/1,2` and the OpenAI/Ollama-style naming used by
+downstream HTTP servers.
+""".
 -spec unload_model(model()) -> ok | {error, term()}.
 unload_model(Model) ->
     unload(Model).
