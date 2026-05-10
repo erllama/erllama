@@ -102,10 +102,12 @@ extern int erllama_safe_memory_seq_rm(struct llama_context *c, int seq_id,
 #endif
 
 #ifndef ERLLAMA_MAX_TOKEN_TEXT
-/* Largest text accepted by tokenize/3 (bytes). 16 MiB is well above
- * any realistic prompt; raise via -DERLLAMA_MAX_TOKEN_TEXT=N for
+/* Largest text accepted by tokenize/3 (bytes). 4 MiB covers ~1 M
+ * tokens at ~4 bytes each, well above any realistic chat prompt
+ * while keeping a single bad request from chewing dirty-scheduler
+ * time. Override at build time via -DERLLAMA_MAX_TOKEN_TEXT=N for
  * batch-tokenization workflows. */
-#define ERLLAMA_MAX_TOKEN_TEXT (16 * 1024 * 1024)
+#define ERLLAMA_MAX_TOKEN_TEXT (4 * 1024 * 1024)
 #endif
 
 /* =========================================================================
@@ -122,7 +124,6 @@ static ERL_NIF_TERM atom_pack_failed;
 static ERL_NIF_TERM atom_unpack_failed;
 static ERL_NIF_TERM atom_true;
 static ERL_NIF_TERM atom_false;
-static ERL_NIF_TERM atom_in_use;
 static ERL_NIF_TERM atom_released;
 static ERL_NIF_TERM atom_too_large;
 static ERL_NIF_TERM atom_invalid_token;
@@ -148,7 +149,6 @@ typedef struct {
     struct llama_model *model;     /* NULL after successful release */
     int active_contexts;           /* nif_new_context bumps; ctx_dtor decrements */
     int release_pending;           /* free_model when active_contexts hit 0 */
-    int release_failed;            /* llama_model_free threw; pointer is poisoned */
 } erllama_model_t;
 
 typedef struct {
@@ -157,7 +157,6 @@ typedef struct {
     struct llama_context *ctx;     /* NULL after successful release */
     erllama_model_t *model_res;    /* keep_resource'd by new_context */
     int decode_ready;              /* set after llama_decode; cleared after kv ops */
-    int release_failed;            /* llama_free threw; pointer is poisoned */
     /* Sampler chain cached on the first nif_decode_one call. The
      * chain is greedy-only and lives for the resource's lifetime;
      * a future sampler-config NIF would free + rebuild this under
@@ -180,10 +179,9 @@ static void context_drops_model(erllama_model_t *m) {
         m->active_contexts--;
     }
     if (m->release_pending && m->active_contexts == 0 && m->model) {
-        int rc = erllama_safe_model_free(m->model);
+        (void) erllama_safe_model_free(m->model);
         m->model = NULL;
         m->release_pending = 0;
-        if (rc != 0) m->release_failed = 1;
     }
     pthread_mutex_unlock(&m->mu);
 }
@@ -196,10 +194,10 @@ static void context_drops_model(erllama_model_t *m) {
 static void model_dtor(ErlNifEnv *env, void *obj) {
     (void) env;
     erllama_model_t *m = (erllama_model_t *) obj;
-    /* If a prior nif_free_model already cleared m->model we skip the
-     * call here. The release_failed flag is informational only --
-     * we never call llama_model_free on a poisoned pointer. */
-    if (m->model && !m->release_failed) {
+    /* The pointer is NULL after any successful or failed explicit
+     * release, so this single check covers both paths and avoids
+     * double-calling the safe wrapper. */
+    if (m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
     }
@@ -216,7 +214,7 @@ static void ctx_dtor(ErlNifEnv *env, void *obj) {
         (void) erllama_safe_sampler_free(c->smpl);
         c->smpl = NULL;
     }
-    if (c->ctx && !c->release_failed) {
+    if (c->ctx) {
         (void) erllama_safe_free(c->ctx);
         c->ctx = NULL;
     }
@@ -256,7 +254,6 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     atom_unpack_failed = enif_make_atom(env, "unpack_failed");
     atom_true = enif_make_atom(env, "true");
     atom_false = enif_make_atom(env, "false");
-    atom_in_use = enif_make_atom(env, "in_use");
     atom_released = enif_make_atom(env, "released");
     atom_too_large = enif_make_atom(env, "too_large");
     atom_invalid_token = enif_make_atom(env, "invalid_token");
@@ -445,16 +442,14 @@ static ERL_NIF_TERM nif_free_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     }
     struct llama_model *to_free = m->model;
     /* Free under the lock so a concurrent state read can't observe a
-     * mid-free m->model. Only clear the pointer if the safe wrapper
-     * confirmed a clean free; on exception we mark the resource as
-     * release_failed and keep the pointer NULL anyway, since calling
-     * llama_model_free again would be a double-free. The native
-     * object is leaked in that case (a llama destructor that throws
-     * is itself a violation; we surface the error and avoid UB). */
+     * mid-free m->model. The pointer is nulled regardless of the
+     * wrapper's return: calling llama_model_free again on a freed
+     * pointer is a double-free, and llama destructors are required
+     * to be noexcept anyway -- if one throws we leak the native
+     * object rather than risk UB. */
     int rc = erllama_safe_model_free(to_free);
     m->model = NULL;
     m->release_pending = 0;
-    if (rc != 0) m->release_failed = 1;
     pthread_mutex_unlock(&m->mu);
     if (rc != 0) {
         return enif_make_tuple2(env, atom_error, atom_exception);
@@ -557,7 +552,6 @@ static ERL_NIF_TERM nif_free_context(ErlNifEnv *env, int argc, const ERL_NIF_TER
     int free_rc = erllama_safe_free(c->ctx);
     c->ctx = NULL;
     c->decode_ready = 0;
-    if (free_rc != 0) c->release_failed = 1;
     erllama_model_t *m = c->model_res;
     c->model_res = NULL;
     pthread_mutex_unlock(&c->mu);
