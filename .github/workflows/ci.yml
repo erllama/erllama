@@ -141,11 +141,15 @@ jobs:
             fetch https://github.com/erlang/rebar3/releases/download/3.25.0/rebar3 -o rebar3
             chmod +x rebar3
 
+            # Build first, then run static analysis (xref, dialyzer)
+            # at the same level as erlfmt + elvis on the Linux jobs:
+            # they must pass before we get to the more brittle eunit
+            # step. Per-module eunit follows so a BEAM segfault on
+            # one module does not contaminate the others.
             ./rebar3 compile
+            ./rebar3 xref
+            ./rebar3 dialyzer
 
-            # Run each EUnit module in isolation. A segfault in BEAM
-            # teardown on one module does not contaminate the next,
-            # and a per-module failure points at the culprit.
             FAILED=""
             for m in $(ls test/*_tests.erl | sed 's|test/||;s|\.erl||'); do
               echo "=== eunit: $m ==="
@@ -153,9 +157,6 @@ jobs:
                 FAILED="$FAILED $m"
               fi
             done
-
-            ./rebar3 xref
-            ./rebar3 dialyzer
 
             if [ -n "$FAILED" ]; then
               echo "EUnit failures on FreeBSD:$FAILED"
