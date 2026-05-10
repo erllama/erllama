@@ -232,9 +232,10 @@ jobs:
             FAILED=""
             for m in $(ls test/*_tests.erl | sed 's|test/||;s|\.erl||'); do
               echo "=== eunit: $m ==="
-              if ! ./rebar3 eunit --module=$m; then
+              if ! timeout 120 ./rebar3 eunit --module=$m; then
                 FAILED="$FAILED $m"
               fi
+              sleep 1
             done
 
             if [ -n "$FAILED" ]; then

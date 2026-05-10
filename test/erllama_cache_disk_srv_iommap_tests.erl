@@ -19,9 +19,10 @@ with_iommap(Body) ->
     try
         Body(Dir)
     after
-        catch gen_server:stop(io_disk),
-        catch gen_server:stop(erllama_cache_ram),
-        catch gen_server:stop(erllama_cache_meta_srv),
+        catch gen_server:stop(io_disk, normal, 5000),
+        catch gen_server:stop(erllama_cache_ram, normal, 5000),
+        catch gen_server:stop(erllama_cache_meta_srv, normal, 5000),
+        timer:sleep(100),
         rm_rf(Dir)
     end.
 
@@ -106,8 +107,11 @@ make_tmp_dir() ->
 
 rm_rf(Dir) ->
     case file:list_dir(Dir) of
-        {ok, Entries} -> [file:delete(filename:join(Dir, E)) || E <- Entries];
-        _ -> ok
+        {ok, Entries} ->
+            [file:delete(filename:join(Dir, E)) || E <- Entries],
+            timer:sleep(50);
+        _ ->
+            ok
     end,
     file:del_dir(Dir).
 
