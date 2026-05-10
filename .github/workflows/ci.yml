@@ -212,9 +212,11 @@ jobs:
             export PATH="/usr/local/lib/erlang28/bin:/usr/local/bin:$PATH"
             export ERL_CRASH_DUMP_SECONDS=0
             # The host's safe.directory config is not visible inside
-            # the VM; rebar3's git deps (or any build hook that
-            # touches git) would hit "dubious ownership" otherwise.
-            git config --global --add safe.directory "$GITHUB_WORKSPACE"
+            # the VM; rebar3's git deps and llama.cpp's build-info
+            # cmake script (git rev-parse) would hit "dubious
+            # ownership" otherwise. Wildcard works for every
+            # subprocess regardless of HOME.
+            git config --global --add safe.directory '*'
             erl -eval 'io:format("OTP ~s~n", [erlang:system_info(otp_release)]), halt().' -noshell
             fetch https://github.com/erlang/rebar3/releases/download/3.25.0/rebar3 -o rebar3
             chmod +x rebar3
