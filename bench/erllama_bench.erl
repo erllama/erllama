@@ -42,7 +42,7 @@ cold_vs_warm(ModelPath, PromptTokenTargets) ->
     Dir = make_tmp_dir(Tag),
     DiskSrv = list_to_atom("disk_" ++ Tag),
     {ok, _} = erllama_cache_disk_srv:start_link(DiskSrv, Dir),
-    Model = list_to_atom("model_" ++ Tag),
+    Model = iolist_to_binary(["model_", Tag]),
     {ok, _} = erllama_model:start_link(Model, model_config(ModelPath, DiskSrv)),
     try
         io:format("~n## cold_vs_warm — ~ts~n~n", [filename:basename(ModelPath)]),
@@ -125,7 +125,7 @@ multi_agent(ModelPath, NAgents, SharedTokens) ->
     DiskSrv = list_to_atom("disk_" ++ Tag),
     {ok, _} = erllama_cache_disk_srv:start_link(DiskSrv, Dir),
     SharedPrompt = generate_prompt(SharedTokens),
-    PrewarmModel = list_to_atom("prewarm_" ++ Tag),
+    PrewarmModel = iolist_to_binary(["prewarm_", Tag]),
     {ok, _} = erllama_model:start_link(PrewarmModel, model_config(ModelPath, DiskSrv)),
     try
         %% Pre-warm: cold completion that publishes the cache row.
@@ -185,7 +185,7 @@ run_agents_parallel(ModelPath, DiskSrv, Tasks, Tag) ->
     ].
 
 run_one_agent(ModelPath, DiskSrv, I, Task, Parent, Tag) ->
-    ModelName = list_to_atom("agent_" ++ Tag ++ "_" ++ integer_to_list(I)),
+    ModelName = iolist_to_binary(["agent_", Tag, "_", integer_to_binary(I)]),
     {ok, _} = erllama_model:start_link(ModelName, model_config(ModelPath, DiskSrv)),
     try
         {Lat, _} = timer:tc(erllama_model, complete, [ModelName, Task, #{response_tokens => 1}]),

@@ -12,6 +12,7 @@
 with_model(PolicyOverrides, Body) ->
     ok = erllama_cache_counters:init(),
     erllama_cache_counters:reset(),
+    {ok, _} = erllama_registry:start_link(),
     {ok, _} = erllama_cache_meta_srv:start_link(),
     {ok, _} = erllama_cache_ram:start_link(),
     {ok, _} = erllama_cache_writer:start_link(2),
@@ -29,15 +30,16 @@ with_model(PolicyOverrides, Body) ->
         context_size => 4096,
         policy => Policy
     },
-    {ok, _} = erllama_model:start_link(test_model, Config),
+    {ok, _} = erllama_model:start_link(<<"test_model">>, Config),
     try
         Body(Config)
     after
-        catch erllama_model:stop(test_model),
+        catch erllama_model:stop(<<"test_model">>),
         catch gen_server:stop(test_disk),
         catch gen_server:stop(erllama_cache_writer),
         catch gen_server:stop(erllama_cache_ram),
         catch gen_server:stop(erllama_cache_meta_srv),
+        catch gen_server:stop(erllama_registry),
         rm_rf(Dir)
     end.
 
@@ -96,14 +98,72 @@ wait_for_key_loop(Key, Deadline) ->
 
 starts_in_idle_test() ->
     with_model(#{}, fun(_) ->
-        ?assertEqual(idle, erllama_model:status(test_model))
+        ?assertEqual(idle, erllama_model:status(<<"test_model">>))
+    end).
+
+model_info_returns_map_test() ->
+    with_model(#{}, fun(_) ->
+        Info = erllama_model:model_info(<<"test_model">>),
+        ?assertEqual(<<"test_model">>, maps:get(id, Info)),
+        ?assertEqual(idle, maps:get(status, Info)),
+        ?assert(is_pid(maps:get(pid, Info))),
+        ?assertEqual(erllama_model_stub, maps:get(backend, Info)),
+        ?assertEqual(4096, maps:get(context_size, Info)),
+        ?assertEqual(f16, maps:get(quant_type, Info)),
+        ?assertEqual(16, maps:get(quant_bits, Info)),
+        ?assertEqual(disk, maps:get(tier, Info)),
+        ?assertEqual(32, byte_size(maps:get(fingerprint, Info)))
+    end).
+
+model_info_via_pid_test() ->
+    with_model(#{}, fun(_) ->
+        Pid = erllama_registry:whereis_name(<<"test_model">>),
+        Info = erllama_model:model_info(Pid),
+        ?assertEqual(<<"test_model">>, maps:get(id, Info))
+    end).
+
+tokenize_returns_list_test() ->
+    with_model(#{}, fun(_) ->
+        {ok, Tokens} = erllama_model:tokenize(<<"test_model">>, <<"hello world">>),
+        ?assert(is_list(Tokens)),
+        ?assert(lists:all(fun is_integer/1, Tokens))
+    end).
+
+tokenize_empty_string_test() ->
+    with_model(#{}, fun(_) ->
+        {ok, Tokens} = erllama_model:tokenize(<<"test_model">>, <<>>),
+        ?assertEqual([], Tokens)
+    end).
+
+detokenize_roundtrip_test() ->
+    %% The stub backend is not roundtrippable (phash2-based), but the
+    %% types should line up: tokenize -> [int], detokenize -> binary.
+    with_model(#{}, fun(_) ->
+        {ok, Tokens} = erllama_model:tokenize(<<"test_model">>, <<"hi there">>),
+        {ok, Bin}    = erllama_model:detokenize(<<"test_model">>, Tokens),
+        ?assert(is_binary(Bin))
+    end).
+
+tokenize_concurrent_with_idle_test() ->
+    with_model(#{}, fun(_) ->
+        ?assertEqual(idle, erllama_model:status(<<"test_model">>)),
+        {ok, _} = erllama_model:tokenize(<<"test_model">>, <<"x">>),
+        ?assertEqual(idle, erllama_model:status(<<"test_model">>))
+    end).
+
+via_unknown_model_crashes_test() ->
+    with_model(#{}, fun(_) ->
+        ?assertExit(
+            {noproc, {erllama_model, not_found, <<"unknown">>}},
+            erllama_model:status(<<"unknown">>)
+        )
     end).
 
 complete_returns_response_test() ->
     with_model(#{}, fun(_) ->
-        {ok, _Reply, Generated} = erllama_model:complete(test_model, short_prompt()),
+        {ok, _Reply, Generated} = erllama_model:complete(<<"test_model">>, short_prompt()),
         ?assert(length(Generated) > 0),
-        ?assertEqual(idle, erllama_model:status(test_model))
+        ?assertEqual(idle, erllama_model:status(<<"test_model">>))
     end).
 
 %% =============================================================================
@@ -114,7 +174,7 @@ short_prompt_does_not_cold_save_test() ->
     with_model(
         #{min_tokens => 4, cold_min_tokens => 4, cold_max_tokens => 1000},
         fun(Cfg) ->
-            {ok, _, _} = erllama_model:complete(test_model, short_prompt()),
+            {ok, _, _} = erllama_model:complete(<<"test_model">>, short_prompt()),
             %% Short prompt has 1 token; min is 4 -> no cold save.
             Tokens = prompt_tokens(short_prompt()),
             ColdKey = key_for_tokens(Tokens, Cfg),
@@ -124,7 +184,7 @@ short_prompt_does_not_cold_save_test() ->
 
 long_prompt_fires_cold_save_test() ->
     with_model(#{}, fun(Cfg) ->
-        {ok, _, _} = erllama_model:complete(test_model, long_prompt()),
+        {ok, _, _} = erllama_model:complete(<<"test_model">>, long_prompt()),
         Tokens = prompt_tokens(long_prompt()),
         ColdKey = key_for_tokens(Tokens, Cfg),
         ?assertMatch({ok, _Row}, wait_for_key(ColdKey, 1000))
@@ -137,7 +197,7 @@ long_prompt_fires_cold_save_test() ->
 finish_save_fires_for_long_prompt_test() ->
     with_model(#{}, fun(Cfg) ->
         {ok, _, Generated} =
-            erllama_model:complete(test_model, long_prompt(), #{response_tokens => 6}),
+            erllama_model:complete(<<"test_model">>, long_prompt(), #{response_tokens => 6}),
         FullTokens = prompt_tokens(long_prompt()) ++ Generated,
         FinishKey = key_for_tokens(FullTokens, Cfg),
         ?assertMatch({ok, _Row}, wait_for_key(FinishKey, 1000))
@@ -150,7 +210,7 @@ finish_save_fires_for_long_prompt_test() ->
 repeat_prompt_hits_finish_save_path_test() ->
     with_model(#{}, fun(Cfg) ->
         {ok, _, Gen1} =
-            erllama_model:complete(test_model, long_prompt(), #{response_tokens => 4}),
+            erllama_model:complete(<<"test_model">>, long_prompt(), #{response_tokens => 4}),
         FullKey1 = key_for_tokens(prompt_tokens(long_prompt()) ++ Gen1, Cfg),
         {ok, _} = wait_for_key(FullKey1, 1000),
         %% Second complete with the *same prompt + response continuation*:
@@ -168,7 +228,7 @@ parent_key_session_resume_test() ->
     with_model(#{}, fun(Cfg) ->
         %% Turn 1: prompt + response.
         {ok, _, Gen1} =
-            erllama_model:complete(test_model, long_prompt(), #{response_tokens => 4}),
+            erllama_model:complete(<<"test_model">>, long_prompt(), #{response_tokens => 4}),
         FullTokens1 = prompt_tokens(long_prompt()) ++ Gen1,
         FullKey1 = key_for_tokens(FullTokens1, Cfg),
         {ok, _} = wait_for_key(FullKey1, 1000),
@@ -179,11 +239,11 @@ parent_key_session_resume_test() ->
             stub_detokenize_decimal(FullTokens1) ++ " more tokens for turn two"
         ),
         {ok, _, _} =
-            erllama_model:complete(test_model, Extension, #{
+            erllama_model:complete(<<"test_model">>, Extension, #{
                 parent_key => FullKey1,
                 response_tokens => 2
             }),
-        ?assertEqual(idle, erllama_model:status(test_model))
+        ?assertEqual(idle, erllama_model:status(<<"test_model">>))
     end).
 
 %% =============================================================================
@@ -198,7 +258,7 @@ continued_save_fires_during_long_generation_test() ->
         fun(Cfg) ->
             PromptTokens = prompt_tokens(long_prompt()),
             {ok, _, Generated} = erllama_model:complete(
-                test_model, long_prompt(), #{response_tokens => 8}
+                <<"test_model">>, long_prompt(), #{response_tokens => 8}
             ),
             %% A continued save fires when LiveTokens - LastSavedAt
             %% reaches continued_interval. With the cold save firing
@@ -219,9 +279,9 @@ continued_save_fires_during_long_generation_test() ->
 
 evict_idle_with_no_context_is_noop_test() ->
     with_model(#{}, fun(_Cfg) ->
-        ok = erllama_model:evict(test_model),
+        ok = erllama_model:evict(<<"test_model">>),
         ?assertEqual(0, length(erllama_cache_meta_srv:dump())),
-        ?assertEqual(idle, erllama_model:status(test_model))
+        ?assertEqual(idle, erllama_model:status(<<"test_model">>))
     end).
 
 evict_during_generation_persists_live_state_test() ->
@@ -234,12 +294,12 @@ evict_during_generation_persists_live_state_test() ->
             Parent !
                 {done,
                     erllama_model:complete(
-                        test_model, long_prompt(), #{response_tokens => 200}
+                        <<"test_model">>, long_prompt(), #{response_tokens => 200}
                     )}
         end),
         %% Give the gen_statem a beat to enter generating.
         timer:sleep(0),
-        ok = erllama_model:evict(test_model),
+        ok = erllama_model:evict(<<"test_model">>),
         %% Wait for the request to complete (the finish save fires too,
         %% so we expect at least an evict row plus cold + finish).
         receive
@@ -256,9 +316,9 @@ evict_during_generation_persists_live_state_test() ->
 
 shutdown_idle_with_no_context_is_noop_test() ->
     with_model(#{}, fun(_Cfg) ->
-        ok = erllama_model:shutdown(test_model),
+        ok = erllama_model:shutdown(<<"test_model">>),
         ?assertEqual(0, length(erllama_cache_meta_srv:dump())),
-        ?assertEqual(idle, erllama_model:status(test_model))
+        ?assertEqual(idle, erllama_model:status(<<"test_model">>))
     end).
 
 %% =============================================================================
@@ -269,7 +329,7 @@ counters_track_misses_and_saves_test() ->
     with_model(#{}, fun(_Cfg) ->
         Before = erllama_cache:get_counters(),
         {ok, _, _} =
-            erllama_model:complete(test_model, long_prompt(), #{response_tokens => 4}),
+            erllama_model:complete(<<"test_model">>, long_prompt(), #{response_tokens => 4}),
         timer:sleep(50),
         After = erllama_cache:get_counters(),
         %% A fresh prompt is a miss, fires cold + finish saves.
@@ -287,12 +347,12 @@ concurrent_complete_rejects_with_busy_test() ->
         Parent = self(),
         %% Spawn a slow caller that keeps the gen_statem busy.
         spawn(fun() ->
-            Parent ! {first, erllama_model:complete(test_model, long_prompt())}
+            Parent ! {first, erllama_model:complete(<<"test_model">>, long_prompt())}
         end),
         timer:sleep(0),
         %% Try a second complete; the gen_statem is in prefilling/
         %% generating and rejects.
-        Result = erllama_model:complete(test_model, short_prompt()),
+        Result = erllama_model:complete(<<"test_model">>, short_prompt()),
         receive
             {first, _} -> ok
         after 5000 -> erlang:error(first_caller_timeout)

@@ -16,6 +16,8 @@ init([]) ->
     SupFlags = #{strategy => one_for_one, intensity => 5, period => 30},
     Children = [
         sup_child(erllama_cache_sup),
+        worker_child(erllama_registry),
+        worker_child(erllama_inflight),
         sup_child(erllama_model_sup),
         worker_child(erllama_scheduler)
     ],

@@ -39,28 +39,39 @@ an explicit `model_id` in the config map.
     load_model/1,
     load_model/2,
     unload/1,
+    unload_model/1,
     complete/2,
     complete/3,
+    infer/4,
+    cancel/1,
     models/0,
+    list_models/0,
+    model_info/1,
+    tokenize/2,
+    detokenize/2,
+    apply_chat_template/2,
+    embed/2,
     counters/0
 ]).
 
--export_type([model/0]).
+-export_type([model/0, model_id/0, model_info/0]).
 
--type model() :: atom() | pid().
+-type model_id()   :: erllama_registry:model_id().
+-type model()      :: erllama_model:model().
+-type model_info() :: erllama_model:model_info().
 
 %% =============================================================================
 %% Public API
 %% =============================================================================
 
 %% @doc Load a model with an auto-generated id.
--spec load_model(map()) -> {ok, atom()} | {error, term()}.
+-spec load_model(map()) -> {ok, model_id()} | {error, term()}.
 load_model(Config) when is_map(Config) ->
     load_model(default_id(), Config).
 
 %% @doc Load a model with an explicit id.
--spec load_model(atom(), map()) -> {ok, atom()} | {error, term()}.
-load_model(ModelId, Config) when is_atom(ModelId), is_map(Config) ->
+-spec load_model(model_id(), map()) -> {ok, model_id()} | {error, term()}.
+load_model(ModelId, Config) when is_binary(ModelId), is_map(Config) ->
     case erllama_model_sup:start_model(ModelId, Config) of
         {ok, _Pid} -> {ok, ModelId};
         {error, {already_started, _}} -> {error, already_loaded};
@@ -71,6 +82,13 @@ load_model(ModelId, Config) when is_atom(ModelId), is_map(Config) ->
 -spec unload(model()) -> ok | {error, term()}.
 unload(Model) ->
     erllama_model_sup:stop_model(Model).
+
+%% @doc Alias for `unload/1`. Provided for API symmetry with
+%% `load_model/1,2` and the OpenAI/Ollama-style naming used by
+%% downstream HTTP servers.
+-spec unload_model(model()) -> ok | {error, term()}.
+unload_model(Model) ->
+    unload(Model).
 
 %% @doc Run a completion against a loaded model.
 -spec complete(model(), binary()) ->
@@ -83,10 +101,85 @@ complete(Model, Prompt) ->
 complete(Model, Prompt, Opts) ->
     erllama_model:complete(Model, Prompt, Opts).
 
-%% @doc List currently-loaded model pids.
+%% @doc Streaming inference. Returns immediately with a `reference()`
+%% that identifies this request; tokens are delivered to `CallerPid`
+%% via async messages:
+%%
+%%   {erllama_token, Ref, Bin :: binary()}     - text fragment
+%%   {erllama_done, Ref, stats()}              - normal completion
+%%   {erllama_error, Ref, term()}              - failure
+%%
+%% `Tokens` is the prompt as a list of token ids; tokenisation is the
+%% caller's responsibility (use `tokenize/2` or apply a chat template
+%% first).
+-spec infer(model(), [erllama_nif:token_id()],
+            erllama_model:infer_params(), pid()) ->
+    {ok, reference()} | {error, term()}.
+infer(Model, Tokens, Params, CallerPid) ->
+    erllama_model:infer(Model, Tokens, Params, CallerPid).
+
+%% @doc Cancel an in-flight streaming inference. Idempotent and
+%% fire-and-forget; cancellation is observed at the next inter-token
+%% boundary. The caller still receives a final `{erllama_done, Ref,
+%% Stats}` with `cancelled => true`.
+-spec cancel(reference()) -> ok.
+cancel(Ref) ->
+    erllama_model:cancel(Ref).
+
+%% @doc List currently-loaded model pids (low-level supervisor view).
+%% Most callers want `list_models/0`, which returns metadata maps.
 -spec models() -> [pid()].
 models() ->
     [Pid || {_, Pid, _, _} <- erllama_model_sup:models(), is_pid(Pid)].
+
+%% @doc List currently-loaded models as `model_info()` maps. Each
+%% entry includes the model id, status, backend, context size, and
+%% quantisation.
+-spec list_models() -> [model_info()].
+list_models() ->
+    lists:filtermap(
+        fun({_ModelId, Pid}) ->
+            try
+                {true, erllama_model:model_info(Pid)}
+            catch
+                _:_ -> false
+            end
+        end,
+        erllama_registry:all()
+    ).
+
+%% @doc Inspect a single loaded model. Returns the same map shape
+%% `list_models/0` produces. Crashes with `noproc` if the model is
+%% not loaded.
+-spec model_info(model()) -> model_info().
+model_info(Model) ->
+    erllama_model:model_info(Model).
+
+%% @doc Tokenise text against a loaded model's tokenizer. Safe to
+%% call concurrently with `complete/2,3`.
+-spec tokenize(model(), binary()) ->
+    {ok, [erllama_nif:token_id()]} | {error, term()}.
+tokenize(Model, Text) ->
+    erllama_model:tokenize(Model, Text).
+
+%% @doc Detokenise a list of token ids back to text.
+-spec detokenize(model(), [erllama_nif:token_id()]) ->
+    {ok, binary()} | {error, term()}.
+detokenize(Model, Tokens) ->
+    erllama_model:detokenize(Model, Tokens).
+
+%% @doc Render a chat request through the model's chat template and
+%% tokenise. The Request map carries `messages`, `system`, and `tools`.
+-spec apply_chat_template(model(), erllama_model_backend:chat_request()) ->
+    {ok, [erllama_nif:token_id()]} | {error, term()}.
+apply_chat_template(Model, Request) ->
+    erllama_model:apply_chat_template(Model, Request).
+
+%% @doc Compute an embedding vector for the given prompt tokens.
+-spec embed(model(), [erllama_nif:token_id()]) ->
+    {ok, [float()]} | {error, term()}.
+embed(Model, Tokens) ->
+    erllama_model:embed(Model, Tokens).
 
 %% @doc Snapshot of the cache subsystem operational counters.
 -spec counters() -> #{atom() => non_neg_integer()}.
@@ -98,4 +191,5 @@ counters() ->
 %% =============================================================================
 
 default_id() ->
-    list_to_atom("erllama_model_" ++ integer_to_list(erlang:unique_integer([positive]))).
+    Int = erlang:unique_integer([positive]),
+    iolist_to_binary(["erllama_model_", integer_to_binary(Int)]).

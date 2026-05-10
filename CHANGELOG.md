@@ -12,6 +12,42 @@ Initial public release.
 
 ### Added
 
+- Models are identified by `binary()` on the public API.
+  `erllama:load_model/2`, `complete/2,3`, `unload/1`, `status/1`,
+  `evict/1`, `shutdown/1` take `binary() | pid()`. Internal
+  registration uses `{via, erllama_registry, BinaryId}` so user-
+  supplied ids cannot exhaust the atom table.
+- `erllama:list_models/0` returning `[model_info()]` and
+  `erllama:model_info/1` keyed on a model id.
+- Public `erllama:tokenize/2` and `erllama:detokenize/2` keyed on a
+  model id. The low-level `erllama_nif:tokenize/3` and
+  `erllama_nif:detokenize/2` remain available.
+- `erllama:unload_model/1` as an alias for `erllama:unload/1` matching
+  the OpenAI/Ollama-style naming downstream HTTP servers use.
+- `erllama:infer/4` streaming inference. Returns `{ok, Ref}`; tokens
+  are delivered to the caller as `{erllama_token, Ref, _}`,
+  `{erllama_done, Ref, Stats}`, `{erllama_error, Ref, Reason}`.
+- `erllama:cancel/1`. Idempotent and fire-and-forget; observed
+  between tokens.
+- `erllama:apply_chat_template/2`. Renders a normalised chat request
+  (`messages`, `system`, `tools`) through the model's GGUF chat
+  template and tokenises. Backed by `llama_chat_apply_template`.
+- `erllama:embed/2`. Per-sequence pooled embedding via
+  `llama_get_embeddings_seq` with last-token fallback.
+- Grammar-constrained sampling. Pass `grammar => GBNF` in the
+  `infer/4` Params map; the per-model sampler chain is rebuilt as
+  grammar then greedy for the duration of the request and reset on
+  completion or cancellation.
+- `erllama_registry` module: ETS-backed `via` callback for binary
+  model ids.
+- `erllama_inflight` module: `Ref -> ModelPid` table so `cancel/1`
+  routes to the right gen_statem.
+- `erllama_model_backend` optional callbacks `apply_chat_template/2`,
+  `embed/2`, `set_grammar/2`, `clear_sampler/1`. Backends that omit
+  them surface `{error, not_supported}` from the public API.
+- Decode loop schedules each step via `gen_statem:cast(self(),
+  decode_step)` instead of `next_event` so cancel, evict, status, and
+  busy rejection interleave fairly between tokens.
 - Native Erlang/OTP wrapper around llama.cpp via a single
   dirty-scheduler NIF (`erllama_nif`) covering model load, context
   construction, tokenisation, prefill, single-token decode, and

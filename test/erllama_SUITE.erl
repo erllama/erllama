@@ -66,7 +66,7 @@ init_per_testcase(TC, Config) ->
     {evicted, _} = erllama_cache_meta_srv:gc(),
     DiskSrv = list_to_atom("ct_disk_" ++ atom_to_list(TC)),
     {ok, _} = erllama_cache_disk_srv:start_link(DiskSrv, Dir),
-    Model = list_to_atom("ct_model_" ++ atom_to_list(TC)),
+    Model = iolist_to_binary(["ct_model_", atom_to_binary(TC)]),
     {ok, _} = erllama_model:start_link(Model, model_config(DiskSrv)),
     erllama_cache_counters:reset(),
     [{disk_srv, DiskSrv}, {model, Model}, {dir, Dir} | Config].
@@ -244,9 +244,7 @@ concurrent_complete_under_writer_cap(Config) ->
     N = 4,
     Pids = [
         spawn(fun() ->
-            ModelN = list_to_atom(
-                atom_to_list(BaseModel) ++ "_" ++ integer_to_list(I)
-            ),
+            ModelN = iolist_to_binary([BaseModel, "_", integer_to_binary(I)]),
             Cfg0 = model_config(DiskSrv),
             FP = crypto:hash(sha256, integer_to_binary(I)),
             Cfg = Cfg0#{fingerprint => FP},

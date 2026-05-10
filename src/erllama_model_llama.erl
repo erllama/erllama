@@ -25,7 +25,11 @@ Config (passed through `erllama_model:start_link/2`):
     decode_one/2,
     kv_pack/2,
     kv_unpack/2,
-    seq_rm_last/2
+    seq_rm_last/2,
+    apply_chat_template/2,
+    embed/2,
+    set_grammar/2,
+    clear_sampler/1
 ]).
 
 -record(s, {
@@ -80,3 +84,21 @@ kv_unpack(#s{ctx = C}, Bin) ->
 %% (or zero) logits.
 seq_rm_last(#s{ctx = C}, NTokens) when NTokens > 0 ->
     erllama_nif:kv_seq_rm(C, 0, NTokens - 1, -1).
+
+apply_chat_template(#s{model = M}, Request) ->
+    erllama_nif:apply_chat_template(M, Request).
+
+embed(#s{ctx = C}, Tokens) ->
+    erllama_nif:embed(C, Tokens).
+
+set_grammar(#s{ctx = C} = S, Grammar) when is_binary(Grammar) ->
+    case erllama_nif:set_grammar(C, Grammar) of
+        ok           -> {ok, S};
+        {error, _} = E -> E
+    end;
+set_grammar(#s{} = S, undefined) ->
+    {ok, S}.
+
+clear_sampler(#s{ctx = C} = S) ->
+    ok = erllama_nif:clear_sampler(C),
+    {ok, S}.
