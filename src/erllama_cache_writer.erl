@@ -287,9 +287,49 @@ derive_key(BuildMeta) ->
         error:Reason -> {error, Reason}
     end.
 
+%% Stage-aware reservation flow:
+%%   reserve_save (already done) → write_tmp → check_reservation
+%%     → publish (link) → mark_published → announce_saved
+%%
+%% check_reservation right before link is the cancel-token check that
+%% prevents a slow writer (whose reservation TTL expired and got
+%% recycled to another writer) from publishing under stale authority.
+%% mark_published advances the meta server's stage to post_link so a
+%% writer that crashes between link and announce_saved triggers the
+%% validate-and-adopt path rather than the placeholder-row delete.
 do_save_reserved(TierSrv, Key, Token, BuildMeta, Payload) ->
-    case erllama_cache_disk_srv:save(TierSrv, BuildMeta, Payload) of
+    Root = erllama_cache_disk_srv:dir(TierSrv),
+    case erllama_cache_disk_srv:write_tmp(Root, BuildMeta, Payload) of
+        {ok, WriteOut} ->
+            after_write_tmp(Key, Token, BuildMeta, WriteOut);
+        {error, _} = E ->
+            _ = erllama_cache_meta_srv:cancel_reservation(Key, Token),
+            E
+    end.
+
+after_write_tmp(Key, Token, BuildMeta, WriteOut) ->
+    case erllama_cache_meta_srv:check_reservation(Key, Token) of
+        ok ->
+            after_check_reservation(Key, Token, BuildMeta, WriteOut);
+        {error, expired} = E ->
+            erllama_cache_disk_srv:abort_tmp(WriteOut),
+            E
+    end.
+
+after_check_reservation(Key, Token, BuildMeta, WriteOut) ->
+    case erllama_cache_disk_srv:publish(WriteOut) of
         {ok, _SameKey, Header, Size} ->
+            #{final := FinalPath} = WriteOut,
+            after_publish(Key, Token, BuildMeta, FinalPath, Header, Size);
+        {error, _} = E ->
+            erllama_cache_disk_srv:abort_tmp(WriteOut),
+            _ = erllama_cache_meta_srv:cancel_reservation(Key, Token),
+            E
+    end.
+
+after_publish(Key, Token, BuildMeta, FinalPath, Header, Size) ->
+    case erllama_cache_meta_srv:mark_published(Key, Token, FinalPath) of
+        ok ->
             TokensBin = erllama_cache_key:encode_tokens(maps:get(tokens, BuildMeta)),
             case
                 erllama_cache_meta_srv:announce_saved(
@@ -303,7 +343,9 @@ do_save_reserved(TierSrv, Key, Token, BuildMeta, Payload) ->
                     E
             end;
         {error, _} = E ->
-            _ = erllama_cache_meta_srv:cancel_reservation(Key, Token),
+            %% Token was recycled between check_reservation and
+            %% mark_published. The file is published; the meta sweep
+            %% will validate-and-adopt it on its next pass.
             E
     end.
 

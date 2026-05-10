@@ -44,6 +44,10 @@
     start_link/3,
     start_link/4,
     save/3,
+    write_tmp/3,
+    publish/1,
+    publish/4,
+    abort_tmp/1,
     load/2,
     delete/2,
     dir/1,
@@ -93,6 +97,94 @@ start_link(Name, Tier, RootDir, DiskIO) when
     | {error, term()}.
 save(SrvName, BuildMeta, Payload) ->
     gen_server:call(SrvName, {save, BuildMeta, Payload}, infinity).
+
+%% Two-phase save for callers that need to interleave the meta
+%% server's reservation protocol (check_reservation, mark_published)
+%% between the temp write and the link publish. write_tmp does the
+%% expensive part (build prefix, write+datasync the temp file);
+%% publish does the atomic link, dir-fsync, and validate. Both are
+%% stateless module functions that take the directory directly.
+%%
+%%   {ok, WriteOut} = write_tmp(Root, BuildMeta, Payload),
+%%   ok = meta_srv:check_reservation(Key, Token),
+%%   {ok, Key, Header, Size} = publish(Root, WriteOut),
+%%   ok = meta_srv:mark_published(Key, Token, FinalPath),
+%%   ok = meta_srv:announce_saved(Key, Token, Size, Header, TokensBin).
+%%
+%% On any meta-server rejection between phases, call abort_tmp/1
+%% with the WriteOut to delete the temp file.
+-type write_out() :: #{
+    key := erllama_cache:cache_key(),
+    tmp := file:name(),
+    final := file:name(),
+    prefix := binary(),
+    payload := binary(),
+    root := file:name()
+}.
+
+-spec write_tmp(file:name(), erllama_cache_kvc:build_meta(), binary()) ->
+    {ok, write_out()} | {error, term()}.
+write_tmp(Root, BuildMeta, Payload) ->
+    Key = erllama_cache_key:make(#{
+        fingerprint => maps:get(fingerprint, BuildMeta),
+        quant_type => maps:get(quant_type, BuildMeta),
+        ctx_params_hash => maps:get(ctx_params_hash, BuildMeta),
+        tokens => maps:get(tokens, BuildMeta)
+    }),
+    HexKey = bin_to_hex(Key),
+    FinalPath = filename:join(Root, HexKey ++ ".kvc"),
+    TmpPath = filename:join(Root, HexKey ++ ".kvc." ++ writer_suffix() ++ ".tmp"),
+    case erllama_cache_kvc:build(BuildMeta, Payload) of
+        {ok, Prefix} ->
+            case write_temp(TmpPath, Prefix, Payload) of
+                ok ->
+                    {ok, #{
+                        key => Key,
+                        tmp => TmpPath,
+                        final => FinalPath,
+                        prefix => Prefix,
+                        payload => Payload,
+                        root => Root
+                    }};
+                {error, _} = E ->
+                    _ = file:delete(TmpPath),
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+-spec publish(write_out()) ->
+    {ok, erllama_cache:cache_key(), binary(), non_neg_integer()}
+    | {error, term()}.
+publish(#{
+    key := Key,
+    tmp := Tmp,
+    final := Final,
+    prefix := Prefix,
+    payload := Payload,
+    root := Root
+}) ->
+    link_temp(Key, Prefix, Payload, Tmp, Final, Root).
+
+%% Compatibility 4-arg form for the rare caller that only has paths.
+%% Re-reads the file to recover the prefix.
+-spec publish(file:name(), file:name(), file:name(), erllama_cache:cache_key()) ->
+    {ok, erllama_cache:cache_key(), binary(), non_neg_integer()}
+    | {error, term()}.
+publish(Root, TmpPath, FinalPath, Key) ->
+    case prim_file:read_file(TmpPath) of
+        {ok, Bin} when byte_size(Bin) >= 48 ->
+            <<Prefix:48/binary, _/binary>> = Bin,
+            link_temp(Key, Prefix, <<>>, TmpPath, FinalPath, Root);
+        _ ->
+            {error, tmp_unreadable}
+    end.
+
+-spec abort_tmp(write_out()) -> ok.
+abort_tmp(#{tmp := Tmp}) ->
+    _ = file:delete(Tmp),
+    ok.
 
 -spec load(atom(), erllama_cache:cache_key()) ->
     {ok, erllama_cache_kvc:info(), binary()} | miss | {error, term()}.
@@ -173,28 +265,10 @@ handle_cast(_Msg, S) ->
 %% =============================================================================
 
 do_save(BuildMeta, Payload, Root) ->
-    Key = erllama_cache_key:make(#{
-        fingerprint => maps:get(fingerprint, BuildMeta),
-        quant_type => maps:get(quant_type, BuildMeta),
-        ctx_params_hash => maps:get(ctx_params_hash, BuildMeta),
-        tokens => maps:get(tokens, BuildMeta)
-    }),
-    HexKey = bin_to_hex(Key),
-    FinalPath = filename:join(Root, HexKey ++ ".kvc"),
-    TmpPath = filename:join(Root, HexKey ++ ".kvc." ++ writer_suffix() ++ ".tmp"),
-    case erllama_cache_kvc:build(BuildMeta, Payload) of
-        {ok, Prefix} ->
-            write_then_publish(Key, Prefix, Payload, TmpPath, FinalPath, Root);
+    case write_tmp(Root, BuildMeta, Payload) of
+        {ok, WriteOut} ->
+            publish(WriteOut);
         {error, _} = E ->
-            E
-    end.
-
-write_then_publish(Key, Prefix, Payload, TmpPath, FinalPath, Root) ->
-    case write_temp(TmpPath, Prefix, Payload) of
-        ok ->
-            link_temp(Key, Prefix, Payload, TmpPath, FinalPath, Root);
-        {error, _} = E ->
-            _ = file:delete(TmpPath),
             E
     end.
 
