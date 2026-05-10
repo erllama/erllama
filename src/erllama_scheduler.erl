@@ -208,12 +208,20 @@ env_config() ->
         _ -> #{}
     end.
 
-validate(#state{high_watermark = H, low_watermark = L}) when
-    H > L, H =< 1.0, L >= 0.0
+validate(#state{
+    high_watermark = H,
+    low_watermark = L,
+    interval_ms = I
+}) when
+    H > L, H =< 1.0, L >= 0.0, is_integer(I), I > 0
 ->
     ok;
+validate(#state{high_watermark = H, low_watermark = L}) when
+    not (H > L andalso H =< 1.0 andalso L >= 0.0)
+->
+    {error, {invalid_config, {watermarks, "require 0.0 <= low < high <= 1.0"}}};
 validate(_) ->
-    {error, {invalid_watermarks, "require 0.0 <= low < high <= 1.0"}}.
+    {error, {invalid_config, {interval_ms, "must be a positive integer"}}}.
 
 maybe_start_os_mon(system) ->
     _ = application:ensure_all_started(os_mon),

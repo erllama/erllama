@@ -166,7 +166,23 @@ set_thresholds_test() ->
 invalid_watermarks_at_init_test() ->
     process_flag(trap_exit, true),
     Cfg = #{high_watermark => 0.5, low_watermark => 0.9},
-    {error, {invalid_watermarks, _}} =
+    {error, {invalid_config, {watermarks, _}}} =
+        gen_server:start(erllama_scheduler, [Cfg], []),
+    process_flag(trap_exit, false),
+    ok.
+
+invalid_interval_zero_at_init_test() ->
+    process_flag(trap_exit, true),
+    Cfg = #{interval_ms => 0},
+    {error, {invalid_config, {interval_ms, _}}} =
+        gen_server:start(erllama_scheduler, [Cfg], []),
+    process_flag(trap_exit, false),
+    ok.
+
+invalid_interval_negative_at_init_test() ->
+    process_flag(trap_exit, true),
+    Cfg = #{interval_ms => -10},
+    {error, {invalid_config, {interval_ms, _}}} =
         gen_server:start(erllama_scheduler, [Cfg], []),
     process_flag(trap_exit, false),
     ok.
