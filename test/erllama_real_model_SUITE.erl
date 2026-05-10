@@ -37,7 +37,8 @@
     tokenize_decode_one/1,
     pack_unpack_round_trip/1,
     cold_then_warm_complete/1,
-    warm_faster_than_cold/1
+    warm_faster_than_cold/1,
+    longest_prefix_resume_without_parent_key/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -60,7 +61,8 @@ all() ->
         tokenize_decode_one,
         pack_unpack_round_trip,
         cold_then_warm_complete,
-        warm_faster_than_cold
+        warm_faster_than_cold,
+        longest_prefix_resume_without_parent_key
     ].
 
 init_per_suite(Config) ->
@@ -224,6 +226,26 @@ warm_faster_than_cold(Config) ->
     %% require that warm is not slower than cold by more than a
     %% generous margin.
     ?assert(Warm =< Cold * 2),
+    ok.
+
+%% Soft check that the longest-prefix path runs against real llama.cpp
+%% tokenization without crashing. We can't hard-assert hits_resume >= 1
+%% because BPE may retokenize across the appended-suffix boundary, in
+%% which case Prompt2's first N tokens won't equal Prompt1's tokens
+%% and the longest-prefix walk legitimately misses. The assertion in
+%% erllama_SUITE (stub backend, deterministic tokeniser) is the
+%% regression gate; this case logs only.
+longest_prefix_resume_without_parent_key(Config) ->
+    Model = ?config(model, Config),
+    Prompt1 = ?LONG_PROMPT,
+    Prompt2 = <<Prompt1/binary, " The next morning brought a quiet rain.">>,
+    {ok, _, _} = erllama_model:complete(Model, Prompt1, #{response_tokens => 4}),
+    timer:sleep(400),
+    Before = erllama_cache:get_counters(),
+    {ok, _, _} = erllama_model:complete(Model, Prompt2, #{response_tokens => 2}),
+    After = erllama_cache:get_counters(),
+    Resumed = maps:get(hits_resume, After) - maps:get(hits_resume, Before),
+    ct:log("longest-prefix hits_resume delta = ~p (>= 1 means BPE preserved boundary)", [Resumed]),
     ok.
 
 %% =============================================================================

@@ -21,6 +21,7 @@
 -export([
     cold_then_warm_counters/1,
     multi_turn_session_resume/1,
+    longest_prefix_resume_without_parent_key/1,
     eviction_drops_files_and_meta/1,
     concurrent_complete_under_writer_cap/1,
     counters_visible_via_facade/1
@@ -34,6 +35,7 @@ all() ->
     [
         cold_then_warm_counters,
         multi_turn_session_resume,
+        longest_prefix_resume_without_parent_key,
         eviction_drops_files_and_meta,
         concurrent_complete_under_writer_cap,
         counters_visible_via_facade
@@ -161,6 +163,25 @@ multi_turn_session_resume(Config) ->
         1,
         maps:get(hits_resume, After) - maps:get(hits_resume, Before)
     ),
+    ok.
+
+%% Stateless callers (HTTP front-end, agent loops) re-send the full
+%% conversation each turn. Without parent_key, the longest-prefix
+%% scan should still find the previous turn's saved row by walking
+%% backward through stride-aligned prefixes.
+longest_prefix_resume_without_parent_key(Config) ->
+    Model = ?config(model, Config),
+    Prompt1 = long_prompt(),
+    %% Stub tokenizer splits on spaces, so appending a new word
+    %% extends the token list cleanly without retokenization noise.
+    Prompt2 = <<Prompt1/binary, " extra-suffix-token">>,
+    {ok, _, _} = erllama_model:complete(Model, Prompt1, #{response_tokens => 2}),
+    timer:sleep(150),
+    Before = erllama_cache:get_counters(),
+    {ok, _, _} = erllama_model:complete(Model, Prompt2, #{response_tokens => 2}),
+    After = erllama_cache:get_counters(),
+    Resumed = maps:get(hits_resume, After) - maps:get(hits_resume, Before),
+    ?assert(Resumed >= 1),
     ok.
 
 eviction_drops_files_and_meta(Config) ->

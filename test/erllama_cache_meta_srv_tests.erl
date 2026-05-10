@@ -110,6 +110,68 @@ install_restores_hits_from_header_test() ->
         ?assertEqual(7, element(?POS_HITS, Row))
     end).
 
+%% =============================================================================
+%% Longest-prefix lookup
+%% =============================================================================
+
+prefix_key_meta() ->
+    #{
+        fingerprint => binary:copy(<<16#AA>>, 32),
+        quant_type => f16,
+        ctx_params_hash => binary:copy(<<16#BB>>, 32)
+    }.
+
+prefix_key_for(Tokens) ->
+    Meta = prefix_key_meta(),
+    erllama_cache_key:make(Meta#{tokens => Tokens}).
+
+lookup_longest_prefix_miss_test() ->
+    with_srv(fun() ->
+        Meta = prefix_key_meta(),
+        Tokens = lists:seq(1, 1000),
+        ?assertEqual(
+            miss,
+            erllama_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 100, 100)
+        )
+    end).
+
+lookup_longest_prefix_hit_at_4096_test() ->
+    with_srv(fun() ->
+        Meta = prefix_key_meta(),
+        Tokens = lists:seq(1, 12000),
+        Prefix = lists:sublist(Tokens, 4096),
+        K = prefix_key_for(Prefix),
+        ok = erllama_cache_meta_srv:insert_available(K, ram, 100, <<"H">>, {ram}),
+        {ok, 4096, Row} =
+            erllama_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 2048, 512),
+        ?assertEqual(K, element(?POS_KEY, Row))
+    end).
+
+lookup_longest_prefix_returns_longest_test() ->
+    with_srv(fun() ->
+        Meta = prefix_key_meta(),
+        Tokens = lists:seq(1, 12000),
+        K2048 = prefix_key_for(lists:sublist(Tokens, 2048)),
+        K4096 = prefix_key_for(lists:sublist(Tokens, 4096)),
+        ok = erllama_cache_meta_srv:insert_available(K2048, ram, 100, <<"H">>, {ram}),
+        ok = erllama_cache_meta_srv:insert_available(K4096, ram, 100, <<"H">>, {ram}),
+        {ok, 4096, Row} =
+            erllama_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 2048, 512),
+        ?assertEqual(K4096, element(?POS_KEY, Row))
+    end).
+
+lookup_longest_prefix_floor_test() ->
+    with_srv(fun() ->
+        Meta = prefix_key_meta(),
+        Tokens = lists:seq(1, 1500),
+        %% Stride 2048 with 1500 tokens: aligned start = 0; never
+        %% reaches a checkable prefix length. Returns miss.
+        ?assertEqual(
+            miss,
+            erllama_cache_meta_srv:lookup_longest_prefix(Meta, Tokens, 2048, 512)
+        )
+    end).
+
 checkout_two_holders_independent_refcounts_test() ->
     with_srv(fun() ->
         ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),

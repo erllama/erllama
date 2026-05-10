@@ -33,6 +33,7 @@
     start_link/0,
     %% Read-only (no server hop)
     lookup_exact/1,
+    lookup_longest_prefix/4,
     %% Read with bounded wait for an in-flight save
     lookup_exact_or_wait/2,
     %% Claim/release (active reader of a slab)
@@ -113,6 +114,35 @@ lookup_exact(Key) ->
     {ok, tuple()} | miss.
 lookup_exact_or_wait(Key, MaxWaitMs) ->
     gen_server:call(?SERVER, {lookup_or_wait, Key, MaxWaitMs}, infinity).
+
+%% @doc Walk `Tokens` backward in `Stride` steps and return the row
+%% for the longest cached prefix. Pure ETS reads, no server hop. Used
+%% by stateless callers (HTTP front-end, agent loops) that resend a
+%% full conversation each turn and don't have a `parent_key` to
+%% thread.
+%%
+%% Stops at `MinTokens` floor and returns `miss` if nothing matches.
+%% Walks at most `length(Tokens) / Stride` rows; with the default
+%% 2048-token stride that's ~15 lookups for a 30k-token prompt.
+-spec lookup_longest_prefix(map(), [erllama_nif:token_id()], pos_integer(), pos_integer()) ->
+    {ok, pos_integer(), tuple()} | miss.
+lookup_longest_prefix(KeyMeta, Tokens, Stride, MinTokens) when
+    is_integer(Stride), Stride > 0, is_integer(MinTokens), MinTokens > 0
+->
+    Len = length(Tokens),
+    Start = (Len div Stride) * Stride,
+    Floor = max(MinTokens, Stride),
+    walk_prefix(KeyMeta, Tokens, Start, Stride, Floor).
+
+walk_prefix(_KeyMeta, _Tokens, N, _Stride, Floor) when N < Floor ->
+    miss;
+walk_prefix(KeyMeta, Tokens, N, Stride, Floor) ->
+    Prefix = lists:sublist(Tokens, N),
+    Key = erllama_cache_key:make(KeyMeta#{tokens => Prefix}),
+    case lookup_exact(Key) of
+        {ok, Row} -> {ok, N, Row};
+        miss -> walk_prefix(KeyMeta, Tokens, N - Stride, Stride, Floor)
+    end.
 
 -spec checkout(erllama_cache:cache_key(), pid()) ->
     {ok, reference(), erllama_cache:tier(), term(), binary(), term()}

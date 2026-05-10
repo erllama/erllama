@@ -314,6 +314,40 @@ lookup_or_resume(PromptTokens, ParentKey, Data) ->
         miss when ParentKey =/= undefined ->
             try_session_resume(PromptTokens, ParentKey, Data);
         miss ->
+            try_longest_prefix(PromptTokens, Data)
+    end.
+
+%% Stateless callers (HTTP front-end, agent loops that resend the
+%% full conversation each turn) don't have a parent_key to thread.
+%% Walk back through the prompt by stride and pick the longest
+%% cached prefix; fall through to cold if nothing matches.
+try_longest_prefix(PromptTokens, Data) ->
+    KeyMeta = #{
+        fingerprint => Data#data.fingerprint,
+        quant_type => Data#data.quant_type,
+        ctx_params_hash => Data#data.ctx_params_hash
+    },
+    Stride = maps:get(boundary_align_tokens, Data#data.policy, 2048),
+    Min = maps:get(min_tokens, Data#data.policy, 512),
+    case erllama_cache_meta_srv:lookup_longest_prefix(KeyMeta, PromptTokens, Stride, Min) of
+        {ok, PrefixLen, Row} ->
+            ParentTokens = load_tokens_from_row(Row, Data),
+            %% Belt-and-braces: the cache key encodes the tokens, so
+            %% a hit at PrefixLen implies the row's tokens equal the
+            %% first PrefixLen of the prompt. Verify before trusting.
+            case
+                length(ParentTokens) =:= PrefixLen andalso
+                    is_strict_prefix(ParentTokens, PromptTokens)
+            of
+                true ->
+                    Remaining = lists:nthtail(PrefixLen, PromptTokens),
+                    erllama_cache_counters:incr(?C_HITS_RESUME),
+                    {warm, ParentTokens, Remaining};
+                false ->
+                    erllama_cache_counters:incr(?C_MISSES),
+                    cold
+            end;
+        miss ->
             erllama_cache_counters:incr(?C_MISSES),
             cold
     end.

@@ -9,7 +9,15 @@
 %% @end
 -module(erllama_cache).
 
--export([get_counters/0, reset_counters/0, gc/0, evict_bytes/1, evict_bytes/2]).
+-export([
+    get_counters/0,
+    reset_counters/0,
+    gc/0,
+    evict_bytes/1,
+    evict_bytes/2,
+    lookup_longest_prefix/2,
+    lookup_longest_prefix/4
+]).
 
 -export_type([
     cache_key/0,
@@ -52,6 +60,24 @@ evict_bytes(TargetBytes) ->
     {evicted, non_neg_integer(), non_neg_integer()}.
 evict_bytes(TargetBytes, Tiers) ->
     erllama_cache_meta_srv:evict_bytes(TargetBytes, Tiers).
+
+%% @doc Find the longest cached prefix of `Tokens` for the given key
+%% namespace. Stride and floor default to the policy's
+%% `boundary_align_tokens` and `min_tokens`. Operator-friendly entry
+%% point for stateless callers (HTTP front-end, agent loops) that
+%% resend the full conversation each turn.
+-spec lookup_longest_prefix(map(), [non_neg_integer()]) ->
+    {ok, pos_integer(), tuple()} | miss.
+lookup_longest_prefix(KeyMeta, Tokens) ->
+    Stride = application:get_env(erllama, boundary_align_tokens, 2048),
+    Min = application:get_env(erllama, min_tokens, 512),
+    lookup_longest_prefix(KeyMeta, Tokens, Stride, Min).
+
+%% @doc Like `lookup_longest_prefix/2` with explicit stride and floor.
+-spec lookup_longest_prefix(map(), [non_neg_integer()], pos_integer(), pos_integer()) ->
+    {ok, pos_integer(), tuple()} | miss.
+lookup_longest_prefix(KeyMeta, Tokens, Stride, MinTokens) ->
+    erllama_cache_meta_srv:lookup_longest_prefix(KeyMeta, Tokens, Stride, MinTokens).
 
 -type cache_key() :: <<_:256>>.
 -type tier() :: ram | ram_file | disk.
