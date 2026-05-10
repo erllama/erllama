@@ -237,8 +237,10 @@ default_hostname(Meta) ->
 default_erllama_version(Meta) ->
     case maps:get(erllama_version, Meta, undefined) of
         undefined ->
-            {ok, V} = application:get_key(erllama, vsn),
-            list_to_binary(V);
+            case application:get_key(erllama, vsn) of
+                {ok, V} -> list_to_binary(V);
+                undefined -> <<"unknown">>
+            end;
         V ->
             V
     end.

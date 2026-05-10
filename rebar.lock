@@ -1,8 +1,4 @@
-{"1.2.0",
-[{<<"iommap">>,{pkg,<<"iommap">>,<<"1.1.0">>},0}]}.
-[
-{pkg_hash,[
- {<<"iommap">>, <<"78D6374DD088B16007B7101C3F698F9631D431079B11DE87CDEB4065B22A0273">>}]},
-{pkg_hash_ext,[
- {<<"iommap">>, <<"B0575796340A4316B74AC446728506AD71F58F45DEC2221663892AF4BA21BA39">>}]}
-].
+[{<<"iommap">>,
+  {git,"https://github.com/benoitc/erlang-iommap.git",
+       {ref,"c5ed20e2aed5d0deb710c58adf2ebc14a7a57959"}},
+  0}].
