@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 %% @doc
 %% Dynamic supervisor for `erllama_model` gen_statems. Each loaded
 %% model is one child started via `start_model/2`. simple_one_for_one

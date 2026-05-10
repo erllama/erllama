@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 %% erllama_cache: shared records, type aliases, and ETS row position constants.
 %%
 %% Position constants are referenced from erllama_cache_meta_srv via

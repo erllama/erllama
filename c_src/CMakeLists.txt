@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+# See the LICENSE file at the project root.
+
 cmake_minimum_required(VERSION 3.20)
 project(erllama_nif C CXX)
 

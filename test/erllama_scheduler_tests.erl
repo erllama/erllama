@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 -module(erllama_scheduler_tests).
 -behaviour(erllama_pressure).
 -include_lib("eunit/include/eunit.hrl").

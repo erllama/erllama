@@ -299,4 +299,7 @@ green on machines without a GGUF on hand.
 
 ## License
 
-Apache-2.0
+MIT — see `LICENSE`. Copyright (c) 2026 Benoit Chesneau.
+
+The vendored `c_src/llama.cpp/` retains its upstream MIT license; see
+`c_src/llama.cpp/LICENSE`.

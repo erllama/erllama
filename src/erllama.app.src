@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 {application, erllama, [
     {description,
         "Native Erlang/OTP wrapper around llama.cpp with OpenAI-compatible API and tiered KV cache"},
@@ -36,7 +39,7 @@
         }}
     ]},
     {modules, []},
-    {licenses, ["Apache-2.0"]},
+    {licenses, ["MIT"]},
     {links, []},
     %% Hex package manifest. Whitelist what to include and exclude
     %% the parts of vendored llama.cpp that are not needed at build

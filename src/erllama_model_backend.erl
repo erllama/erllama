@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 %% @doc
 %% Behaviour describing the operations the `erllama_model` gen_statem
 %% needs from a backing inference engine.

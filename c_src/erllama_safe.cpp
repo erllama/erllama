@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+// See the LICENSE file at the project root.
+
 // erllama_safe: C++-side shims around llama.cpp calls that can throw.
 //
 // llama.cpp exposes a C ABI but is implemented in C++. Some entry

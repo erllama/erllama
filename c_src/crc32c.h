@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+// See the LICENSE file at the project root.
+
 /*
  * RFC 3720 / iSCSI / SCTP CRC32C (Castagnoli polynomial 0x1EDC6F41).
  *

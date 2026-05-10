@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 %% @doc
 %% File-tier save orchestrator with a leak-proof ETS counting
 %% semaphore.

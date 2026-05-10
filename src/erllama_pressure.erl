@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 %% @doc
 %% Behaviour and helpers for memory-pressure samplers used by
 %% `erllama_scheduler`. A sampler is a stateless module that returns

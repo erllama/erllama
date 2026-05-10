@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 %% @doc
 %% NVIDIA GPU memory-pressure sampler. Aggregates VRAM usage across
 %% every GPU on the host via `nvidia-smi --query-gpu=memory.used,

@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 %% @doc
 %% System-memory pressure sampler backed by OTP's `memsup` (from
 %% `os_mon`). Portable across Linux, macOS, BSD, and Windows. Returns

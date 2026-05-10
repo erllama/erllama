@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 %% @doc
 %% Sole writer for the cache meta and LRU ETS tables; arbitrates
 %% claim/release and the reservation state machine for save

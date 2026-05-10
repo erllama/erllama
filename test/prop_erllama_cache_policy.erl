@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 -module(prop_erllama_cache_policy).
 -include_lib("proper/include/proper.hrl").
 

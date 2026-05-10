@@ -1,3 +1,6 @@
+%% Copyright (c) 2026 Benoit Chesneau. Licensed under the MIT License.
+%% See the LICENSE file at the project root.
+%%
 %% @doc
 %% Per-model gen_statem that drives the request flow and wires the
 %% cache subsystem into the model lifecycle.
