@@ -36,7 +36,11 @@
     decode_one/1,
     kv_pack/3,
     kv_unpack/3,
-    kv_seq_rm/4
+    kv_seq_rm/4,
+    apply_chat_template/2,
+    embed/2,
+    set_grammar/2,
+    clear_sampler/1
 ]).
 
 -on_load(init/0).
@@ -110,6 +114,34 @@ kv_unpack(Ctx, Bin, SeqId) -> nif_kv_unpack(Ctx, Bin, SeqId).
     ok | {error, atom()}.
 kv_seq_rm(Ctx, SeqId, P0, P1) -> nif_kv_seq_rm(Ctx, SeqId, P0, P1).
 
+%% Render a normalised chat request through the model's chat template
+%% (read from GGUF metadata) and tokenise the result. Request is a map
+%% with `messages`, optional `system`, optional `tools`. Returns a
+%% list of token ids on success.
+-spec apply_chat_template(model_ref(), map()) ->
+    {ok, [token_id()]} | {error, atom()}.
+apply_chat_template(Model, Request) when is_map(Request) ->
+    nif_apply_chat_template(Model, Request).
+
+%% Decode a token list and read the per-sequence pooled embedding
+%% vector. The context must have been opened with `embeddings => true`.
+-spec embed(context_ref(), [token_id()]) ->
+    {ok, [float()]} | {error, atom()}.
+embed(Ctx, Tokens) when is_list(Tokens) ->
+    nif_embed(Ctx, Tokens).
+
+%% Install a GBNF grammar on the context's sampler. Subsequent
+%% `decode_one/1` calls sample only tokens that keep the output on a
+%% valid grammar path. Use `clear_sampler/1` to drop the grammar
+%% (returns the context to greedy sampling on the next decode).
+-spec set_grammar(context_ref(), binary()) -> ok | {error, atom()}.
+set_grammar(Ctx, Grammar) when is_binary(Grammar) ->
+    nif_set_grammar(Ctx, Grammar).
+
+-spec clear_sampler(context_ref()) -> ok.
+clear_sampler(Ctx) ->
+    nif_clear_sampler(Ctx).
+
 %% =============================================================================
 %% NIF stubs (replaced at on_load time)
 %% =============================================================================
@@ -127,3 +159,7 @@ nif_decode_one(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_kv_pack(_Ctx, _Tokens, _NTokens) -> erlang:nif_error(nif_not_loaded).
 nif_kv_unpack(_Ctx, _Bin, _SeqId) -> erlang:nif_error(nif_not_loaded).
 nif_kv_seq_rm(_Ctx, _SeqId, _P0, _P1) -> erlang:nif_error(nif_not_loaded).
+nif_apply_chat_template(_Model, _Request) -> erlang:nif_error(nif_not_loaded).
+nif_embed(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
+nif_set_grammar(_Ctx, _Grammar) -> erlang:nif_error(nif_not_loaded).
+nif_clear_sampler(_Ctx) -> erlang:nif_error(nif_not_loaded).

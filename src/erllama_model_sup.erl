@@ -19,23 +19,23 @@ start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
 -doc """
-Start a model under this supervisor with ModelId as the local
-registered name. Returns the started pid.
+Start a model under this supervisor. ModelId is a binary; the model
+registers itself in `erllama_registry` under that key. Returns the
+started pid.
 """.
--spec start_model(atom(), map()) -> {ok, pid()} | {error, term()}.
-start_model(ModelId, Config) when is_atom(ModelId), is_map(Config) ->
+-spec start_model(binary(), map()) -> {ok, pid()} | {error, term()}.
+start_model(ModelId, Config) when is_binary(ModelId), is_map(Config) ->
     supervisor:start_child(?SERVER, [ModelId, Config]).
 
 -doc "Terminate a previously started model.".
--spec stop_model(atom() | pid()) -> ok | {error, term()}.
+-spec stop_model(binary() | pid()) -> ok | {error, term()}.
 stop_model(ModelOrPid) ->
-    Pid = pid_of(ModelOrPid),
-    case Pid of
+    case pid_of(ModelOrPid) of
         undefined -> {error, not_found};
-        _ -> supervisor:terminate_child(?SERVER, Pid)
+        Pid -> supervisor:terminate_child(?SERVER, Pid)
     end.
 
--doc "List currently-supervised model pids.".
+-doc "List currently-supervised model pids (raw supervisor view).".
 -spec models() -> [{undefined, pid(), worker, [module()]}].
 models() ->
     supervisor:which_children(?SERVER).
@@ -57,4 +57,4 @@ init([]) ->
     {ok, {SupFlags, [Child]}}.
 
 pid_of(Pid) when is_pid(Pid) -> Pid;
-pid_of(Name) when is_atom(Name) -> whereis(Name).
+pid_of(ModelId) when is_binary(ModelId) -> erllama_registry:whereis_name(ModelId).

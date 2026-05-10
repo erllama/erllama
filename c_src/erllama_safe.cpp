@@ -305,4 +305,101 @@ int erllama_safe_memory_seq_rm(struct llama_context *c, int seq_id,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Chat templating (bucket C, C-NIF)
+// ---------------------------------------------------------------------------
+
+// Returns the GGUF-stored chat template, or nullptr if the model has
+// none. Pass `name = nullptr` to get the default template; passing a
+// name selects a named alternate (rare).
+const char *erllama_safe_model_chat_template(const struct llama_model *m,
+                                             const char *name) noexcept {
+    try {
+        return llama_model_chat_template(m, name);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+// Renders messages through a chat template. Same return convention
+// as llama_chat_apply_template: bytes written, or negative
+// needed-size when the buffer is too small. INT32_MIN on a thrown
+// exception.
+int32_t erllama_safe_chat_apply_template(const char *tmpl,
+                                         const struct llama_chat_message *msgs,
+                                         size_t n_msgs,
+                                         bool add_assistant,
+                                         char *buf, int32_t buf_size) noexcept {
+    try {
+        return llama_chat_apply_template(tmpl, msgs, n_msgs, add_assistant,
+                                         buf, buf_size);
+    } catch (...) {
+        return INT32_MIN;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grammar sampler (bucket C, C-NIF)
+// ---------------------------------------------------------------------------
+
+// Returns a new grammar-aware sampler, or nullptr on a thrown
+// exception or invalid grammar.
+struct llama_sampler *
+erllama_safe_sampler_init_grammar(const struct llama_vocab *vocab,
+                                  const char *grammar_str,
+                                  const char *grammar_root) noexcept {
+    try {
+        return llama_sampler_init_grammar(vocab, grammar_str, grammar_root);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Embeddings (bucket C, C-NIF)
+// ---------------------------------------------------------------------------
+
+// Per-sequence pooled embedding vector. Returns nullptr if the
+// context was not created with embeddings = true, the model has no
+// pooling, or on a thrown exception.
+float *erllama_safe_get_embeddings_seq(struct llama_context *c,
+                                       int seq_id) noexcept {
+    try {
+        return llama_get_embeddings_seq(c, (llama_seq_id) seq_id);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+// Last-token (non-pooled) embedding. Used as a fallback for models
+// whose pooling_type is NONE.
+float *erllama_safe_get_embeddings(struct llama_context *c) noexcept {
+    try {
+        return llama_get_embeddings(c);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+// Returns the model's embedding dimension, or 0 on exception.
+int32_t erllama_safe_n_embd(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_n_embd(m);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Sets the embeddings flag on a live context. Lets a single context
+// be flipped to embeddings mode for a single call without
+// reallocation. Returns 0 on success, -1 on exception.
+int erllama_safe_set_embeddings(struct llama_context *c, bool value) noexcept {
+    try {
+        llama_set_embeddings(c, value);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
 }  // extern "C"

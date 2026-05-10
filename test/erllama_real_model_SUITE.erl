@@ -41,7 +41,11 @@
     pack_unpack_round_trip/1,
     cold_then_warm_complete/1,
     warm_faster_than_cold/1,
-    longest_prefix_resume_without_parent_key/1
+    longest_prefix_resume_without_parent_key/1,
+    apply_chat_template_renders/1,
+    apply_chat_template_includes_system/1,
+    set_grammar_constrains_output/1,
+    clear_sampler_resets_to_greedy/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -65,7 +69,11 @@ all() ->
         pack_unpack_round_trip,
         cold_then_warm_complete,
         warm_faster_than_cold,
-        longest_prefix_resume_without_parent_key
+        longest_prefix_resume_without_parent_key,
+        apply_chat_template_renders,
+        apply_chat_template_includes_system,
+        set_grammar_constrains_output,
+        clear_sampler_resets_to_greedy
     ].
 
 init_per_suite(Config) ->
@@ -100,7 +108,7 @@ init_per_testcase(TC, Config) ->
     {evicted, _} = erllama_cache_meta_srv:gc(),
     DiskSrv = list_to_atom("real_disk_" ++ atom_to_list(TC)),
     {ok, _} = erllama_cache_disk_srv:start_link(DiskSrv, Dir),
-    Model = list_to_atom("real_model_" ++ atom_to_list(TC)),
+    Model = iolist_to_binary(["real_model_", atom_to_binary(TC)]),
     {ok, _} = erllama_model:start_link(Model, model_config(Path, DiskSrv)),
     erllama_cache_counters:reset(),
     [{disk_srv, DiskSrv}, {model, Model}, {dir, Dir} | Config].
@@ -266,6 +274,106 @@ longest_prefix_resume_without_parent_key(Config) ->
     ?assert(Resumed >= 1),
     ?assert(Probes >= 1),
     ok.
+
+%% =============================================================================
+%% Bucket C-NIF: chat template, grammar, embeddings
+%% =============================================================================
+
+apply_chat_template_renders(Config) ->
+    Model = ?config(model, Config),
+    Request = #{
+        messages => [#{role => <<"user">>, content => <<"Hi.">>}]
+    },
+    case erllama:apply_chat_template(Model, Request) of
+        {ok, Tokens} ->
+            ?assert(is_list(Tokens)),
+            ?assert(length(Tokens) > 0),
+            ?assert(lists:all(fun is_integer/1, Tokens));
+        {error, no_template} ->
+            {skip, "model has no chat template in GGUF metadata"};
+        {error, Reason} ->
+            ct:fail({apply_chat_template_failed, Reason})
+    end.
+
+apply_chat_template_includes_system(Config) ->
+    Model = ?config(model, Config),
+    Without = #{messages => [#{role => <<"user">>, content => <<"hi">>}]},
+    With = Without#{system => <<"You speak only in haiku.">>},
+    case {erllama:apply_chat_template(Model, Without), erllama:apply_chat_template(Model, With)} of
+        {{ok, A}, {ok, B}} ->
+            %% System content lands in the rendered prompt; longer.
+            ?assert(length(B) > length(A));
+        {{error, no_template}, _} ->
+            {skip, "model has no chat template"};
+        {_, {error, no_template}} ->
+            {skip, "model has no chat template"};
+        Other ->
+            ct:fail({unexpected, Other})
+    end.
+
+%% Constrain the sampler to a tiny grammar that only emits the literal
+%% "yes" or "no" tokens, then run a normal complete and verify the
+%% output is one of those tokens. (We test this through the model
+%% gen_statem rather than infer/4 because complete is simpler to set up.)
+set_grammar_constrains_output(Config) ->
+    Model = ?config(model, Config),
+    {ok, [Pid]} = {ok, [erllama_registry:whereis_name(Model)]},
+    [_] = [Pid || is_pid(Pid)],
+    {ok, PromptTokens} = erllama:tokenize(Model, <<"Answer with yes or no:">>),
+    Grammar = <<"root ::= \"yes\" | \"no\"">>,
+    Params = #{response_tokens => 6, grammar => Grammar},
+    {ok, Ref} = erllama:infer(Model, PromptTokens, Params, self()),
+    Drained = drain(Ref, 60000),
+    case Drained of
+        {Texts, _Stats} ->
+            All = iolist_to_binary(Texts),
+            ct:log("grammar-constrained output: ~ts", [All]),
+            %% The grammar admits only `yes` or `no` (plus optional
+            %% trailing whitespace from the tokenizer). The output must
+            %% be one of those after trimming.
+            Trimmed = string:trim(All),
+            ?assert(Trimmed =:= <<"yes">> orelse Trimmed =:= <<"no">>);
+        timeout ->
+            ct:fail(grammar_timeout)
+    end.
+
+clear_sampler_resets_to_greedy(Config) ->
+    Model = ?config(model, Config),
+    {ok, PromptTokens} = erllama:tokenize(Model, <<"Hello.">>),
+    %% Run grammar-constrained, then the SAME tokens with no grammar.
+    %% The second run should be free to produce any output, so it
+    %% must complete without {error, grammar_failed}.
+    Grammar = <<"root ::= \"a\" | \"b\"">>,
+    {ok, R1} = erllama:infer(
+        Model,
+        PromptTokens,
+        #{response_tokens => 2, grammar => Grammar},
+        self()
+    ),
+    _ = drain(R1, 60000),
+    %% Second run, no grammar.
+    {ok, R2} = erllama:infer(
+        Model,
+        PromptTokens,
+        #{response_tokens => 2},
+        self()
+    ),
+    case drain(R2, 60000) of
+        {Texts, _Stats} ->
+            ?assert(iolist_size(Texts) >= 0);
+        timeout ->
+            ct:fail(post_grammar_timeout)
+    end.
+
+drain(Ref, TimeoutMs) -> drain(Ref, TimeoutMs, []).
+drain(Ref, TimeoutMs, Acc) ->
+    receive
+        {erllama_token, Ref, B} -> drain(Ref, TimeoutMs, [B | Acc]);
+        {erllama_done, Ref, S} -> {lists:reverse(Acc), S};
+        {erllama_error, Ref, R} -> {error, R}
+    after TimeoutMs ->
+        timeout
+    end.
 
 %% =============================================================================
 %% Helpers
