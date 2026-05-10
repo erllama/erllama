@@ -142,9 +142,13 @@ is the cheapest place to keep warm state.
 
 ### `policy`
 
-Per-model overrides of the cache save-policy gates configured at the
-application level. See the [caching guide](caching.md) for what each
-gate means.
+Optional per-model overrides of the cache save-policy gates. Any
+keys you omit fall back to the application defaults declared in
+`erllama.app.src` (`min_tokens`, `cold_min_tokens`,
+`cold_max_tokens`, `continued_interval`, `boundary_trim_tokens`,
+`boundary_align_tokens`, `session_resume_wait_ms`). See the
+[caching guide](caching.md) for what each gate means. Pass an empty
+map (or omit the key entirely) to use the defaults.
 
 ## Loading multiple models
 

@@ -305,7 +305,7 @@ init([ModelId, Config]) ->
                 quant_bits = maps:get(quant_bits, Config, 16),
                 ctx_params_hash = maps:get(ctx_params_hash, Config),
                 context_size = maps:get(context_size, Config, 4096),
-                policy = maps:get(policy, Config),
+                policy = resolve_policy(Config),
                 backend = Backend,
                 backend_state = BState,
                 prompt_tokens = [],
@@ -318,6 +318,20 @@ init([ModelId, Config]) ->
         {error, Reason} ->
             {stop, Reason}
     end.
+
+%% Per-model policy. Caller can override any subset; missing keys
+%% fall back to the app env defaults declared in `erllama.app.src`.
+resolve_policy(Config) ->
+    Defaults = #{
+        min_tokens => application:get_env(erllama, min_tokens, 512),
+        cold_min_tokens => application:get_env(erllama, cold_min_tokens, 512),
+        cold_max_tokens => application:get_env(erllama, cold_max_tokens, 30000),
+        continued_interval => application:get_env(erllama, continued_interval, 2048),
+        boundary_trim_tokens => application:get_env(erllama, boundary_trim_tokens, 32),
+        boundary_align_tokens => application:get_env(erllama, boundary_align_tokens, 2048),
+        session_resume_wait_ms => application:get_env(erllama, session_resume_wait_ms, 500)
+    },
+    maps:merge(Defaults, maps:get(policy, Config, #{})).
 
 terminate(_Reason, _State, #data{backend = B, backend_state = S}) ->
     B:terminate(S),
