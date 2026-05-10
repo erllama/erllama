@@ -47,9 +47,9 @@ its own supervisor, and never returns approximate matches.
   `sha256(model_fp || quant || ctx_params || tokens_le32)`. Same
   tokens, same key, guaranteed-correct restore.
 - **Three storage tiers.** ETS slabs for the hottest data, files
-  on `/dev/shm` for warm working set, on-disk files (read/write or
-  zero-copy `iommap`) for everything else. Each tier supervised
-  independently with its own quota and LRU.
+  on `/dev/shm` for warm working set, on-disk files (plain read
+  I/O) for everything else. Each tier supervised independently
+  with its own quota and LRU.
 - **Bigger than RAM.** Disk is a first-class tier, not a fallback.
   A 70B model in Q4 already takes ~40 GB of weights; the disk tier
   holds the warm KV state your working set needs without crowding
@@ -113,7 +113,7 @@ For the design rationale behind the cache:
 - [Publish protocol](internals/publish-protocol.md) — the
   five-stage crash-safe save protocol.
 - [NIF safety](internals/nif-safety.md) — two-resource lifetime,
-  exception shim, SIGBUS in `iommap` mode.
+  exception shim, why disk reads use plain `file:read_file/1`.
 
 ## A slightly longer example
 
@@ -198,7 +198,7 @@ erllama_sup
 │   ├── erllama_cache_meta_srv      sole writer; meta + LRU + reservations
 │   ├── erllama_cache_ram           RAM tier (ETS slabs)
 │   ├── erllama_cache_ramfile_srv   ram_file tier
-│   ├── erllama_cache_disk_srv      disk tier (read/write or iommap)
+│   ├── erllama_cache_disk_srv      disk tier (plain read/write I/O)
 │   └── erllama_cache_writer        writer pool, leak-proof semaphore
 ├── erllama_model_sup               simple_one_for_one for dynamic models
 └── erllama_scheduler               memory-pressure poller (off by default)

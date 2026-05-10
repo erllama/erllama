@@ -27,7 +27,6 @@ passed to `erllama:load_model/1,2`. This page is the full set.
   {evict_save_timeout_ms,  30000},
   {session_resume_wait_ms,   500},
   {fingerprint_mode,         safe},   %% safe | gguf_chunked | fast_unsafe
-  {disk_io,                  auto},   %% auto | iommap | read_write
 
   %% --------------- Memory-pressure scheduler ---------------------
   {scheduler, #{
@@ -84,19 +83,6 @@ How to verify the model fingerprint at load:
   Catches accidental corruption, not malicious tampering.
 - `fast_unsafe` — trust the supplied fingerprint blindly. Use only
   when you fingerprint upstream and pass the digest through.
-
-### `disk_io`
-
-How the disk tier reads slabs back into RAM:
-
-- `auto` — pick `iommap` on platforms where it is supported, fall
-  back to `read_write`.
-- `iommap` — zero-copy mmap into a refcounted region binary. Fast
-  and cheap on hot prefixes. Requires erllama to have exclusive
-  access to the cache directory; an external `truncate(2)` would
-  surface as SIGBUS.
-- `read_write` — `pread(2)` into a fresh binary. Slower but
-  immune to external file-system mutation.
 
 ### `scheduler`
 

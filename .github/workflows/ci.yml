@@ -7,17 +7,86 @@ on:
     branches: [main]
 
 jobs:
+  # ----- Static checks: run first, fail fast --------------------------------
+  xref:
+    name: XRef
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+      - uses: actions/cache@v5
+        with:
+          path: |
+            _build
+            ~/.cache/rebar3
+          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
+          restore-keys: |
+            build-ubuntu-24.04-otp-28-
+      - name: Run XRef
+        run: rebar3 xref
+
+  dialyzer:
+    name: Dialyzer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+      - name: Restore PLT cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            _build/*_plt
+            _build/*/rebar3_*_plt
+            ~/.cache/rebar3
+          key: plt-otp-28-${{ hashFiles('rebar.lock') }}
+          restore-keys: |
+            plt-otp-28-
+      - name: Run Dialyzer
+        run: rebar3 dialyzer
+
+  format:
+    name: erlfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+      - name: Run erlfmt --check
+        run: rebar3 fmt --check
+
+  lint:
+    name: Elvis lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+      - name: Run Elvis
+        run: rebar3 lint
+
+  # ----- Build + tests: gated on the static checks --------------------------
   build:
     name: Build OTP ${{ matrix.otp }} on ${{ matrix.os }}
+    needs: [xref, dialyzer, format, lint]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-13, macos-14]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15]
         otp: ['28']
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Erlang
         uses: erlef/setup-beam@v1
@@ -26,7 +95,7 @@ jobs:
           rebar3-version: '3.25.0'
 
       - name: Restore build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             _build
@@ -45,11 +114,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-13, macos-14]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-14, macos-15]
         otp: ['28']
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Erlang
         uses: erlef/setup-beam@v1
@@ -58,7 +127,7 @@ jobs:
           rebar3-version: '3.25.0'
 
       - name: Restore build cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             _build
@@ -75,12 +144,12 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '28'
           rebar3-version: '3.25.0'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             _build
@@ -96,12 +165,12 @@ jobs:
     needs: build
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
         with:
           otp-version: '28'
           rebar3-version: '3.25.0'
-      - uses: actions/cache@v4
+      - uses: actions/cache@v5
         with:
           path: |
             _build
@@ -113,95 +182,39 @@ jobs:
         run: rebar3 ct
 
   freebsd:
-    name: FreeBSD build + EUnit
+    name: FreeBSD ${{ matrix.release }}
+    needs: [xref, dialyzer, format, lint]
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['14.2', '14.4']
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build + test in FreeBSD VM
         uses: vmactions/freebsd-vm@v1
         with:
-          release: '14.4'
+          release: ${{ matrix.release }}
           usesh: true
           prepare: |
-            # The base `erlang` package on FreeBSD lags upstream
-            # (26.x as of 14.4); we require OTP >= 28. The ports
-            # tree ships per-major runtime packages — use the 28
-            # runtime directly. /usr/local/lib/erlang28/bin is its
-            # binaries dir; prepend to PATH.
-            pkg install -y erlang-runtime28 cmake bash gmake
+            # The cached VM image ships an older libpcre2 than git
+            # in the latest repo expects (PCRE2_10.47 not defined).
+            # Refresh first so git can load.
+            pkg install -y pcre2
+            # erlang-runtime28 is OTP 28 (base erlang is 26.x);
+            # binaries live under /usr/local/lib/erlang28/bin.
+            pkg install -y erlang-runtime28 cmake bash gmake git
           run: |
+            set -e
             export PATH="/usr/local/lib/erlang28/bin:/usr/local/bin:$PATH"
+            # llama.cpp's build-info cmake script invokes git
+            # rev-parse from inside the VM where the repo's owner
+            # differs from the user; allow it.
+            git config --global --add safe.directory '*'
             erl -eval 'io:format("OTP ~s~n", [erlang:system_info(otp_release)]), halt().' -noshell
             fetch https://github.com/erlang/rebar3/releases/download/3.25.0/rebar3 -o rebar3
             chmod +x rebar3
             ./rebar3 compile
-            ./rebar3 eunit
             ./rebar3 xref
-
-  dialyzer:
-    name: Dialyzer
-    needs: build
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: '28'
-          rebar3-version: '3.25.0'
-      - name: Restore PLT cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            _build/*_plt
-            _build/*/rebar3_*_plt
-            ~/.cache/rebar3
-          key: plt-otp-28-${{ hashFiles('rebar.lock') }}
-          restore-keys: |
-            plt-otp-28-
-      - name: Run Dialyzer
-        run: rebar3 dialyzer
-
-  format:
-    name: erlfmt
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: '28'
-          rebar3-version: '3.25.0'
-      - name: Run erlfmt --check
-        run: rebar3 fmt --check
-
-  lint:
-    name: Elvis lint
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: '28'
-          rebar3-version: '3.25.0'
-      - name: Run Elvis
-        run: rebar3 lint
-
-  xref:
-    name: XRef
-    needs: build
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: '28'
-          rebar3-version: '3.25.0'
-      - uses: actions/cache@v4
-        with:
-          path: |
-            _build
-            ~/.cache/rebar3
-          key: build-ubuntu-24.04-otp-28-${{ hashFiles('rebar.lock', 'c_src/llama.cpp/CMakeLists.txt') }}
-          restore-keys: |
-            build-ubuntu-24.04-otp-28-
-      - name: Run XRef
-        run: rebar3 xref
+            ./rebar3 dialyzer
+            ./rebar3 eunit

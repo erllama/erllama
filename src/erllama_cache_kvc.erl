@@ -228,10 +228,8 @@ build_tlv(Meta, Tokens) ->
 default_hostname(Meta) ->
     case maps:get(hostname, Meta, undefined) of
         undefined ->
-            case inet:gethostname() of
-                {ok, H} -> list_to_binary(H);
-                _ -> <<"unknown">>
-            end;
+            {ok, H} = inet:gethostname(),
+            list_to_binary(H);
         H ->
             H
     end.

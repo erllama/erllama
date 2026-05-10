@@ -53,7 +53,6 @@ init_per_suite(Config) ->
 
 end_per_suite(_Config) ->
     application:stop(erllama),
-    application:stop(iommap),
     ok.
 
 init_per_testcase(TC, Config) ->

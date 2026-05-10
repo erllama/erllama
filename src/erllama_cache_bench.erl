@@ -7,7 +7,7 @@ Microbench helpers for the cache subsystem.
 
 These do NOT measure realistic prefill / decode latency — that
 requires the real `erllama_nif` against llama.cpp (step 2b).
-What they do measure: framing / CRC / link-publish / iommap-load
+What they do measure: framing / CRC / link-publish / disk-load
 latency. Useful as a regression guard on the I/O path and as a
 template for the post-2b benchmark that will assert the >=10x
 cold-vs-warm speedup target on NVMe.

@@ -106,24 +106,24 @@ calling into llama. The C side double-checks; both layers must
 fail closed before we hand a context with no decode history to
 `llama_decode`.
 
-## SIGBUS and `iommap`
+## Disk reads: plain read I/O, not mmap
 
-The disk tier in `iommap` mode hands out refcounted region binaries
-that point directly into the mmap'd cache file. Reads happen
-**outside any NIF call** (sub-binary creation, message send,
-ets:insert, hashing, GC). If the underlying file is truncated by an
-external process, those reads can hit unmapped pages and produce
-SIGBUS in places no NIF handler can catch.
+The disk tier reads cache files via `file:read_file/1` into a fresh
+BEAM heap binary. mmap was an option in earlier revisions; we
+removed it because:
 
-We do not install a SIGBUS handler. The defence is exclusivity:
-`erllama_cache_disk_srv` takes `flock(LOCK_EX)` on a sentinel file
-at startup and refuses to start if the lock is held. That detects
-two erllama nodes; it does not detect an admin running
-`truncate(1)`.
+- The process already mmaps the GGUF (multi-GB on a 70B-class
+  model); a second mmap per cache restore doubles the VM footprint.
+- A region binary returned to the BEAM survives the closing NIF
+  call. Any external truncation of the cache file then crashes the
+  VM with SIGBUS in places no NIF can intercept (sub-binary
+  creation, message send, GC).
+- ds4 — the design erllama draws from — makes the same choice for
+  the same reasons.
 
-The `read_write` disk-io mode is the safe alternative — every read
-copies into a fresh binary, so external truncation only affects
-*future* reads. Use it on shared-storage deployments.
+For typical cache files (1–100 MB) the kernel page cache already
+makes the second `read(2)` cheap; mmap's zero-copy benefit only
+shows up at sizes where the trade-off ceases to be acceptable.
 
 ## `fsync_dir` and link durability
 

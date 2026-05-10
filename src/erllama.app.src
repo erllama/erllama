@@ -11,8 +11,7 @@
         kernel,
         stdlib,
         sasl,
-        crypto,
-        iommap
+        crypto
     ]},
     {env, [
         {tiers, [
@@ -27,7 +26,6 @@
         {evict_save_timeout_ms, 30000},
         {session_resume_wait_ms, 500},
         {fingerprint_mode, safe},
-        {disk_io, auto},
         {scheduler, #{
             enabled => false,
             pressure_source => noop,
@@ -54,7 +52,6 @@
         "AGENTS.md",
         "CLAUDE.md",
         "LICENSE",
-        "IOMMAP_PREREQUISITE.md",
         "UPDATE_LLAMA.md",
         "config",
         "src",
