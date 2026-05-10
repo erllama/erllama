@@ -160,6 +160,15 @@ lookup_longest_prefix_returns_longest_test() ->
         ?assertEqual(K4096, element(?POS_KEY, Row))
     end).
 
+evict_bytes_zero_is_noop_test() ->
+    with_srv(fun() ->
+        ok = erllama_cache_meta_srv:insert_available(key(1), ram, 100, <<"H">>, {ram}),
+        ok = erllama_cache_meta_srv:insert_available(key(2), ram, 200, <<"H">>, {ram}),
+        ?assertEqual({evicted, 0, 0}, erllama_cache_meta_srv:evict_bytes(0)),
+        ?assertMatch({ok, _}, erllama_cache_meta_srv:lookup_exact(key(1))),
+        ?assertMatch({ok, _}, erllama_cache_meta_srv:lookup_exact(key(2)))
+    end).
+
 lookup_longest_prefix_floor_test() ->
     with_srv(fun() ->
         Meta = prefix_key_meta(),

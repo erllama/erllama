@@ -358,7 +358,10 @@ handle_call({insert_available, Key, Tier, Size, Header, Location, TokensBin}, _F
 handle_call(gc, _From, S) ->
     Evicted = run_eviction(),
     {reply, {evicted, Evicted}, S};
-handle_call({evict_bytes, Target, Tiers}, _From, S) ->
+handle_call({evict_bytes, 0, _Tiers}, _From, S) ->
+    %% "Evict at least 0 bytes" is a no-op. Use gc/0 for full GC.
+    {reply, {evicted, 0, 0}, S};
+handle_call({evict_bytes, Target, Tiers}, _From, S) when Target > 0 ->
     {N, Bytes} = run_eviction_bytes(Target, tier_pred(Tiers)),
     {reply, {evicted, N, Bytes}, S};
 handle_call(_Msg, _From, S) ->
