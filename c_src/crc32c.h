@@ -17,8 +17,12 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Initialise the lookup table. Idempotent; safe to call multiple times. */
-void erllama_crc32c_init(void);
+/* Initialise the lookup table. Idempotent and thread-safe (uses
+ * pthread_once internally). Returns the pthread_once result: 0 on
+ * success, or the platform error code if the once-control could not
+ * be initialised (extremely rare; only happens for an invalid
+ * once-control or out-of-resources). */
+int erllama_crc32c_init(void);
 
 /* Update an existing CRC32C state with `len` bytes of `data`.
  *

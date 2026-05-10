@@ -13,8 +13,13 @@
 
 #include "llama.h"
 
+#include <climits>
 #include <new>
 #include <stdint.h>
+
+// Sentinel returned by erllama_safe_decode on a thrown exception.
+// Mirrors the macro in erllama_nif.c; both sides must agree.
+#define ERLLAMA_DECODE_EXC_SENTINEL INT_MIN
 
 extern "C" {
 
@@ -215,13 +220,13 @@ int32_t erllama_safe_tokenize(const struct llama_vocab *vocab,
 }
 
 // Returns 0 ok, llama's negative error codes on decode failure, or
-// INT_MIN on thrown exception.
+// ERLLAMA_DECODE_EXC_SENTINEL (INT_MIN) on a thrown exception.
 int erllama_safe_decode(struct llama_context *c,
                         struct llama_batch batch) noexcept {
     try {
         return llama_decode(c, batch);
     } catch (...) {
-        return -32768;  // distinct sentinel; llama's own codes are small ints
+        return ERLLAMA_DECODE_EXC_SENTINEL;
     }
 }
 
@@ -236,13 +241,16 @@ size_t erllama_safe_state_seq_get_size(struct llama_context *c,
     }
 }
 
+// Returns the number of bytes written, or SIZE_MAX on a thrown
+// exception. Distinguishing SIZE_MAX from "wrote zero bytes" lets
+// the caller surface a clean exception error.
 size_t erllama_safe_state_seq_get_data(struct llama_context *c,
                                        uint8_t *dst, size_t size,
                                        int seq_id) noexcept {
     try {
         return llama_state_seq_get_data(c, dst, size, (llama_seq_id) seq_id);
     } catch (...) {
-        return 0;
+        return SIZE_MAX;
     }
 }
 

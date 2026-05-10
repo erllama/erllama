@@ -22,12 +22,19 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* Sentinel returned by erllama_safe_decode when llama_decode threw a
+ * C++ exception. Distinct from any documented llama_decode return
+ * (currently 0/1/-1/2). Defined here and in erllama_safe.cpp; both
+ * sides must agree. */
+#define ERLLAMA_DECODE_EXC_SENTINEL INT_MIN
 
 #include "crc32c.h"
 #include "llama.h"
@@ -223,7 +230,9 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     (void) priv_data;
     (void) load_info;
 
-    erllama_crc32c_init();
+    if (erllama_crc32c_init() != 0) {
+        return -1;
+    }
     if (erllama_safe_backend_init() != 0) {
         return -1;
     }
@@ -687,6 +696,10 @@ static ERL_NIF_TERM nif_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     size_t written = erllama_safe_state_seq_get_data(
         c->ctx, out.data, out.size, seq_id);
     pthread_mutex_unlock(&c->mu);
+    if (written == SIZE_MAX) {
+        enif_release_binary(&out);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
     if (written == 0 || written > need) {
         enif_release_binary(&out);
         return enif_make_tuple2(env, atom_error, atom_pack_failed);
@@ -842,8 +855,17 @@ static ERL_NIF_TERM nif_prefill(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     const struct llama_vocab *vocab =
         model ? erllama_safe_model_get_vocab(model) : NULL;
     int32_t n_vocab = vocab ? erllama_safe_vocab_n_tokens(vocab) : 0;
+    /* Fail closed if the vocab lookup failed: without n_vocab we
+     * cannot validate token IDs, and an out-of-range positive ID
+     * would reach `id_to_token.at(id)` deep inside llama and throw
+     * a C++ exception across the C ABI. */
+    if (n_vocab <= 0) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
     for (int32_t i = 0; i < n; i++) {
-        if (n_vocab > 0 && tokens[i] >= n_vocab) {
+        if (tokens[i] >= n_vocab) {
             pthread_mutex_unlock(&c->mu);
             enif_free(tokens);
             return enif_make_tuple2(env, atom_error, atom_invalid_token);
@@ -854,7 +876,7 @@ static ERL_NIF_TERM nif_prefill(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
     if (dr == 0) c->decode_ready = 1;
     pthread_mutex_unlock(&c->mu);
     enif_free(tokens);
-    if (dr == -32768) {
+    if (dr == ERLLAMA_DECODE_EXC_SENTINEL) {
         return enif_make_tuple2(env, atom_error, atom_exception);
     }
     if (dr != 0) {
@@ -931,7 +953,7 @@ static ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     if (rc == 0) c->decode_ready = 1;
     else c->decode_ready = 0;
     pthread_mutex_unlock(&c->mu);
-    if (rc == -32768) {
+    if (rc == ERLLAMA_DECODE_EXC_SENTINEL) {
         return enif_make_tuple2(env, atom_error, atom_exception);
     }
     if (rc != 0) {
