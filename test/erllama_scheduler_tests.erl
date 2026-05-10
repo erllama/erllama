@@ -166,29 +166,30 @@ set_thresholds_test() ->
         ?assertMatch({error, _}, erllama_scheduler:set_thresholds(0.5, 0.9))
     end).
 
+%% Config validation is exercised directly through validate_config/1
+%% rather than spawning a gen_server with bad config: the latter would
+%% emit a SASL =CRASH REPORT= for every case and pollute every CI log.
+
 invalid_watermarks_at_init_test() ->
-    process_flag(trap_exit, true),
     Cfg = #{high_watermark => 0.5, low_watermark => 0.9},
-    {error, {invalid_config, {watermarks, _}}} =
-        gen_server:start(erllama_scheduler, [Cfg], []),
-    process_flag(trap_exit, false),
-    ok.
+    ?assertMatch(
+        {error, {invalid_config, {watermarks, _}}},
+        erllama_scheduler:validate_config(Cfg)
+    ).
 
 invalid_interval_zero_at_init_test() ->
-    process_flag(trap_exit, true),
     Cfg = #{interval_ms => 0},
-    {error, {invalid_config, {interval_ms, _}}} =
-        gen_server:start(erllama_scheduler, [Cfg], []),
-    process_flag(trap_exit, false),
-    ok.
+    ?assertMatch(
+        {error, {invalid_config, {interval_ms, _}}},
+        erllama_scheduler:validate_config(Cfg)
+    ).
 
 invalid_interval_negative_at_init_test() ->
-    process_flag(trap_exit, true),
     Cfg = #{interval_ms => -10},
-    {error, {invalid_config, {interval_ms, _}}} =
-        gen_server:start(erllama_scheduler, [Cfg], []),
-    process_flag(trap_exit, false),
-    ok.
+    ?assertMatch(
+        {error, {invalid_config, {interval_ms, _}}},
+        erllama_scheduler:validate_config(Cfg)
+    ).
 
 disk_tier_skipped_by_default_test() ->
     stub_set(95, 100),

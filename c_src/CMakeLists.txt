@@ -4,6 +4,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(erllama_nif C CXX)
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMake")
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -38,6 +40,10 @@ set(GGML_STATIC ON CACHE BOOL "" FORCE)
 # CUDA on Linux when enabled) are unaffected.
 set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
 
+# Silence "ccache not found" diagnostic from ggml when ccache is
+# not installed on the build host (FreeBSD CI VMs, fresh dev boxes).
+set(GGML_CCACHE OFF CACHE BOOL "" FORCE)
+
 # Backends we never ship in the vendored tree (sources are not present).
 set(GGML_VULKAN  OFF CACHE BOOL "" FORCE)
 set(GGML_SYCL    OFF CACHE BOOL "" FORCE)
@@ -68,17 +74,14 @@ endif()
 add_subdirectory(llama.cpp EXCLUDE_FROM_ALL)
 
 # -----------------------------------------------------------------------------
-# Erlang ERTS include dir
+# Erlang ERTS include dir (via FindErlang.cmake, copied from
+# erlang-rocksdb). Honour ERTS_INCLUDE_DIR if the caller pre-set it.
 # -----------------------------------------------------------------------------
-if(NOT DEFINED ENV{ERTS_INCLUDE_DIR})
-    execute_process(
-        COMMAND erl -noshell
-            -eval "io:format(\"~s\", [filename:join([code:root_dir(), \"erts-\" ++ erlang:system_info(version), \"include\"])])"
-            -s init stop
-        OUTPUT_VARIABLE ERTS_INCLUDE_DIR
-    )
-else()
+if(DEFINED ENV{ERTS_INCLUDE_DIR})
     set(ERTS_INCLUDE_DIR $ENV{ERTS_INCLUDE_DIR})
+else()
+    include(FindErlang)
+    set(ERTS_INCLUDE_DIR ${ERLANG_ERTS_INCLUDE_PATH})
 endif()
 
 # -----------------------------------------------------------------------------

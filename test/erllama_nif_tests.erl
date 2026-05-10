@@ -70,9 +70,16 @@ kv_pack_rejects_non_resource_test() ->
 kv_unpack_rejects_non_resource_test() ->
     ?assertError(badarg, erllama_nif:kv_unpack(make_ref(), <<>>, 0)).
 
-load_model_rejects_non_existent_path_test() ->
-    Result = erllama_nif:load_model(<<"/no/such/file.gguf">>, #{}),
-    ?assertMatch({error, _}, Result).
+%% First call to nif_load_model triggers the lazy
+%% llama_backend_init (pthread_once), which on macOS includes Metal
+%% device discovery and can take several seconds. eunit's default
+%% 5s case timeout is too tight for this even though the actual
+%% load_from_file failure path is fast.
+load_model_rejects_non_existent_path_test_() ->
+    {timeout, 60, fun() ->
+        Result = erllama_nif:load_model(<<"/no/such/file.gguf">>, #{}),
+        ?assertMatch({error, _}, Result)
+    end}.
 
 %% =============================================================================
 %% End-to-end smoke (gated by LLAMA_TEST_MODEL env var)

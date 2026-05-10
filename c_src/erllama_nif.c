@@ -65,6 +65,7 @@ extern int32_t erllama_safe_token_to_piece(const struct llama_vocab *vocab,
                                            int32_t lstrip,
                                            bool special);
 extern int erllama_safe_backend_init(void);
+extern int erllama_safe_backend_init_once(void);
 extern int erllama_safe_backend_free(void);
 extern struct llama_model *erllama_safe_model_load_from_file(
     const char *path, struct llama_model_params params);
@@ -119,7 +120,6 @@ extern int erllama_safe_memory_seq_rm(struct llama_context *c, int seq_id,
 
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_error;
-static ERL_NIF_TERM atom_not_implemented;
 static ERL_NIF_TERM atom_load_failed;
 static ERL_NIF_TERM atom_context_failed;
 static ERL_NIF_TERM atom_tokenize_failed;
@@ -260,13 +260,16 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     if (erllama_crc32c_init() != 0) {
         return -1;
     }
-    if (erllama_safe_backend_init() != 0) {
-        return -1;
-    }
+    /* llama_backend_init() is deferred to first model load via
+     * erllama_safe_backend_init_once(). NIF load only sets up
+     * resources and atoms. Cache-only and cache-test workloads
+     * never invoke ggml_backend_load_all, which on some platforms
+     * (notably FreeBSD when paired with another NIF that uses
+     * mmap and signal handlers) perturbs process state in ways
+     * that break unrelated code paths. */
 
     atom_ok = enif_make_atom(env, "ok");
     atom_error = enif_make_atom(env, "error");
-    atom_not_implemented = enif_make_atom(env, "not_implemented");
     atom_load_failed = enif_make_atom(env, "load_failed");
     atom_context_failed = enif_make_atom(env, "context_failed");
     atom_tokenize_failed = enif_make_atom(env, "tokenize_failed");
@@ -285,14 +288,12 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     MODEL_RT = enif_open_resource_type(
         env, NULL, "erllama_model", model_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!MODEL_RT) {
-        (void) erllama_safe_backend_free();
         return -1;
     }
 
     CTX_RT = enif_open_resource_type(
         env, NULL, "erllama_context", ctx_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!CTX_RT) {
-        (void) erllama_safe_backend_free();
         return -1;
     }
 
@@ -302,10 +303,9 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
 static void unload(ErlNifEnv *env, void *priv_data) {
     (void) env;
     (void) priv_data;
-    /* Counterpart to llama_backend_init in load(). Lets the BEAM
-     * reload the NIF (e.g. on hot upgrade) without leaking llama
-     * global state. We can't surface a failure from unload, but the
-     * exception is at least caught by the safe wrapper. */
+    /* If backend_init_once ran, free the global llama state so a
+     * NIF reload (hot upgrade, test runner) doesn't leak. If it
+     * never ran, llama_backend_free is a no-op. */
     (void) erllama_safe_backend_free();
 }
 
@@ -393,6 +393,10 @@ static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     }
     if (!enif_is_map(env, argv[1])) {
         return enif_make_badarg(env);
+    }
+
+    if (erllama_safe_backend_init_once() != 0) {
+        return enif_make_tuple2(env, atom_error, atom_load_failed);
     }
 
     struct llama_model_params params = llama_model_default_params();
@@ -613,7 +617,7 @@ static ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     if (get_map_bool(env, argv[2], "parse_special", &b)) parse_special = b;
 
     pthread_mutex_lock(&m->mu);
-    if (!m->model) {
+    if (!m->model || m->release_pending) {
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
@@ -1011,7 +1015,7 @@ static ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     }
 
     pthread_mutex_lock(&m->mu);
-    if (!m->model) {
+    if (!m->model || m->release_pending) {
         pthread_mutex_unlock(&m->mu);
         enif_free(tokens);
         return enif_make_tuple2(env, atom_error, atom_released);
@@ -1023,10 +1027,19 @@ static ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         return enif_make_tuple2(env, atom_error, atom_exception);
     }
     int32_t n_vocab = erllama_safe_vocab_n_tokens(vocab);
+    /* Fail closed if the vocab lookup gave us no usable size: without
+     * n_vocab we cannot validate token IDs, and an out-of-range
+     * positive ID would reach `id_to_token.at(id)` deep inside llama
+     * and throw across the C ABI. Mirrors the prefill path. */
+    if (n_vocab <= 0) {
+        pthread_mutex_unlock(&m->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_invalid_token);
+    }
     /* Validate before any token_to_piece call so out-of-range IDs do
      * not reach `id_to_token.at(id)` and trigger an internal throw. */
     for (int32_t i = 0; i < n; i++) {
-        if (n_vocab > 0 && tokens[i] >= n_vocab) {
+        if (tokens[i] >= n_vocab) {
             pthread_mutex_unlock(&m->mu);
             enif_free(tokens);
             return enif_make_tuple2(env, atom_error, atom_invalid_token);
@@ -1039,7 +1052,16 @@ static ERL_NIF_TERM nif_detokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
      * enough (it returns the negative needed size). The safe wrapper
      * returns INT32_MIN on a thrown C++ exception. */
     char small_piece[256];
-    size_t cap = (size_t) n * 32 + 16;
+    /* Guard the size computation: clamp n to a sane upper bound so
+     * gcc's range analysis can prove cap fits. 16M tokens is far
+     * beyond any realistic prompt; reject earlier rather than
+     * overflow. */
+    if (n < 0 || n > (1 << 24)) {
+        pthread_mutex_unlock(&m->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_too_large);
+    }
+    size_t cap = (size_t) n * 32u + 16u;
     char *out = enif_alloc(cap);
     if (!out) {
         pthread_mutex_unlock(&m->mu);
@@ -1131,6 +1153,12 @@ static ERL_NIF_TERM make_errno_atom(ErlNifEnv *env, int e) {
         case ENOTDIR:   name = "enotdir";   break;
         case EPERM:     name = "eperm";     break;
         case EROFS:     name = "erofs";     break;
+#ifdef EINTEGRITY
+        /* FreeBSD fsync(2) returns EINTEGRITY on filesystem
+         * integrity errors (ZFS checksum failure, ufs2 sb
+         * mismatch). Surface it instead of mapping to "unknown". */
+        case EINTEGRITY: name = "eintegrity"; break;
+#endif
         default:        name = "unknown";   break;
     }
     return enif_make_atom(env, name);
@@ -1158,14 +1186,6 @@ static ERL_NIF_TERM nif_fsync_dir(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
     return atom_ok;
 }
 
-/* =========================================================================
- * Suppress unused-stub warning for atom_not_implemented now that the
- * real API is in place.
- * ========================================================================= */
-static ERL_NIF_TERM use_atom_not_implemented(void) {
-    return atom_not_implemented;
-}
-
 static ErlNifFunc nif_funcs[] = {
     {"nif_crc32c",       1, nif_crc32c,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      3, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
@@ -1183,8 +1203,3 @@ static ErlNifFunc nif_funcs[] = {
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, unload)
-
-/* The unused_stub function is referenced once to satisfy -Wunused. */
-__attribute__((unused)) static void *_unused_anchor(void) {
-    return (void *) use_atom_not_implemented;
-}

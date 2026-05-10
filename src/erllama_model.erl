@@ -70,7 +70,7 @@ stubs get replaced; the cache integration is unaffected.
     prompt_tokens :: [non_neg_integer()],
     %% Tokens currently in the "context".
     context_tokens :: [non_neg_integer()],
-    response_target :: pos_integer(),
+    response_target :: non_neg_integer(),
     generated :: [non_neg_integer()],
     last_save_at :: non_neg_integer()
 }).

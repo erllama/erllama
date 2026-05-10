@@ -18,6 +18,7 @@
 
 #include <climits>
 #include <new>
+#include <pthread.h>
 #include <stdint.h>
 
 // Sentinel returned by erllama_safe_decode on a thrown exception.
@@ -114,6 +115,28 @@ int erllama_safe_backend_init(void) noexcept {
     } catch (...) {
         return -1;
     }
+}
+
+// Lazy-init wrapper: backend_init runs at most once across the
+// process. The NIF load path no longer eagerly invokes it; instead,
+// the first model load triggers this helper. This keeps cache-only
+// workloads (and unit tests that never touch llama) free of the
+// ggml_backend_load_all side effects, which on some platforms
+// (notably FreeBSD when paired with another NIF that registers
+// resources or signal handlers) can perturb process state in ways
+// that break unrelated code.
+int erllama_safe_backend_init_once(void) noexcept {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    static int rc = 0;
+    pthread_once(&once, []() noexcept {
+        try {
+            llama_backend_init();
+            rc = 0;
+        } catch (...) {
+            rc = -1;
+        }
+    });
+    return rc;
 }
 
 int erllama_safe_backend_free(void) noexcept {

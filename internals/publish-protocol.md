@@ -106,23 +106,15 @@ stages:
 This is what makes orphan adoption work: a writer can crash
 arbitrarily late and we still recover the bytes it wrote.
 
-## What `disk_io = iommap` adds
+## Read path: plain read I/O
 
-When the disk tier is in `iommap` mode, reads happen against a
-zero-copy refcounted region binary (`iommap:region_binary/3`). The
-reservation protocol stays the same; the read path changes.
-
-Cost of `iommap` is that erllama must have **exclusive** access to
-the cache directory. An external `truncate(2)` on a published file
-would invalidate live region binaries; the BEAM would surface that
-as a SIGBUS at message-send or sub-binary creation time. The disk
-tier server takes an advisory `flock(LOCK_EX)` on a sentinel file
-at startup to detect concurrent erllama processes; it does not
-defend against unrelated tools.
-
-The `read_write` mode does not have this problem because every read
-copies into a fresh binary. Pick `auto` and trust the platform's
-default.
+The disk tier reads cache files via `file:read_file/1` into a
+fresh BEAM heap binary. mmap was an option in earlier revisions
+but was removed: the process already mmaps the GGUF (multi-GB),
+and a region binary that survives the NIF call would expose the
+BEAM to SIGBUS from any external truncation. ds4 makes the same
+choice. See [internals/nif-safety.md](nif-safety.md) for the
+fuller rationale.
 
 ## Test surface
 

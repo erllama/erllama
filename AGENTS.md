@@ -71,7 +71,7 @@ erllama_cache_sup
 ├── erllama_cache_ramfile_sup
 │   └── erllama_cache_ramfile_srv  per ram_file root dir
 ├── erllama_cache_disk_sup
-│   └── erllama_cache_disk_srv     per disk root dir (iommap or read/write)
+│   └── erllama_cache_disk_srv     per disk root dir (plain read/write)
 └── erllama_cache_writer_pool  poolboy: dirty-IO save workers
 ```
 
@@ -94,10 +94,12 @@ save announce) go through `erllama_cache_meta_srv` via
   immediately before link to defeat stale-writer races. EEXIST is
   validated and either adopted or replaced under the current
   reservation; never silently skipped.
-- The cache directory is treated as erllama-exclusive when
-  `disk_io = iommap`. External truncation can crash the BEAM via
-  delayed SIGBUS in BEAM-internal binary access. The disk tier server
-  takes an advisory `flock(LOCK_EX)` on a sentinel file at startup.
+- Disk reads use plain `file:read_file/1` into a fresh BEAM heap
+  binary. mmap is deliberately avoided: the process already mmaps
+  multi-GB GGUF weights, so a second mapping per cache restore
+  doubles the VM footprint, and a region binary surviving the NIF
+  call would expose the BEAM to SIGBUS from any external truncation.
+  ds4 makes the same choice.
 
 ### Multi-turn warmth
 
@@ -158,8 +160,7 @@ The atom naming regex allows `_SUITE` suffix for CT suites:
 ## What to avoid
 
 - No `iolist_to_binary` flattening of multi-GB payloads. Use iolists
-  for `prim_file:write/2`; use multi-pwrite at distinct offsets for
-  iommap.
+  for `prim_file:write/2`.
 - No `ets:select_replace/2` on the hot path; the meta server is the
   arbitration authority.
 - No silent EEXIST handling on link; always validate-and-adopt or

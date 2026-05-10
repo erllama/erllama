@@ -49,7 +49,8 @@ The scheduler always starts (so it can be enabled at runtime via
     set_thresholds/2,
     sample/0,
     force_check/0,
-    status/0
+    status/0,
+    validate_config/1
 ]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).

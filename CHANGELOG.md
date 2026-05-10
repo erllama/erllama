@@ -17,8 +17,8 @@ Initial public release.
   construction, tokenisation, prefill, single-token decode, and
   KV pack/unpack.
 - Token-exact KV cache with three independently-supervised tiers:
-  RAM (ETS slabs), `ram_file` (`/dev/shm`), and disk (read+write
-  or zero-copy `iommap`).
+  RAM (ETS slabs), `ram_file` (`/dev/shm`), and disk (plain read
+  I/O).
 - Sole-writer arbitration through `erllama_cache_meta_srv`; reads
   on the hot path go to ETS directly.
 - Crash-safe save publish protocol: reserve, write_tmp, check,
