@@ -128,12 +128,16 @@ model_config(Path, DiskSrv) ->
         ctx_params_hash => crypto:hash(sha256, term_to_binary({2048, 512})),
         context_size => 2048,
         policy => #{
-            min_tokens => 8,
-            cold_min_tokens => 8,
+            min_tokens => 16,
+            cold_min_tokens => 16,
             cold_max_tokens => 4096,
             continued_interval => 64,
-            boundary_trim_tokens => 0,
-            boundary_align_tokens => 1,
+            %% trim 8 tail tokens before saving so the saved key
+            %% lands on a stable BPE boundary (the last few tokens
+            %% are the most likely to retokenize when the next
+            %% turn appends user text).
+            boundary_trim_tokens => 8,
+            boundary_align_tokens => 16,
             session_resume_wait_ms => 1000
         }
     }.
@@ -183,10 +187,13 @@ pack_unpack_round_trip(Config) ->
         Model, ?LONG_PROMPT, #{response_tokens => 8, seed => 42}
     ),
     After = erllama_cache:get_counters(),
-    ?assertEqual(
-        1,
-        maps:get(hits_exact, After) - maps:get(hits_exact, Before)
-    ),
+    %% Either path counts: with trim+align the cold save lands at
+    %% a trimmed prefix shorter than the full prompt, so the warm
+    %% lookup hits via longest-prefix (hits_resume) rather than exact.
+    Warm =
+        (maps:get(hits_exact, After) - maps:get(hits_exact, Before)) +
+            (maps:get(hits_resume, After) - maps:get(hits_resume, Before)),
+    ?assert(Warm >= 1),
     ?assert(byte_size(Reply2) > 0),
     Common = binary:longest_common_prefix([Reply1, Reply2]),
     ct:log("cold=~ts~nwarm=~ts~ncommon prefix bytes=~p", [Reply1, Reply2, Common]),
@@ -207,7 +214,13 @@ cold_then_warm_complete(Config) ->
         Model, ?LONG_PROMPT, #{response_tokens => 4}
     ),
     After = erllama_cache:get_counters(),
-    ?assert(maps:get(hits_exact, After) - maps:get(hits_exact, Mid) >= 1),
+    %% trim+align makes the saved key a strict prefix of the live
+    %% token list, so the warm lookup may hit via longest-prefix
+    %% (hits_resume) rather than exact. Either counts.
+    Warm =
+        (maps:get(hits_exact, After) - maps:get(hits_exact, Mid)) +
+            (maps:get(hits_resume, After) - maps:get(hits_resume, Mid)),
+    ?assert(Warm >= 1),
     ok.
 
 warm_faster_than_cold(Config) ->
@@ -228,13 +241,11 @@ warm_faster_than_cold(Config) ->
     ?assert(Warm =< Cold * 2),
     ok.
 
-%% Soft check that the longest-prefix path runs against real llama.cpp
-%% tokenization without crashing. We can't hard-assert hits_resume >= 1
-%% because BPE may retokenize across the appended-suffix boundary, in
-%% which case Prompt2's first N tokens won't equal Prompt1's tokens
-%% and the longest-prefix walk legitimately misses. The assertion in
-%% erllama_SUITE (stub backend, deterministic tokeniser) is the
-%% regression gate; this case logs only.
+%% Real-GGUF version of the longest-prefix path. The test policy
+%% uses boundary_trim_tokens = 8 and boundary_align_tokens = 16 so
+%% the cold save lands on a stable BPE boundary well inside the
+%% prompt. The next turn appends new text; even if BPE retokenizes
+%% around the join, the saved trimmed-prefix key still matches.
 longest_prefix_resume_without_parent_key(Config) ->
     Model = ?config(model, Config),
     Prompt1 = ?LONG_PROMPT,
@@ -245,7 +256,8 @@ longest_prefix_resume_without_parent_key(Config) ->
     {ok, _, _} = erllama_model:complete(Model, Prompt2, #{response_tokens => 2}),
     After = erllama_cache:get_counters(),
     Resumed = maps:get(hits_resume, After) - maps:get(hits_resume, Before),
-    ct:log("longest-prefix hits_resume delta = ~p (>= 1 means BPE preserved boundary)", [Resumed]),
+    ct:log("longest-prefix hits_resume delta = ~p", [Resumed]),
+    ?assert(Resumed >= 1),
     ok.
 
 %% =============================================================================

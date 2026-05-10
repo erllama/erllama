@@ -336,32 +336,28 @@ try_longest_prefix(PromptTokens, Data) ->
     Min = maps:get(min_tokens, Data#data.policy, 512),
     case erllama_cache_meta_srv:lookup_longest_prefix(KeyMeta, PromptTokens, Stride, Min) of
         {ok, PrefixLen, Row} ->
-            FoundKey = element(?POS_KEY, Row),
-            case pin_and_load(FoundKey, Data) of
-                {ok, ParentTokens} ->
-                    %% Belt-and-braces: the cache key encodes the
-                    %% tokens, so a hit at PrefixLen implies the
-                    %% row's tokens equal the first PrefixLen of the
-                    %% prompt. Verify before trusting.
-                    case
-                        length(ParentTokens) =:= PrefixLen andalso
-                            is_strict_prefix(ParentTokens, PromptTokens)
-                    of
-                        true ->
-                            Remaining = lists:nthtail(PrefixLen, PromptTokens),
-                            erllama_cache_counters:incr(?C_HITS_RESUME),
-                            {warm, ParentTokens, Remaining};
-                        false ->
-                            erllama_cache_counters:incr(?C_MISSES),
-                            cold
-                    end;
-                miss ->
-                    %% Race: row was evicted between the longest-prefix
-                    %% scan and our checkout. Treat as cold.
+            resume_at_prefix(element(?POS_KEY, Row), PrefixLen, PromptTokens, Data);
+        miss ->
+            erllama_cache_counters:incr(?C_MISSES),
+            cold
+    end.
+
+%% Pin + load the row, then verify the tokens really are the first
+%% PrefixLen of PromptTokens. The key is sha256 of the tokens, so a
+%% hit implies equality, but we belt-and-braces it here.
+resume_at_prefix(Key, PrefixLen, PromptTokens, Data) ->
+    case pin_and_load(Key, Data) of
+        {ok, ParentTokens} when length(ParentTokens) =:= PrefixLen ->
+            case is_strict_prefix(ParentTokens, PromptTokens) of
+                true ->
+                    Remaining = lists:nthtail(PrefixLen, PromptTokens),
+                    erllama_cache_counters:incr(?C_HITS_RESUME),
+                    {warm, ParentTokens, Remaining};
+                false ->
                     erllama_cache_counters:incr(?C_MISSES),
                     cold
             end;
-        miss ->
+        _ ->
             erllama_cache_counters:incr(?C_MISSES),
             cold
     end.
