@@ -28,6 +28,16 @@ set(GGML_BUILD_TESTS   OFF CACHE BOOL "" FORCE)
 set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(GGML_STATIC ON CACHE BOOL "" FORCE)
 
+# We link the ggml/llama static libs into a shared NIF .so. On Linux,
+# the system libgomp.a is built without -fPIC, so an OpenMP-enabled
+# static ggml-cpu drags in a non-PIC libgomp that fails to relocate
+# into our .so ("R_X86_64_TPOFF32 against hidden symbol gomp_tls_data
+# can not be used when making a shared object"). Disabling OpenMP at
+# the ggml level avoids the libgomp dependency entirely. The cost is
+# CPU-path parallelism inside ggml; the GPU paths (Metal on Apple,
+# CUDA on Linux when enabled) are unaffected.
+set(GGML_OPENMP OFF CACHE BOOL "" FORCE)
+
 # Backends we never ship in the vendored tree (sources are not present).
 set(GGML_VULKAN  OFF CACHE BOOL "" FORCE)
 set(GGML_SYCL    OFF CACHE BOOL "" FORCE)

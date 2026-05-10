@@ -2,14 +2,57 @@
 
 [![CI](https://github.com/erllama/erllama/actions/workflows/ci.yml/badge.svg)](https://github.com/erllama/erllama/actions/workflows/ci.yml)
 
-Native Erlang/OTP wrapper around `llama.cpp` with full supervision, a
-tiered KV cache, and memory-pressure-aware eviction.
+Native Erlang/OTP wrapper around `llama.cpp` with a **token-exact,
+multi-tier, supervised KV cache** that turns a multi-second prefill
+into a millisecond restore.
 
-The cache subsystem is the centrepiece: an inference run can save its
-KV state to disk and a later run with the same prompt resumes from
-that state in milliseconds instead of re-running prefill. The cache
-key is the `(model fingerprint, quant, ctx params, exact tokens)`
-tuple — hits are token-exact by construction.
+## Why the cache matters
+
+A 30 000-token prompt on TinyLlama is several seconds of prefill.
+Reload the same prefix from disk and you skip almost all of it: the
+saved KV state goes straight back into the model's context via
+`llama_state_seq_set_data`, then one extra decode regenerates the
+logits buffer. **One-shot reuse, multi-turn chat, and many concurrent
+agents that share a system prompt all hit the same fast path.**
+
+What the cache subsystem gives you:
+
+- **Token-exact hits.** Cache key is
+  `sha256(model_fp || quant || ctx_params_hash || tokens_le32)`.
+  Same tokens → same key → guaranteed-correct restore. No
+  approximate matching, no chance of "I think this is the same
+  prompt".
+- **Three tiers** — `ram` (ETS slabs), `ram_file` (`/dev/shm`),
+  `disk` (read+write or zero-copy `iommap`). Each tier is an
+  independently-supervised gen_server with its own quota.
+- **Stateless-client friendly.** A bare `erllama:complete/2` with
+  no `parent_key` walks the cache backward by the configured
+  stride to find the longest cached prefix of the request — same
+  pattern ds4 uses for OpenAI/Anthropic-shaped clients that resend
+  the full conversation each turn.
+- **Multi-turn warmth.** The session layer holds the previous
+  turn's cache key and passes it as `parent_key`; the cache waits
+  up to `session_resume_wait_ms` for an in-flight `finish` save
+  to publish before falling through to cold.
+- **Five save reasons** — `cold`, `continued`, `finish`, `evict`,
+  `shutdown` — fired automatically by the per-model gen_statem.
+  Async (writer pool) for the first three, sync for the last two.
+- **Crash-safe publish protocol.** `reserve_save → write_tmp →
+  check_reservation → link(2) → mark_published → announce_saved`,
+  with two-stage TTL-elastic cleanup that adopts a valid orphan
+  file on writer crash and replaces a corrupt one.
+- **Persisted hit counters.** Every warm read bumps a u32 in the
+  on-disk header so popular prefixes survive an LRU walk after a
+  server restart.
+- **Memory-pressure-driven eviction.** `erllama_scheduler` polls a
+  pluggable source (`memsup`, `nvidia-smi`, or a custom callback)
+  and asks the cache to evict slabs above a watermark. RAM tiers
+  only by default — disk fills up to its own quota.
+- **End-to-end metrics.** `erllama_cache:get_counters()` exposes
+  hits/misses/saves/evictions and per-path latency totals
+  (`pack_total_ns`, `load_total_ns`, `longest_prefix_ns/_probes`).
+
+## Quick taste
 
 ```erlang
 {ok, _} = application:ensure_all_started(erllama).
@@ -18,28 +61,22 @@ tuple — hits are token-exact by construction.
     model_path  => "/srv/models/tinyllama-1.1b-chat.gguf",
     %% ...cache + context fields, see "Configuration" below
 }).
-{ok, Reply, _Tokens} = erllama:complete(M, <<"Once upon a time">>).
+%% First call: cold, runs the full prefill.
+{ok, Reply1, _} = erllama:complete(M, <<"Once upon a time">>).
+%% Second call with the same prompt: warm hit via the cold-save row.
+{ok, Reply2, _} = erllama:complete(M, <<"Once upon a time">>).
+%% Stateless callers: no parent_key needed — longest-prefix walk
+%% finds the cached row even when the new prompt is the old prompt
+%% plus extra tokens.
+{ok, Reply3, _} = erllama:complete(M, <<"Once upon a time, in a quiet village">>).
 ```
-
-Multi-turn chat reuses the previous turn's saved state via the
-session-layer `parent_key` mechanism; the cache layer waits up to
-`session_resume_wait_ms` for an in-flight `finish` save to publish
-before falling through to cold prefill.
 
 ## Status
 
-**Pre-release (`v0.1`).** The cache subsystem, scheduler, and the
-NIF surface for llama.cpp are implemented and covered by 157 EUnit +
-11 PropEr + 5 stub Common Test cases. An end-to-end CT suite gated on
-`LLAMA_TEST_MODEL` runs against a real GGUF (5 cases, all passing
-locally with TinyLlama 1.1B Q4_K_M).
-
-Out of scope for `v1`:
-
-- Semantic candidate proposer (vector-index-driven warmth) — deferred to v2.
-- KV state compression (TurboQuant or generic lz4/zstd) — uncompressed in v1.
-- Sampler / RNG state persistence for mid-stream resume — turn boundaries only.
-- HTTP API (Cowboy + OpenAI-compat) — not yet wired.
+**Pre-release.** Cache, scheduler, NIF: 166 EUnit + 11 PropEr +
+7 stub Common Test cases. End-to-end CT suite gated on
+`LLAMA_TEST_MODEL` (6 cases, passing locally with TinyLlama 1.1B
+Q4_K_M).
 
 ## Requirements
 
