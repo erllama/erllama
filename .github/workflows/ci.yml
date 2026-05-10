@@ -202,7 +202,7 @@ jobs:
             # tree ships per-major runtime packages — use the 28
             # runtime directly. /usr/local/lib/erlang28/bin is its
             # binaries dir; prepend to PATH.
-            pkg install -y erlang-runtime28 cmake bash gmake
+            pkg install -y erlang-runtime28 cmake bash gmake git
           run: |
             set -e
             export PATH="/usr/local/lib/erlang28/bin:/usr/local/bin:$PATH"
