@@ -183,7 +183,7 @@ longest_prefix_resume_without_parent_key(Config) ->
     Before = erllama_cache:get_counters(),
     {ok, _, _} = erllama_model:complete(Model, Prompt2, #{response_tokens => 2}),
     After = erllama_cache:get_counters(),
-    Resumed = maps:get(hits_resume, After) - maps:get(hits_resume, Before),
+    Resumed = maps:get(hits_longest_prefix, After) - maps:get(hits_longest_prefix, Before),
     ?assert(Resumed >= 1),
     ok.
 

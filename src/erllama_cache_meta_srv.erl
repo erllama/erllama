@@ -135,21 +135,29 @@ lookup_exact_or_wait(Key, MaxWaitMs) ->
 lookup_longest_prefix(KeyMeta, Tokens, Stride, MinTokens) when
     is_integer(Stride), Stride > 0, is_integer(MinTokens), MinTokens > 0
 ->
+    T0 = erlang:monotonic_time(nanosecond),
     Len = length(Tokens),
     Start = (Len div Stride) * Stride,
     Floor = max(MinTokens, Stride),
     AllTokensBin = erllama_cache_key:encode_tokens(Tokens),
     #{fingerprint := Fp, quant_type := QT, ctx_params_hash := CtxHash} = KeyMeta,
-    walk_prefix(Fp, QT, CtxHash, AllTokensBin, Start, Stride, Floor).
+    Result = walk_prefix(Fp, QT, CtxHash, AllTokensBin, Start, Stride, Floor, 0),
+    Elapsed = erlang:monotonic_time(nanosecond) - T0,
+    erllama_cache_counters:add(?C_LONGEST_PREFIX_NS, max(Elapsed, 0)),
+    Result.
 
-walk_prefix(_Fp, _QT, _CtxHash, _Bin, N, _Stride, Floor) when N < Floor ->
+walk_prefix(_Fp, _QT, _CtxHash, _Bin, N, _Stride, Floor, Probes) when N < Floor ->
+    erllama_cache_counters:add(?C_LONGEST_PREFIX_PROBES, Probes),
     miss;
-walk_prefix(Fp, QT, CtxHash, Bin, N, Stride, Floor) ->
+walk_prefix(Fp, QT, CtxHash, Bin, N, Stride, Floor, Probes) ->
     PrefixBin = binary:part(Bin, 0, N * 4),
     Key = erllama_cache_key:make(Fp, QT, CtxHash, PrefixBin),
     case lookup_exact(Key) of
-        {ok, Row} -> {ok, N, Row};
-        miss -> walk_prefix(Fp, QT, CtxHash, Bin, N - Stride, Stride, Floor)
+        {ok, Row} ->
+            erllama_cache_counters:add(?C_LONGEST_PREFIX_PROBES, Probes + 1),
+            {ok, N, Row};
+        miss ->
+            walk_prefix(Fp, QT, CtxHash, Bin, N - Stride, Stride, Floor, Probes + 1)
     end.
 
 -spec checkout(erllama_cache:cache_key(), pid()) ->

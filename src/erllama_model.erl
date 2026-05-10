@@ -351,7 +351,7 @@ resume_at_prefix(Key, PrefixLen, PromptTokens, Data) ->
             case is_strict_prefix(ParentTokens, PromptTokens) of
                 true ->
                     Remaining = lists:nthtail(PrefixLen, PromptTokens),
-                    erllama_cache_counters:incr(?C_HITS_RESUME),
+                    erllama_cache_counters:incr(?C_HITS_LONGEST_PREFIX),
                     {warm, ParentTokens, Remaining};
                 false ->
                     erllama_cache_counters:incr(?C_MISSES),
@@ -397,28 +397,33 @@ try_session_resume(PromptTokens, ParentKey, Data) ->
 %% Eviction never selects a refcount > 0 row, so the load itself is
 %% safe; the only failure mode is the row already being gone.
 pin_and_load(Key, Data) ->
-    case erllama_cache_meta_srv:checkout(Key, self()) of
-        {ok, HolderRef, Tier, Loc, _Header, TokensBin} ->
-            Bin = load_payload(Tier, Loc, Key, Data),
-            case Bin of
-                <<>> ->
-                    ok = erllama_cache_meta_srv:checkin(HolderRef),
-                    miss;
-                _ ->
-                    ok = backend_call(Data, kv_unpack, [Bin]),
-                    ok = erllama_cache_meta_srv:checkin(HolderRef),
-                    Tokens =
-                        case TokensBin of
-                            undefined -> [];
-                            _ -> erllama_cache_key:decode_tokens(TokensBin)
-                        end,
-                    {ok, Tokens}
-            end;
-        {error, busy} ->
-            miss;
-        miss ->
-            miss
-    end.
+    T0 = erlang:monotonic_time(nanosecond),
+    Result =
+        case erllama_cache_meta_srv:checkout(Key, self()) of
+            {ok, HolderRef, Tier, Loc, _Header, TokensBin} ->
+                Bin = load_payload(Tier, Loc, Key, Data),
+                case Bin of
+                    <<>> ->
+                        ok = erllama_cache_meta_srv:checkin(HolderRef),
+                        miss;
+                    _ ->
+                        ok = backend_call(Data, kv_unpack, [Bin]),
+                        ok = erllama_cache_meta_srv:checkin(HolderRef),
+                        Tokens =
+                            case TokensBin of
+                                undefined -> [];
+                                _ -> erllama_cache_key:decode_tokens(TokensBin)
+                            end,
+                        {ok, Tokens}
+                end;
+            {error, busy} ->
+                miss;
+            miss ->
+                miss
+        end,
+    Elapsed = erlang:monotonic_time(nanosecond) - T0,
+    erllama_cache_counters:add(?C_LOAD_TOTAL_NS, max(Elapsed, 0)),
+    Result.
 
 load_payload(ram, _Loc, Key, _Data) ->
     case erllama_cache_ram:load(Key) of
@@ -445,7 +450,10 @@ fire_save_if(false, _Reason, _Tokens, _Data) ->
     ok;
 fire_save_if(true, Reason, Tokens, Data) ->
     BuildMeta = build_meta_for(Reason, Tokens, Data),
+    T0 = erlang:monotonic_time(nanosecond),
     Payload = backend_call(Data, kv_pack, [Tokens]),
+    Elapsed = erlang:monotonic_time(nanosecond) - T0,
+    erllama_cache_counters:add(?C_PACK_TOTAL_NS, max(Elapsed, 0)),
     _ = erllama_cache_writer:save(
         Data#data.tier_srv, Data#data.tier, BuildMeta, Payload, 0
     ),

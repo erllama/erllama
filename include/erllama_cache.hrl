@@ -44,7 +44,14 @@
 -define(C_BYTES_RAMFILE, 14).
 -define(C_BYTES_DISK, 15).
 -define(C_DUPLICATE_DROPPED, 16).
--define(C_NSLOTS, 16).
+%% Longest-prefix walk profiling. probes is the running sum of probes
+%% attempted across all walks; probes / (hits_longest_prefix + misses)
+%% gives the average walk depth. ns is total monotonic time spent in
+%% the walk.
+-define(C_HITS_LONGEST_PREFIX, 17).
+-define(C_LONGEST_PREFIX_PROBES, 18).
+-define(C_LONGEST_PREFIX_NS, 19).
+-define(C_NSLOTS, 19).
 
 %% Public types live in `erllama_cache.erl`. Refer to them as
 %% `erllama_cache:cache_key()` etc. from outside this header.

@@ -192,7 +192,8 @@ pack_unpack_round_trip(Config) ->
     %% lookup hits via longest-prefix (hits_resume) rather than exact.
     Warm =
         (maps:get(hits_exact, After) - maps:get(hits_exact, Before)) +
-            (maps:get(hits_resume, After) - maps:get(hits_resume, Before)),
+            (maps:get(hits_resume, After) - maps:get(hits_resume, Before)) +
+            (maps:get(hits_longest_prefix, After) - maps:get(hits_longest_prefix, Before)),
     ?assert(Warm >= 1),
     ?assert(byte_size(Reply2) > 0),
     Common = binary:longest_common_prefix([Reply1, Reply2]),
@@ -219,7 +220,8 @@ cold_then_warm_complete(Config) ->
     %% (hits_resume) rather than exact. Either counts.
     Warm =
         (maps:get(hits_exact, After) - maps:get(hits_exact, Mid)) +
-            (maps:get(hits_resume, After) - maps:get(hits_resume, Mid)),
+            (maps:get(hits_resume, After) - maps:get(hits_resume, Mid)) +
+            (maps:get(hits_longest_prefix, After) - maps:get(hits_longest_prefix, Mid)),
     ?assert(Warm >= 1),
     ok.
 
@@ -255,9 +257,12 @@ longest_prefix_resume_without_parent_key(Config) ->
     Before = erllama_cache:get_counters(),
     {ok, _, _} = erllama_model:complete(Model, Prompt2, #{response_tokens => 2}),
     After = erllama_cache:get_counters(),
-    Resumed = maps:get(hits_resume, After) - maps:get(hits_resume, Before),
-    ct:log("longest-prefix hits_resume delta = ~p", [Resumed]),
+    Resumed = maps:get(hits_longest_prefix, After) - maps:get(hits_longest_prefix, Before),
+    Probes = maps:get(longest_prefix_probes, After) - maps:get(longest_prefix_probes, Before),
+    Ns = maps:get(longest_prefix_ns, After) - maps:get(longest_prefix_ns, Before),
+    ct:log("longest-prefix hits=~p probes=~p ns=~p", [Resumed, Probes, Ns]),
     ?assert(Resumed >= 1),
+    ?assert(Probes >= 1),
     ok.
 
 %% =============================================================================

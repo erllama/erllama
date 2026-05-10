@@ -180,6 +180,7 @@ Per-model config (passed to `erllama:load_model/1,2`):
 |---|---|
 | `hits_exact` | Lookups that hit a published row by exact key. |
 | `hits_resume` | Lookups that took the `parent_key` resume path (strict-prefix verified). |
+| `hits_longest_prefix` | Lookups that found a cached prefix via the stride walk (no `parent_key` supplied). |
 | `misses` | Lookups that fell through to cold prefill. |
 | `saves_cold` | Async cold saves at the trimmed prefix. |
 | `saves_continued` | Async continued saves every `continued_interval` tokens. |
@@ -189,8 +190,11 @@ Per-model config (passed to `erllama:load_model/1,2`):
 | `evictions` | Rows the meta server has actually dropped. |
 | `corrupt_files` | Files rejected by parse + deleted by the load path. |
 | `duplicate_dropped` | Save reservations short-circuited by `already_present`. |
+| `pack_total_ns` | Cumulative monotonic-time spent in `kv_pack` calls (save path). Divide by saves to get average pack cost. |
+| `load_total_ns` | Cumulative monotonic-time spent in `pin_and_load` (warm-read path: checkout + tier load + kv_unpack + checkin). Divide by exact+resume+longest-prefix hits to get average load cost. |
+| `longest_prefix_probes` | Sum of probes across all `lookup_longest_prefix` calls. Divide by `hits_longest_prefix + misses` (since the last call) to get average walk depth. |
+| `longest_prefix_ns` | Cumulative time spent in the longest-prefix walk. With `longest_prefix_probes` gives ns/probe. |
 | `bytes_ram`, `bytes_ramfile`, `bytes_disk` | Reserved for tier byte accounting. |
-| `pack_total_ns`, `load_total_ns` | Reserved for latency histograms. |
 
 ### `erllama_scheduler` — memory-pressure-driven eviction
 
