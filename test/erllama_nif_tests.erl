@@ -105,3 +105,125 @@ live_smoke(Path) ->
     ?assert(is_binary(Bin)),
     ok = erllama_nif:free_context(Ctx),
     ok = erllama_nif:free_model(Model).
+
+%% =============================================================================
+%% Hardening guards (gated by LLAMA_TEST_MODEL)
+%% =============================================================================
+
+prefill_context_overflow_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                prefill_overflow(
+                    list_to_binary(Path),
+                    #{n_ctx => 64, n_batch => 64},
+                    100,
+                    context_overflow
+                )
+            end}
+    end.
+
+prefill_batch_overflow_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                prefill_overflow(
+                    list_to_binary(Path),
+                    #{n_ctx => 4096, n_batch => 32},
+                    64,
+                    batch_overflow
+                )
+            end}
+    end.
+
+embed_context_overflow_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                embed_overflow(
+                    list_to_binary(Path),
+                    #{n_ctx => 64, n_batch => 64, embeddings => true},
+                    100,
+                    context_overflow
+                )
+            end}
+    end.
+
+apply_chat_template_invalid_content_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() -> bad_content(list_to_binary(Path)) end}
+    end.
+
+prefill_fuzz_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        _Path ->
+            {timeout, 300, fun() ->
+                true = proper:quickcheck(
+                    prop_erllama_nif:prop_prefill_never_crashes(),
+                    [{numtests, 100}, {to_file, user}]
+                )
+            end}
+    end.
+
+%% Helpers --------------------------------------------------------------------
+
+prefill_overflow(Path, CtxOpts, NTokens, ExpectedAtom) ->
+    {ok, Model} = erllama_nif:load_model(Path, #{n_gpu_layers => 0}),
+    {ok, Ctx} = erllama_nif:new_context(Model, CtxOpts),
+    try
+        ?assertEqual(
+            {error, ExpectedAtom},
+            erllama_nif:prefill(Ctx, lists:seq(1, NTokens))
+        )
+    after
+        ok = erllama_nif:free_context(Ctx),
+        ok = erllama_nif:free_model(Model)
+    end.
+
+embed_overflow(Path, CtxOpts, NTokens, ExpectedAtom) ->
+    {ok, Model} = erllama_nif:load_model(Path, #{n_gpu_layers => 0}),
+    {ok, Ctx} = erllama_nif:new_context(Model, CtxOpts),
+    try
+        ?assertEqual(
+            {error, ExpectedAtom},
+            erllama_nif:embed(Ctx, lists:seq(1, NTokens))
+        )
+    after
+        ok = erllama_nif:free_context(Ctx),
+        ok = erllama_nif:free_model(Model)
+    end.
+
+bad_content(Path) ->
+    {ok, Model} = erllama_nif:load_model(Path, #{n_gpu_layers => 0}),
+    Req = #{
+        messages => [
+            #{
+                role => <<"user">>,
+                content => [
+                    #{
+                        <<"type">> => <<"text">>,
+                        <<"text">> => <<"hi">>
+                    }
+                ]
+            }
+        ]
+    },
+    try
+        ?assertEqual(
+            {error, invalid_content},
+            erllama_nif:apply_chat_template(Model, Req)
+        )
+    after
+        ok = erllama_nif:free_model(Model)
+    end.
