@@ -420,36 +420,35 @@ verify(Model, PrefixTokens, Candidates, K) ->
 init([ModelId, Config]) ->
     Backend = maps:get(backend, Config, erllama_model_stub),
     case Backend:init(Config) of
-        {ok, BState} ->
-            Fp = maps:get(fingerprint, Config, default_fingerprint()),
-            Data = #data{
-                model_id = ModelId,
-                tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
-                tier = maps:get(tier, Config, ram),
-                fingerprint = Fp,
-                fingerprint_mode = maps:get(fingerprint_mode, Config, safe),
-                quant_type = maps:get(quant_type, Config, f16),
-                quant_bits = maps:get(quant_bits, Config, 16),
-                ctx_params_hash = maps:get(ctx_params_hash, Config, default_ctx_params_hash()),
-                context_size = maps:get(context_size, Config, 4096),
-                policy = resolve_policy(Config),
-                backend = Backend,
-                backend_state = BState,
-                adapters = [],
-                %% No adapters at boot -> effective fp == base fp.
-                effective_fp = Fp,
-                loaded_at_monotonic = erlang:monotonic_time(nanosecond),
-                vram_estimate_b = compute_vram_estimate(Backend, BState),
-                prompt_tokens = [],
-                context_tokens = [],
-                response_target = 0,
-                generated = [],
-                last_save_at = 0
-            },
-            {ok, idle, Data};
-        {error, Reason} ->
-            {stop, Reason}
+        {ok, BState} -> {ok, idle, build_init_data(ModelId, Config, Backend, BState)};
+        {error, Reason} -> {stop, Reason}
     end.
+
+build_init_data(ModelId, Config, Backend, BState) ->
+    Fp = maps:get(fingerprint, Config, default_fingerprint()),
+    #data{
+        model_id = ModelId,
+        tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
+        tier = maps:get(tier, Config, ram),
+        fingerprint = Fp,
+        fingerprint_mode = maps:get(fingerprint_mode, Config, safe),
+        quant_type = maps:get(quant_type, Config, f16),
+        quant_bits = maps:get(quant_bits, Config, 16),
+        ctx_params_hash = maps:get(ctx_params_hash, Config, default_ctx_params_hash()),
+        context_size = maps:get(context_size, Config, 4096),
+        policy = resolve_policy(Config),
+        backend = Backend,
+        backend_state = BState,
+        adapters = [],
+        effective_fp = Fp,
+        loaded_at_monotonic = erlang:monotonic_time(nanosecond),
+        vram_estimate_b = compute_vram_estimate(Backend, BState),
+        prompt_tokens = [],
+        context_tokens = [],
+        response_target = 0,
+        generated = [],
+        last_save_at = 0
+    }.
 
 %% Best-effort: ask the backend for the byte size, total layer count,
 %% and n_gpu_layers it captured at load time. Backends without the
