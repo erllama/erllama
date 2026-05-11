@@ -48,8 +48,13 @@ init([]) ->
     },
     Child = #{
         id => erllama_model,
+        %% temporary: a model that crashes in init / first call (bad
+        %% path, OOM, unsupported quant) will keep crashing the same
+        %% way. Auto-restarting drains the supervisor intensity budget
+        %% and cascades up the tree. Failed loads stay dead; the
+        %% caller surfaces the error and re-loads explicitly.
         start => {erllama_model, start_link, []},
-        restart => transient,
+        restart => temporary,
         shutdown => 5000,
         type => worker,
         modules => [erllama_model]

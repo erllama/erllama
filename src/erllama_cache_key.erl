@@ -31,17 +31,35 @@
 -type quant_type() ::
     f32
     | f16
+    | bf16
     | q4_0
     | q4_1
     | q5_0
     | q5_1
     | q8_0
+    | q2_k
+    | q3_k_s
+    | q3_k_m
+    | q3_k_l
     | q4_k_m
     | q4_k_s
     | q5_k_m
     | q5_k_s
     | q6_k
-    | q8_k.
+    | q8_k
+    | iq1_s
+    | iq1_m
+    | iq2_xxs
+    | iq2_xs
+    | iq2_s
+    | iq2_m
+    | iq3_xxs
+    | iq3_xs
+    | iq3_s
+    | iq3_m
+    | iq4_nl
+    | iq4_xs
+    | atom().
 
 -type components() :: #{
     fingerprint := <<_:256>>,
@@ -98,7 +116,29 @@ quant_byte(q4_k_s) -> 8;
 quant_byte(q5_k_m) -> 9;
 quant_byte(q5_k_s) -> 10;
 quant_byte(q6_k) -> 11;
-quant_byte(q8_k) -> 12.
+quant_byte(q8_k) -> 12;
+quant_byte(q2_k) -> 13;
+quant_byte(q3_k_s) -> 14;
+quant_byte(q3_k_m) -> 15;
+quant_byte(q3_k_l) -> 16;
+quant_byte(iq2_xxs) -> 17;
+quant_byte(iq2_xs) -> 18;
+quant_byte(iq2_s) -> 19;
+quant_byte(iq2_m) -> 20;
+quant_byte(iq3_xxs) -> 21;
+quant_byte(iq3_xs) -> 22;
+quant_byte(iq3_s) -> 23;
+quant_byte(iq3_m) -> 24;
+quant_byte(iq1_s) -> 25;
+quant_byte(iq1_m) -> 26;
+quant_byte(iq4_nl) -> 27;
+quant_byte(iq4_xs) -> 28;
+quant_byte(bf16) -> 29;
+%% Catch-all: any future or unknown quant atom maps to byte 255 so the
+%% cache key derivation never crashes. Cache buckets are already
+%% differentiated by the model fingerprint, so conflating several
+%% unknown labels into byte 255 is harmless.
+quant_byte(_) -> 255.
 
 -spec quant_atom(0..255) -> {ok, quant_type()} | {error, unknown_quant}.
 quant_atom(0) -> {ok, f32};
@@ -114,6 +154,23 @@ quant_atom(9) -> {ok, q5_k_m};
 quant_atom(10) -> {ok, q5_k_s};
 quant_atom(11) -> {ok, q6_k};
 quant_atom(12) -> {ok, q8_k};
+quant_atom(13) -> {ok, q2_k};
+quant_atom(14) -> {ok, q3_k_s};
+quant_atom(15) -> {ok, q3_k_m};
+quant_atom(16) -> {ok, q3_k_l};
+quant_atom(17) -> {ok, iq2_xxs};
+quant_atom(18) -> {ok, iq2_xs};
+quant_atom(19) -> {ok, iq2_s};
+quant_atom(20) -> {ok, iq2_m};
+quant_atom(21) -> {ok, iq3_xxs};
+quant_atom(22) -> {ok, iq3_xs};
+quant_atom(23) -> {ok, iq3_s};
+quant_atom(24) -> {ok, iq3_m};
+quant_atom(25) -> {ok, iq1_s};
+quant_atom(26) -> {ok, iq1_m};
+quant_atom(27) -> {ok, iq4_nl};
+quant_atom(28) -> {ok, iq4_xs};
+quant_atom(29) -> {ok, bf16};
 quant_atom(_) -> {error, unknown_quant}.
 
 -spec encode_tokens([non_neg_integer()]) -> binary().
