@@ -297,13 +297,13 @@ init([ModelId, Config]) ->
         {ok, BState} ->
             Data = #data{
                 model_id = ModelId,
-                tier_srv = maps:get(tier_srv, Config),
-                tier = maps:get(tier, Config),
-                fingerprint = maps:get(fingerprint, Config),
+                tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
+                tier = maps:get(tier, Config, ram),
+                fingerprint = maps:get(fingerprint, Config, default_fingerprint()),
                 fingerprint_mode = maps:get(fingerprint_mode, Config, safe),
                 quant_type = maps:get(quant_type, Config, f16),
                 quant_bits = maps:get(quant_bits, Config, 16),
-                ctx_params_hash = maps:get(ctx_params_hash, Config),
+                ctx_params_hash = maps:get(ctx_params_hash, Config, default_ctx_params_hash()),
                 context_size = maps:get(context_size, Config, 4096),
                 policy = resolve_policy(Config),
                 backend = Backend,
@@ -338,6 +338,16 @@ terminate(_Reason, _State, #data{backend = B, backend_state = S}) ->
     ok;
 terminate(_Reason, _State, _Data) ->
     ok.
+
+%% Placeholder fingerprint when none supplied. The cache key still
+%% segregates rows by this 32-byte tag, so different models that share
+%% the default never collide unless their tokens + ctx params also
+%% match - but pass a real fingerprint in production.
+default_fingerprint() ->
+    binary:copy(<<0>>, 32).
+
+default_ctx_params_hash() ->
+    binary:copy(<<0>>, 32).
 
 %% =============================================================================
 %% State: idle

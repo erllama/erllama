@@ -8,13 +8,6 @@ passed to `erllama:load_model/1,2`. This page is the full set.
 
 ```erlang
 {erllama, [
-  %% --------------- Tiers -----------------------------------------
-  {tiers, [
-    #{backend => ram,                              quota_mb => 4096},
-    #{backend => {ram_file, "/dev/shm/erllama"},   quota_mb => 16384},
-    #{backend => {disk, "/var/lib/erllama/kvc"},   quota_mb => 65536}
-  ]},
-
   %% --------------- Save-policy gates -----------------------------
   {min_tokens,             512},
   {cold_min_tokens,        512},
@@ -41,19 +34,21 @@ passed to `erllama:load_model/1,2`. This page is the full set.
 ]}.
 ```
 
-### `tiers`
+### Tiers
 
-A list of tier specs, in the order erllama should consult them. Each
-entry is a map:
+The RAM tier (`erllama_cache_ram`) starts automatically with the
+application. For `ram_file` or `disk` tiers, start an
+`erllama_cache_disk_srv` per root in your own supervision tree (or
+from a release start hook) and pass its registered name as `tier_srv`
+on the relevant `load_model/1,2` call:
 
-| Key | Type | Notes |
-|---|---|---|
-| `backend` | `ram` \| `{ram_file, Path}` \| `{disk, Path}` | Tier kind. |
-| `quota_mb` | non_neg_integer | Soft byte budget. The tier evicts to keep itself under this. |
-| `name` | atom | Optional registered name; defaults to `default_<kind>`. |
+```erlang
+{ok, _} = erllama_cache_disk_srv:start_link(my_disk,    "/var/lib/erllama/kvc"),
+{ok, _} = erllama_cache_ramfile_srv:start_link(my_shm,  "/dev/shm/erllama").
+```
 
-The first tier is preferred for new saves unless the per-model
-`tier` option overrides.
+There is no single `tiers` env key in v0.1: per-process supervision
+gives you crisper restart semantics than a static list.
 
 ### Save-policy gates
 
@@ -130,5 +125,7 @@ See [loading a model](loading.md) for the per-field walkthrough.
 #{enabled => true, pressure_source => system, ...}
 
 3> erllama_cache_meta_srv:dump().
-[#{key => <<...>>, tier => disk, size => 8388608, ...}]
+%% List of raw ETS tuples; see include/erllama_cache.hrl for the
+%% position layout.
+[{<<_:256>>, disk, 8388608, _, 0, available, _, _, _, 4}, ...]
 ```
