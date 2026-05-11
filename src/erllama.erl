@@ -59,7 +59,8 @@ an explicit `model_id` in the config map.
     counters/0,
     vram_info/0,
     queue_depth/0,
-    list_cached_prefixes/2
+    list_cached_prefixes/2,
+    draft_tokens/3
 ]).
 
 -export_type([model/0, model_id/0, model_info/0]).
@@ -354,6 +355,77 @@ list_cached_prefixes(ModelId, PromptTokens) when is_binary(ModelId), is_list(Pro
                 {ok, MatchLen, _Row} -> {ok, MatchLen};
                 miss -> {ok, 0}
             end
+    end.
+
+-doc """
+Synchronous speculative draft. Generates up to `max` next-token
+ids from the model given the supplied prefix and returns them as
+a list. The list may be shorter than `max` if the model hits EOS
+or its response_tokens limit first; an empty list is valid.
+
+Implementation reuses `infer/4` and collects the
+`{erllama_token_id, Ref, Id}` messages it emits, so the path is
+identical to ordinary streaming inference apart from the
+synchronous reply. The 30 s default timeout cancels the
+underlying request and drains any pending messages so they do
+not leak into the caller's mailbox.
+
+Used by the upcoming erllama_cluster speculative-decoding
+strategy to produce K candidate tokens for verification.
+""".
+-spec draft_tokens(
+    model_id(),
+    [erllama_nif:token_id()],
+    #{max => pos_integer(), atom() => term()}
+) ->
+    {ok, [erllama_nif:token_id()]} | {error, term()}.
+draft_tokens(_ModelId, [], _Opts) ->
+    {error, empty_prefix};
+draft_tokens(ModelId, PrefixTokens, Opts) when
+    is_binary(ModelId), is_list(PrefixTokens), is_map(Opts)
+->
+    Params = draft_params(Opts),
+    case erllama:infer(ModelId, PrefixTokens, Params, self()) of
+        {ok, Ref} -> collect_draft_tokens(Ref, [], 30_000);
+        {error, _} = E -> E
+    end.
+
+draft_params(Opts) ->
+    case maps:find(max, Opts) of
+        {ok, Max} when is_integer(Max), Max > 0 ->
+            #{response_tokens => Max};
+        _ ->
+            #{}
+    end.
+
+collect_draft_tokens(Ref, Acc, Timeout) ->
+    receive
+        {erllama_token_id, Ref, Id} ->
+            collect_draft_tokens(Ref, [Id | Acc], Timeout);
+        {erllama_token, Ref, _Bin} ->
+            collect_draft_tokens(Ref, Acc, Timeout);
+        {erllama_done, Ref, _Stats} ->
+            {ok, lists:reverse(Acc)};
+        {erllama_error, Ref, Reason} ->
+            {error, Reason}
+    after Timeout ->
+        ok = erllama:cancel(Ref),
+        ok = drain_draft(Ref),
+        {error, timeout}
+    end.
+
+%% Drain any messages still in transit after a timeout-driven
+%% cancel so the caller's mailbox stays clean. A short tail
+%% timeout is enough; the model's cancel handling fires the
+%% terminal {erllama_done, _, _} or {erllama_error, _, _} within
+%% one inter-token boundary.
+drain_draft(Ref) ->
+    receive
+        {erllama_token, Ref, _} -> drain_draft(Ref);
+        {erllama_token_id, Ref, _} -> drain_draft(Ref);
+        {erllama_done, Ref, _} -> ok;
+        {erllama_error, Ref, _} -> ok
+    after 100 -> ok
     end.
 
 %% =============================================================================

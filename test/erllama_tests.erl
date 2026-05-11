@@ -28,3 +28,14 @@ list_cached_prefixes_unloaded_model_test() ->
     after
         ok = application:stop(erllama)
     end.
+
+%% =============================================================================
+%% draft_tokens/3
+%% =============================================================================
+
+draft_tokens_empty_prefix_test() ->
+    %% Short-circuits before infer/4, so no app required.
+    ?assertEqual(
+        {error, empty_prefix},
+        erllama:draft_tokens(<<"any">>, [], #{max => 4})
+    ).

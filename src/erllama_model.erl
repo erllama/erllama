@@ -221,7 +221,11 @@ Streaming inference. Admits a request and immediately returns a
 unique `reference()`; tokens are delivered to `CallerPid` via
 asynchronous messages:
 
-- `{erllama_token, Ref, binary()}` per generated token (text fragment)
+- `{erllama_token, Ref, binary()}` per generated token (text fragment;
+  suppressed when the detokenized binary is empty)
+- `{erllama_token_id, Ref, integer()}` per generated token (always
+  delivered, including for tokens whose text fragment is empty;
+  used by speculative-decoding collectors)
 - `{erllama_done, Ref, stats()}` on normal completion
 - `{erllama_error, Ref, term()}` on failure
 
@@ -919,6 +923,12 @@ stream_emit(
         _ ->
             ok
     end,
+    %% Token-id message always lands, even for tokens whose
+    %% detokenized binary is empty (special tokens, BPE merges
+    %% with no visible bytes). Speculative-decoding collectors
+    %% need every produced id; the existing text-only consumers
+    %% (erllama_server) ignore this tag.
+    Pid ! {erllama_token_id, Ref, Token},
     Data;
 stream_emit(_Token, Data = #data{mode = standard}) ->
     Data.
