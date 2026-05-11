@@ -316,6 +316,36 @@ LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.gguf \
 
 Bumping the vendored llama.cpp: see [UPDATE_LLAMA.md](UPDATE_LLAMA.md).
 
+## Coming next: erllama_cluster
+
+A separate OTP application is in development to coordinate a fleet of
+erllama nodes into a single inference cluster. Each node continues to
+run erllama as a standalone library — local model loading, local KV
+cache, local inference. The cluster layer sits on top and decides
+which node serves which request.
+
+Three distribution strategies, all in v1:
+
+- **Request distribution** with pluggable load-balancing and
+  cache-affinity routing — follow-up requests prefer the node that
+  warmed the KV cache for the prefix.
+- **Speculative decoding across nodes** — small draft model on one
+  node, large verifier on another, coordinated per request.
+- **Pipeline parallelism** — models too large for one node split by
+  layer ranges across multiple nodes, hidden states passed between
+  shards as Erlang binaries.
+
+Transport is QUIC, via Erlang distribution carried over
+[erlang_quic](https://github.com/benoitc/erlang_quic) — a pure Erlang
+QUIC implementation, no C NIF in the protocol path. Circuit breakers
+per `{Node, ModelId}` driven by `nodeup`/`nodedown` rather than
+application-level pings. A globally registered scheduler handles
+cluster-wide GPU budgeting and on-demand model placement, with local
+fallback schedulers elected by `pg` quorum on network partition.
+
+Repository: <https://github.com/erllama/erllama_cluster> (under
+construction).
+
 ## Acknowledgements
 
 Same idea as [antirez/ds4](https://github.com/antirez/ds4).
