@@ -63,13 +63,23 @@ inference, etc.) can plug in via this same surface.
     {ok, [float()]} | {error, term()}.
 
 %% Optional. Configure the per-request sampler with a GBNF grammar.
-%% Called by `erllama_model` immediately before the first decode_one
-%% of an inference. Returning `{ok, NewState}` lets the backend swap
-%% in a state holding the grammar-aware sampler. Reset is called at
-%% the end of the request via `clear_sampler/1`. Backends that
-%% ignore grammar can omit both callbacks.
+%% Equivalent to `configure_sampler(state(), #{grammar => Grammar})`.
+%% Kept for backwards compatibility; new code should call
+%% `configure_sampler/2`.
 -callback set_grammar(state(), Grammar :: binary() | undefined) ->
     {ok, state()} | {error, term()}.
+
+%% Optional. Configure the per-request sampler from a config map.
+%% Called by `erllama_model` immediately before the first decode_one
+%% of an inference; the chain is reset to greedy on
+%% `clear_sampler/1`. Backends that ignore sampling can omit it.
+%%
+%% Recognised keys (all optional): `grammar`, `repetition_penalty`,
+%% `top_k`, `top_p`, `min_p`, `temperature`, `seed`. See
+%% `erllama_nif:configure_sampler/2` for the precise semantics.
+-callback configure_sampler(state(), sampler_opts()) ->
+    {ok, state()} | {error, term()}.
+
 -callback clear_sampler(state()) -> {ok, state()} | {error, term()}.
 
 -optional_callbacks([
@@ -77,8 +87,21 @@ inference, etc.) can plug in via this same surface.
     apply_chat_template/2,
     embed/2,
     set_grammar/2,
+    configure_sampler/2,
     clear_sampler/1
 ]).
+
+-type sampler_opts() :: #{
+    grammar => binary(),
+    repetition_penalty => float(),
+    top_k => non_neg_integer(),
+    top_p => float(),
+    min_p => float(),
+    temperature => float(),
+    seed => non_neg_integer()
+}.
+
+-export_type([sampler_opts/0]).
 
 -type chat_request() :: #{
     messages := [chat_message()],

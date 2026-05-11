@@ -46,7 +46,8 @@ stubs get replaced; the cache integration is unaffected.
     tokenize/2,
     detokenize/2,
     apply_chat_template/2,
-    embed/2
+    embed/2,
+    get_backend_state/1
 ]).
 
 -export_type([
@@ -83,10 +84,12 @@ stubs get replaced; the cache integration is unaffected.
     cancelled := boolean()
 }.
 
-%% Optional fields the caller may set on `infer/4`. `parent_key` and
-%% `response_tokens` mirror the existing `complete/3` opts; the rest
-%% are placeholders for sampling settings that bucket C will wire to
-%% the llama.cpp sampler.
+%% Optional fields the caller may set on `infer/4`. The same fields
+%% are honoured by `complete/3` Opts. The sampler chain is rebuilt
+%% per-request: grammar -> repetition_penalty -> top_k -> top_p ->
+%% min_p -> (temperature > 0 ? temp -> dist(seed) : greedy). `stop`
+%% is reserved for a future stop-sequence implementation; not used
+%% in 0.1.
 -type infer_params() :: #{
     response_tokens => pos_integer(),
     parent_key => term(),
@@ -94,7 +97,8 @@ stubs get replaced; the cache integration is unaffected.
     top_p => float(),
     top_k => pos_integer(),
     min_p => float(),
-    seed => integer(),
+    repetition_penalty => float(),
+    seed => non_neg_integer(),
     stop => [binary()],
     grammar => binary(),
     _ => _
@@ -291,6 +295,15 @@ embed(Model, Tokens) when is_list(Tokens) ->
 
 callback_mode() -> state_functions.
 
+%% Test-only: returns the current backend state. Used by sampler
+%% plumbing tests to assert that configure_sampler/2 lands the right
+%% map on the stub backend. Not part of the public API; the test
+%% suite is the only caller.
+-doc false.
+get_backend_state(Model) ->
+    {_State, Data} = sys:get_state(via(Model)),
+    Data#data.backend_state.
+
 init([ModelId, Config]) ->
     Backend = maps:get(backend, Config, erllama_model_stub),
     case Backend:init(Config) of
@@ -374,24 +387,28 @@ idle(EventType, EventContent, Data) ->
     handle_common(idle, EventType, EventContent, Data).
 
 start_complete(From, Prompt, Opts, Data) ->
-    PromptTokens = backend_call(Data, tokenize, [Prompt]),
-    Data1 = Data#data{
-        mode = standard,
-        caller = From,
-        caller_pid = undefined,
-        request_ref = undefined,
-        cancel_pending = false,
-        prompt_tokens = PromptTokens,
-        response_target = maps:get(response_tokens, Opts, 4),
-        generated = [],
-        prefill_started_at = erlang:monotonic_time(millisecond)
-    },
-    enter_after_lookup(maps:get(parent_key, Opts, undefined), Data1).
+    case configure_sampler_for(Opts, Data) of
+        {ok, Data0} ->
+            PromptTokens = backend_call(Data0, tokenize, [Prompt]),
+            Data1 = Data0#data{
+                mode = standard,
+                caller = From,
+                caller_pid = undefined,
+                request_ref = undefined,
+                cancel_pending = false,
+                prompt_tokens = PromptTokens,
+                response_target = maps:get(response_tokens, Opts, 4),
+                generated = [],
+                prefill_started_at = erlang:monotonic_time(millisecond)
+            },
+            enter_after_lookup(maps:get(parent_key, Opts, undefined), Data1);
+        {error, Reason} ->
+            {keep_state, Data, [{reply, From, {error, Reason}}]}
+    end.
 
 start_infer(From, Tokens, Params, CallerPid, Data) ->
     Ref = make_ref(),
-    Grammar = maps:get(grammar, Params, undefined),
-    case set_grammar(Grammar, Data) of
+    case configure_sampler_for(Params, Data) of
         {ok, Data0} ->
             ok = erllama_inflight:register(Ref, self()),
             Data1 = Data0#data{
@@ -682,12 +699,51 @@ send_error(#data{mode = streaming, caller_pid = Pid, request_ref = Ref}, Reason)
 send_error(_, _) ->
     ok.
 
-%% Optional grammar setup. If the backend doesn't export set_grammar
-%% the caller's grammar (if any) is silently ignored. Returns the
-%% (possibly updated) Data on success.
+%% Build the sampler-config subset from request opts. Only the keys
+%% the sampler chain cares about; everything else (response_tokens,
+%% parent_key) is dropped.
+-define(SAMPLER_KEYS, [
+    grammar,
+    repetition_penalty,
+    top_k,
+    top_p,
+    min_p,
+    temperature,
+    seed
+]).
+
+sampler_cfg_from(Opts) ->
+    maps:with(?SAMPLER_KEYS, Opts).
+
+%% Configure the per-request sampler chain. Wired to both
+%% configure_sampler/2 (preferred) and the older set_grammar/2 callback
+%% as a fallback for backends that haven't been ported. If the caller
+%% passed no sampler keys at all we still call the backend so any
+%% leftover state from a previous request is reset.
+configure_sampler_for(Opts, Data) ->
+    Cfg = sampler_cfg_from(Opts),
+    configure_sampler_call(Cfg, Data).
+
+configure_sampler_call(Cfg, Data = #data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, configure_sampler, 2) of
+        true ->
+            case Mod:configure_sampler(S, Cfg) of
+                {ok, S1} -> {ok, Data#data{backend_state = S1}};
+                {error, _} = E -> E
+            end;
+        false ->
+            %% Backwards-compat: legacy backends only know set_grammar.
+            Grammar = maps:get(grammar, Cfg, undefined),
+            set_grammar(Grammar, Data)
+    end.
+
+%% Legacy grammar-only callback path. Kept so backends that only
+%% implement set_grammar/2 + clear_sampler/1 still work.
 set_grammar(undefined, Data) ->
     clear_grammar(Data);
-set_grammar(Grammar, Data = #data{backend = Mod, backend_state = S}) when is_binary(Grammar) ->
+set_grammar(Grammar, Data = #data{backend = Mod, backend_state = S}) when
+    is_binary(Grammar)
+->
     case erlang:function_exported(Mod, set_grammar, 2) of
         true ->
             case Mod:set_grammar(S, Grammar) of

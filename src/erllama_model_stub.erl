@@ -25,11 +25,29 @@
     apply_chat_template/2,
     embed/2,
     set_grammar/2,
-    clear_sampler/1
+    configure_sampler/2,
+    clear_sampler/1,
+    %% Test helpers: read back what the most recent configure_sampler
+    %% / clear_sampler call saw.
+    last_sampler_cfg/1,
+    cleared/1
 ]).
 
+%% Stub state.
+%%
+%% `sampler` is the currently-installed chain config (matches the real
+%% backend's behaviour: it gets reset to #{} on clear_sampler/1).
+%% `last_sampler` is the cfg the most recent configure_sampler/2 saw,
+%% preserved across clear_sampler/1 so end-of-request cleanup doesn't
+%% wipe out the value tests want to read.
+-record(stub, {
+    sampler = #{} :: map(),
+    last_sampler = #{} :: map(),
+    cleared = false :: boolean()
+}).
+
 init(_Config) ->
-    {ok, undefined}.
+    {ok, #stub{}}.
 
 terminate(_S) ->
     ok.
@@ -81,10 +99,23 @@ embed(_S, Tokens) when is_list(Tokens) ->
     {ok, Vec}.
 
 %% Stub backend doesn't sample (decode_one returns a phash2-derived
-%% token deterministically), so grammar is ignored. Return ok so the
-%% gen_statem keeps going.
-set_grammar(S, _Grammar) -> {ok, S}.
-clear_sampler(S) -> {ok, S}.
+%% token deterministically), so grammar / sampler params are ignored.
+%% The most recent config is recorded on the state so tests can read
+%% it back via `last_sampler_cfg/1`.
+set_grammar(#stub{sampler = Cfg} = S, Grammar) when is_binary(Grammar) ->
+    NewCfg = Cfg#{grammar => Grammar},
+    {ok, S#stub{sampler = NewCfg, last_sampler = NewCfg, cleared = false}};
+set_grammar(#stub{} = S, undefined) ->
+    {ok, S}.
+
+configure_sampler(#stub{} = S, Cfg) when is_map(Cfg) ->
+    {ok, S#stub{sampler = Cfg, last_sampler = Cfg, cleared = false}}.
+
+clear_sampler(#stub{} = S) ->
+    {ok, S#stub{sampler = #{}, cleared = true}}.
+
+last_sampler_cfg(#stub{last_sampler = Cfg}) -> Cfg.
+cleared(#stub{cleared = C}) -> C.
 
 %% =============================================================================
 %% Internal: chat-template rendering

@@ -40,6 +40,7 @@
     apply_chat_template/2,
     embed/2,
     set_grammar/2,
+    configure_sampler/2,
     clear_sampler/1
 ]).
 
@@ -134,9 +135,31 @@ embed(Ctx, Tokens) when is_list(Tokens) ->
 %% `decode_one/1` calls sample only tokens that keep the output on a
 %% valid grammar path. Use `clear_sampler/1` to drop the grammar
 %% (returns the context to greedy sampling on the next decode).
+%%
+%% Equivalent to `configure_sampler(Ctx, #{grammar => Grammar})`.
 -spec set_grammar(context_ref(), binary()) -> ok | {error, atom()}.
 set_grammar(Ctx, Grammar) when is_binary(Grammar) ->
     nif_set_grammar(Ctx, Grammar).
+
+%% Build the sampler chain in one shot from a config map. Recognised
+%% keys (all optional):
+%%
+%%   grammar             :: binary()           %% GBNF source
+%%   repetition_penalty  :: float()            %% > 1.0 penalises repeats
+%%   top_k               :: non_neg_integer()
+%%   top_p               :: float()            %% (0, 1]
+%%   min_p               :: float()            %% (0, 1]
+%%   temperature         :: float()            %% 0.0 == greedy
+%%   seed                :: non_neg_integer()  %% honoured only with temperature > 0
+%%
+%% Stages are appended in a deterministic order:
+%% grammar -> repetition_penalty -> top_k -> top_p -> min_p ->
+%% (temperature > 0 ? temp -> dist(seed) : greedy).
+%%
+%% Replaces any previously configured chain on the context atomically.
+-spec configure_sampler(context_ref(), map()) -> ok | {error, atom()}.
+configure_sampler(Ctx, Cfg) when is_map(Cfg) ->
+    nif_configure_sampler(Ctx, Cfg).
 
 -spec clear_sampler(context_ref()) -> ok.
 clear_sampler(Ctx) ->
@@ -162,4 +185,5 @@ nif_kv_seq_rm(_Ctx, _SeqId, _P0, _P1) -> erlang:nif_error(nif_not_loaded).
 nif_apply_chat_template(_Model, _Request) -> erlang:nif_error(nif_not_loaded).
 nif_embed(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_set_grammar(_Ctx, _Grammar) -> erlang:nif_error(nif_not_loaded).
+nif_configure_sampler(_Ctx, _Cfg) -> erlang:nif_error(nif_not_loaded).
 nif_clear_sampler(_Ctx) -> erlang:nif_error(nif_not_loaded).

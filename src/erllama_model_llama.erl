@@ -29,6 +29,7 @@ Config (passed through `erllama_model:start_link/2`):
     apply_chat_template/2,
     embed/2,
     set_grammar/2,
+    configure_sampler/2,
     clear_sampler/1
 ]).
 
@@ -98,6 +99,16 @@ set_grammar(#s{ctx = C} = S, Grammar) when is_binary(Grammar) ->
     end;
 set_grammar(#s{} = S, undefined) ->
     {ok, S}.
+
+configure_sampler(#s{} = S, Cfg) when map_size(Cfg) =:= 0 ->
+    %% No sampler params at all - leave the existing chain alone so
+    %% the lazy greedy fallback in the NIF kicks in on first decode.
+    {ok, S};
+configure_sampler(#s{ctx = C} = S, Cfg) when is_map(Cfg) ->
+    case erllama_nif:configure_sampler(C, Cfg) of
+        ok -> {ok, S};
+        {error, _} = E -> E
+    end.
 
 clear_sampler(#s{ctx = C} = S) ->
     ok = erllama_nif:clear_sampler(C),
