@@ -34,6 +34,7 @@ exact hit. **No model loaded — `llama_backend_init` doesn't run.**
 ## 1. Load a model and run a one-shot completion
 
 ```erlang
+{ok, _} = erllama_cache_disk_srv:start_link(my_disk, "/var/lib/erllama/kvc"),
 {ok, Bin} = file:read_file("/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf"),
 Fp = crypto:hash(sha256, Bin),
 
@@ -46,7 +47,7 @@ Fp = crypto:hash(sha256, Bin),
     quant_bits       => 4,
     ctx_params_hash  => crypto:hash(sha256, term_to_binary({2048, 512})),
     context_size     => 2048,
-    tier_srv         => default_disk,
+    tier_srv         => my_disk,
     tier             => disk
 }),
 
@@ -66,9 +67,9 @@ rows. Repeating the same call hits the cache via the exact-key path.
 %% Inside your request handler. The cache walks the new prompt's
 %% tokens backward by `boundary_align_tokens` and resumes from the
 %% longest published prefix automatically — no parent_key needed.
-handle_chat(Prompt) ->
+handle_chat(ModelId, Prompt) ->
     {ok, Reply, _Tokens} =
-        erllama:complete(model_a3b1, Prompt, #{response_tokens => 256}),
+        erllama:complete(ModelId, Prompt, #{response_tokens => 256}),
     {200, [{"Content-Type", "text/plain"}], Reply}.
 ```
 
@@ -76,20 +77,37 @@ Hits show up as `hits_longest_prefix` in `erllama_cache:get_counters/0`.
 
 ## 3. Multi-turn Erlang-native session (tracks parent_key)
 
+The session layer is responsible for threading `parent_key` between
+turns. The cache does not expose a "last finish key" lookup; you
+compute the key from the tokens `complete/3` returns.
+
 ```erlang
-chat(Model, Prompt, undefined) ->
-    {ok, Reply, _} = erllama:complete(Model, Prompt, #{}),
-    {ok, K} = erllama_cache:last_finish_key(Model),
+%% Helper: build the finish-save key from the tokens of the previous turn.
+finish_key(Fp, QT, CtxHash, Tokens) ->
+    erllama_cache_key:make(#{
+        fingerprint     => Fp,
+        quant_type      => QT,
+        ctx_params_hash => CtxHash,
+        tokens          => Tokens
+    }).
+
+chat(Model, KeyMeta, Prompt, undefined) ->
+    {ok, Reply, Tokens} = erllama:complete(Model, Prompt, #{}),
+    K = finish_key(maps:get(fingerprint, KeyMeta),
+                   maps:get(quant_type, KeyMeta),
+                   maps:get(ctx_params_hash, KeyMeta), Tokens),
     {Reply, K};
-chat(Model, Prompt, ParentKey) ->
-    {ok, Reply, _} =
+chat(Model, KeyMeta, Prompt, ParentKey) ->
+    {ok, Reply, Tokens} =
         erllama:complete(Model, Prompt, #{parent_key => ParentKey}),
-    {ok, K} = erllama_cache:last_finish_key(Model),
+    K = finish_key(maps:get(fingerprint, KeyMeta),
+                   maps:get(quant_type, KeyMeta),
+                   maps:get(ctx_params_hash, KeyMeta), Tokens),
     {Reply, K}.
 
-%% Driver:
-{R1, K1} = chat(M, <<"User: hello\nAssistant:">>, undefined),
-{R2, K2} = chat(M,
+%% Driver: `KeyMeta` is whatever you passed to `load_model/2`.
+{R1, K1} = chat(M, KeyMeta, <<"User: hello\nAssistant:">>, undefined),
+{R2, K2} = chat(M, KeyMeta,
     <<"User: hello\nAssistant: ", R1/binary,
       "\nUser: tell me a joke\nAssistant:">>,
     K1),
@@ -101,15 +119,17 @@ directly from the previous turn's finish save.
 
 ## 4. Multiple loaded models
 
+Model ids are `binary()` (the registered name).
+
 ```erlang
-{ok, _} = erllama:load_model(tiny, TinyConfig),
-{ok, _} = erllama:load_model(big,  BigConfig),
+{ok, _} = erllama:load_model(<<"tiny">>, TinyConfig),
+{ok, _} = erllama:load_model(<<"big">>,  BigConfig),
 
-{ok, R1, _} = erllama:complete(tiny, <<"summarise: ...">>),
-{ok, R2, _} = erllama:complete(big,  <<"deep analysis of: ...">>),
+{ok, R1, _} = erllama:complete(<<"tiny">>, <<"summarise: ...">>),
+{ok, R2, _} = erllama:complete(<<"big">>,  <<"deep analysis of: ...">>),
 
-ok = erllama:unload(tiny),
-ok = erllama:unload(big).
+ok = erllama:unload(<<"tiny">>),
+ok = erllama:unload(<<"big">>).
 ```
 
 Both share one `erllama_cache` instance. Cache rows are scoped by
@@ -118,7 +138,9 @@ fingerprint, so the two models never collide.
 ## 5. Concurrent agents on a shared system prompt
 
 ```erlang
+ModelId = <<"assistant">>,
 SharedPrefix = <<"You are a helpful assistant.\n">>,
+Parent = self(),
 
 %% Spawn N workers; each appends a different user query but they
 %% all start with the same prefix. After the first agent's cold
@@ -128,7 +150,7 @@ Workers = [
     spawn(fun() ->
         Q = list_to_binary(io_lib:format("Worker ~p question.", [N])),
         Prompt = <<SharedPrefix/binary, Q/binary>>,
-        {ok, Reply, _} = erllama:complete(model_a3b1, Prompt),
+        {ok, Reply, _} = erllama:complete(ModelId, Prompt),
         Parent ! {N, Reply}
     end) || N <- lists:seq(1, 8)
 ],
@@ -138,18 +160,89 @@ Replies = [receive {N, R} -> {N, R} end || N <- lists:seq(1, 8)],
 Replies.
 ```
 
-## 6. Inspecting cache state
+## 6. Streaming tokens (`infer/4`) with cancellation
+
+```erlang
+{ok, Tokens} = erllama:tokenize(ModelId, <<"Once upon a time">>),
+{ok, Ref} = erllama:infer(ModelId, Tokens,
+                           #{response_tokens => 200}, self()),
+
+loop(Ref) ->
+    receive
+        {erllama_token, Ref, Fragment} ->
+            io:put_chars(Fragment),
+            loop(Ref);
+        {erllama_done, Ref, _Stats} ->
+            io:nl(),
+            ok;
+        {erllama_error, Ref, Reason} ->
+            {error, Reason}
+    after 30000 ->
+        erllama:cancel(Ref),
+        %% Still drain the final done message after cancel.
+        loop(Ref)
+    end.
+```
+
+`cancel/1` is observed at the next inter-token boundary; the model
+always emits a final `{erllama_done, Ref, Stats}` with
+`#{cancelled => true}`.
+
+## 7. Chat template + embeddings
+
+```erlang
+%% Render a chat request through the model's built-in GGUF template
+%% and tokenise it in one shot. Backed by llama_chat_apply_template.
+{ok, ChatTokens} = erllama:apply_chat_template(ModelId, #{
+    messages => [
+        #{role => system,    content => <<"You are concise.">>},
+        #{role => user,      content => <<"What's 2+2?">>}
+    ]
+}),
+{ok, Ref} = erllama:infer(ModelId, ChatTokens, #{response_tokens => 8}, self()).
+```
+
+```erlang
+%% Pooled sentence embedding via llama_get_embeddings_seq.
+%% The model must have been loaded with embedding-friendly settings
+%% (see guides/loading.md). Returns a list of floats.
+{ok, Toks}      = erllama:tokenize(ModelId, <<"The quick brown fox.">>),
+{ok, Embedding} = erllama:embed(ModelId, Toks).
+```
+
+## 8. Grammar-constrained sampling (GBNF)
+
+```erlang
+%% Force the model to emit a JSON-shaped string with a digit value.
+Grammar = <<
+    "root ::= \"{\" ws \"\\\"n\\\":\" ws digit \"}\"\n"
+    "digit ::= [0-9]\n"
+    "ws    ::= [ \\t\\n]*"
+>>,
+{ok, Toks} = erllama:tokenize(ModelId, <<"Reply with JSON:">>),
+{ok, Ref}  = erllama:infer(ModelId, Toks,
+                           #{response_tokens => 32, grammar => Grammar},
+                           self()).
+```
+
+The grammar is per-request: the sampler chain is reset to grammar →
+greedy for the duration of the request and cleared on completion or
+cancellation.
+
+## 9. Inspecting cache state
 
 ```erlang
 %% Hit/miss/save counters and per-path latency totals.
 Counters = erllama_cache:get_counters(),
 io:format("~p~n", [Counters]).
 
-%% Every row in the index, with tier, size, last_used_ns, refcount.
+%% Every row in the index. dump/0 returns raw ETS tuples; the layout
+%% is documented in include/erllama_cache.hrl:
+%%   {Key, Tier, Size, LastUsedNs, Refcount, Status, Header,
+%%    Location, TokensRef, Hits}
 Dump = erllama_cache_meta_srv:dump(),
-[io:format("~s ~p ~p~n",
-    [erllama_cache_key:to_hex(K), Tier, Size])
- || #{key := K, tier := Tier, size := Size} <- Dump].
+[io:format("tier=~p size=~p refs=~p~n", [Tier, Size, Refs])
+ || {_Key, Tier, Size, _Lru, Refs, _Status, _Hdr, _Loc, _Tok, _Hits} <- Dump].
 
 %% Free at least 256 MiB, oldest LRU first, RAM tiers only.
 erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
@@ -158,7 +251,7 @@ erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 erllama_cache:gc().
 ```
 
-## 7. Memory-pressure-driven eviction (in `sys.config`)
+## 10. Memory-pressure-driven eviction (in `sys.config`)
 
 ```erlang
 {erllama, [
@@ -177,7 +270,7 @@ Sources shipped: `noop`, `system`, `nvidia_smi`, `{module, M}`. Roll
 your own with `-behaviour(erllama_pressure)` and pass
 `{module, M}` as the source.
 
-## 8. Cache-only tests (no model required)
+## 11. Cache-only tests (no model required)
 
 The cache subsystem is independently usable. eunit tests that
 exercise save/load round-trips never touch llama.cpp:
@@ -220,7 +313,7 @@ round_trip_test() ->
 The lazy `llama_backend_init` means cache-only tests never trigger
 `ggml_backend_load_all` — no Metal/CUDA discovery cost.
 
-## 9. End-to-end against a real GGUF
+## 12. End-to-end against a real GGUF
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.Q4_K_M.gguf \
@@ -232,7 +325,7 @@ parent-key resume, longest-prefix walk, eviction, and a multi-model
 concurrent run. Without the env var it skips so default
 `rebar3 ct` stays green.
 
-## 10. Microbench: cold vs. warm
+## 13. Microbench: cold vs. warm
 
 ```bash
 bench/run.sh tiny    # TinyLlama 1.1B Q4_K_M

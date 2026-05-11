@@ -42,6 +42,9 @@ an explicit `model_id` in the config map.
     complete/3,
     infer/4,
     cancel/1,
+    status/1,
+    evict/1,
+    shutdown/1,
     models/0,
     list_models/0,
     model_info/1,
@@ -95,6 +98,20 @@ unload_model(Model) ->
 complete(Model, Prompt) ->
     erllama_model:complete(Model, Prompt).
 
+-doc """
+Run a completion against a loaded model with options.
+
+Recognised keys in `Opts`:
+
+- `response_tokens` (`non_neg_integer()`) — cap on the number of
+  tokens generated. Defaults to the model's `n_ctx` minus prompt
+  length.
+- `parent_key` (`erllama_cache:cache_key()`) — the previous turn's
+  finish-save key. Skips the longest-prefix walk and resumes
+  directly from that row.
+
+Returns `{ok, ReplyText, FullTokenList}` on success.
+""".
 -spec complete(model(), binary(), map()) ->
     {ok, binary(), [erllama_nif:token_id()]} | {error, term()}.
 complete(Model, Prompt, Opts) ->
@@ -132,6 +149,31 @@ Stats}` with `cancelled => true`.
 -spec cancel(reference()) -> ok.
 cancel(Ref) ->
     erllama_model:cancel(Ref).
+
+-doc """
+Current model state. `idle` means no request is in flight;
+`prefilling` and `generating` are the two active phases.
+""".
+-spec status(model()) -> idle | prefilling | generating.
+status(Model) ->
+    erllama_model:status(Model).
+
+-doc """
+Fire an `evict` save synchronously and release the model's live KV
+state. Used by an external memory-pressure scheduler when it wants
+this model's working set off the heap without unloading the model.
+""".
+-spec evict(model()) -> ok.
+evict(Model) ->
+    erllama_model:evict(Model).
+
+-doc """
+Fire a `shutdown` save synchronously and return. Called from a
+release stop hook; bounded by `evict_save_timeout_ms`.
+""".
+-spec shutdown(model()) -> ok.
+shutdown(Model) ->
+    erllama_model:shutdown(Model).
 
 -doc """
 List currently-loaded model pids (low-level supervisor view). Most

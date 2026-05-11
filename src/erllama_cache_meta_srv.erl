@@ -86,7 +86,8 @@ may have left a valid `.kvc` we can validate-and-adopt.
 -record(state, {
     holders :: #{reference() => {pid(), erllama_cache:cache_key()}},
     reservations :: #{erllama_cache:cache_key() => #reservation{}},
-    waiters :: #{erllama_cache:cache_key() => [{gen_server:from(), integer()}]},
+    waiters ::
+        #{erllama_cache:cache_key() => [{gen_server:from(), integer(), reference()}]},
     sweep_timer :: reference() | undefined
 }).
 
@@ -103,9 +104,10 @@ start_link() ->
 -spec lookup_exact(erllama_cache:cache_key()) ->
     {ok, tuple()} | miss.
 lookup_exact(Key) ->
-    try ets:lookup_element(?TBL_META, Key, ?POS_STATUS) of
-        available ->
-            [Row] = ets:lookup(?TBL_META, Key),
+    %% Single ets:lookup; an eviction between the historical two-call
+    %% pattern (lookup_element + lookup) would crash the match.
+    try ets:lookup(?TBL_META, Key) of
+        [Row] when element(?POS_STATUS, Row) =:= available ->
             {ok, Row};
         _ ->
             miss
@@ -268,13 +270,19 @@ dump() ->
 
 -spec dump(erllama_cache:cache_key()) -> {ok, tuple()} | miss.
 dump(Key) ->
+    lookup_row(Key).
+%% Note: dump/1 wants the full row, so the lookup/2 form is appropriate
+%% here. lookup_element + lookup would be two ETS ops on the hit path
+%% with no benefit.
+
+%% Shared ETS row lookup used by dump/1 and by notify_waiters/2.
+%% Returns the raw row tuple as `{ok, Row}` or `miss`.
+-spec lookup_row(erllama_cache:cache_key()) -> {ok, tuple()} | miss.
+lookup_row(Key) ->
     case ets:lookup(?TBL_META, Key) of
         [Row] -> {ok, Row};
         [] -> miss
     end.
-%% Note: dump/1 wants the full row, so the lookup/2 form is appropriate
-%% here. lookup_element + lookup would be two ETS ops on the hit path
-%% with no benefit.
 
 %% =============================================================================
 %% gen_server callbacks
@@ -412,8 +420,14 @@ handle_info(sweep, S) ->
 handle_info(_Msg, S) ->
     {noreply, S}.
 
-terminate(_Reason, _S) ->
-    ok.
+terminate(_Reason, S) ->
+    case S#state.sweep_timer of
+        undefined ->
+            ok;
+        TRef ->
+            _ = erlang:cancel_timer(TRef),
+            ok
+    end.
 
 %% =============================================================================
 %% Internal: checkout / refcount / LRU
@@ -610,18 +624,22 @@ find_reservation_by_monref(Ref, Reservations) ->
 
 add_waiter(Key, From, MaxWaitMs, S) ->
     Expires = monotonic_ns() + MaxWaitMs * 1_000_000,
-    erlang:send_after(MaxWaitMs, self(), {waiter_expire, Key, From}),
+    TRef = erlang:send_after(MaxWaitMs, self(), {waiter_expire, Key, From}),
     Existing = maps:get(Key, S#state.waiters, []),
-    Waiters1 = (S#state.waiters)#{Key => [{From, Expires} | Existing]},
+    Waiters1 = (S#state.waiters)#{Key => [{From, Expires, TRef} | Existing]},
     S#state{waiters = Waiters1}.
 
 notify_waiters(Key, S) ->
     case maps:take(Key, S#state.waiters) of
         {Waiters, W1} ->
-            case ets:lookup(?TBL_META, Key) of
-                [Row] -> [gen_server:reply(From, {ok, Row}) || {From, _} <- Waiters];
-                [] -> [gen_server:reply(From, miss) || {From, _} <- Waiters]
-            end,
+            Reply = lookup_row(Key),
+            lists:foreach(
+                fun({From, _Exp, TRef}) ->
+                    _ = erlang:cancel_timer(TRef),
+                    gen_server:reply(From, Reply)
+                end,
+                Waiters
+            ),
             S#state{waiters = W1};
         error ->
             S
@@ -640,7 +658,9 @@ expire_waiter(Key, From, S) ->
                     gen_server:reply(From, miss),
                     S#state{waiters = (S#state.waiters)#{Key => Rest}};
                 false ->
-                    %% Already replied (e.g. a save published first).
+                    %% Already replied (e.g. a save published first) and the
+                    %% timer was cancelled in notify_waiters; this message is
+                    %% the one that lost the race between cancel and fire.
                     S
             end
     end.

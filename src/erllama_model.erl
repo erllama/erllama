@@ -339,13 +339,24 @@ terminate(_Reason, _State, #data{backend = B, backend_state = S}) ->
 terminate(_Reason, _State, _Data) ->
     ok.
 
-%% Placeholder fingerprint when none supplied. The cache key still
-%% segregates rows by this 32-byte tag, so different models that share
-%% the default never collide unless their tokens + ctx params also
-%% match - but pass a real fingerprint in production.
+%% Placeholder fingerprint when none supplied.
+%%
+%% Production code must always pass a real fingerprint via
+%% `crypto:hash(sha256, ModelBytes)`. The default exists only so the
+%% minimal `load_model/1` example in the docs runs without an
+%% operator having to compute a hash first.
+%%
+%% Sharing the default across two distinct models lets the cache
+%% accidentally false-hit between them (same default fp + same
+%% tokens + same ctx_params -> same key). Hardly anyone hits this
+%% in practice because real prompts differ, but it is unsafe under
+%% adversarial inputs.
 default_fingerprint() ->
     binary:copy(<<0>>, 32).
 
+%% Same caveat as default_fingerprint/0. Pass a real
+%% `crypto:hash(sha256, term_to_binary({Nctx, Nbatch}))` in
+%% production.
 default_ctx_params_hash() ->
     binary:copy(<<0>>, 32).
 
@@ -824,20 +835,26 @@ pin_and_load(Key, Data) ->
     Result =
         case erllama_cache_meta_srv:checkout(Key, self()) of
             {ok, HolderRef, Tier, Loc, _Header, TokensBin} ->
-                Bin = load_payload(Tier, Loc, Key, Data),
-                case Bin of
-                    <<>> ->
-                        ok = erllama_cache_meta_srv:checkin(HolderRef),
-                        miss;
-                    _ ->
-                        ok = backend_call(Data, kv_unpack, [Bin]),
-                        ok = erllama_cache_meta_srv:checkin(HolderRef),
-                        Tokens =
-                            case TokensBin of
-                                undefined -> [];
-                                _ -> erllama_cache_key:decode_tokens(TokensBin)
-                            end,
-                        {ok, Tokens}
+                %% try/after guarantees the holder is released even if
+                %% load_payload or kv_unpack throws. Without it, recovery
+                %% relies on the meta server's process monitor firing,
+                %% which leaves a brief window where the slab is pinned.
+                try
+                    Bin = load_payload(Tier, Loc, Key, Data),
+                    case Bin of
+                        <<>> ->
+                            miss;
+                        _ ->
+                            ok = backend_call(Data, kv_unpack, [Bin]),
+                            Tokens =
+                                case TokensBin of
+                                    undefined -> [];
+                                    _ -> erllama_cache_key:decode_tokens(TokensBin)
+                                end,
+                            {ok, Tokens}
+                    end
+                after
+                    ok = erllama_cache_meta_srv:checkin(HolderRef)
                 end;
             {error, busy} ->
                 miss;
@@ -877,10 +894,20 @@ fire_save_if(true, Reason, Tokens, Data) ->
     Payload = backend_call(Data, kv_pack, [Tokens]),
     Elapsed = erlang:monotonic_time(nanosecond) - T0,
     erllama_cache_counters:add(?C_PACK_TOTAL_NS, max(Elapsed, 0)),
-    _ = erllama_cache_writer:save(
-        Data#data.tier_srv, Data#data.tier, BuildMeta, Payload, 0
-    ),
-    ok.
+    case
+        erllama_cache_writer:save(
+            Data#data.tier_srv, Data#data.tier, BuildMeta, Payload, 0
+        )
+    of
+        {ok, _} ->
+            ok;
+        {error, _SaveErr} ->
+            %% Writer pool saturated or row already present. Either way
+            %% the save the model wanted to fire didn't land; surface
+            %% the drop via a counter so operators can see back-pressure.
+            erllama_cache_counters:incr(?C_SAVES_DROPPED),
+            ok
+    end.
 
 %% Evict and shutdown saves: fire unconditionally if there is any
 %% live context, regardless of `min_tokens`. The plan's policy

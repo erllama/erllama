@@ -345,12 +345,20 @@ after_publish(Key, Token, BuildMeta, FinalPath, Header, Size) ->
                     bump_save_counter(maps:get(save_reason, BuildMeta, unknown)),
                     {ok, Key};
                 {error, _} = E ->
+                    %% Token expired between mark_published and announce_saved
+                    %% (writer was slow; TTL sweep ran and validated-and-adopted
+                    %% the linked file under a fresh reservation). The data is
+                    %% on disk and indexed; the writer's caller just sees the
+                    %% stale `{error, expired}` and should treat it as a
+                    %% non-fatal save-skip. The save_counter bump for this
+                    %% reason intentionally does not fire.
                     E
             end;
         {error, _} = E ->
             %% Token was recycled between check_reservation and
             %% mark_published. The file is published; the meta sweep
-            %% will validate-and-adopt it on its next pass.
+            %% will validate-and-adopt it on its next pass. Same
+            %% non-fatal outcome as above.
             E
     end.
 
