@@ -18,25 +18,29 @@ sharing the same system prompt skip it.
 
 ```erlang
 1> {ok, _} = application:ensure_all_started(erllama).
-2> {ok, M} = erllama:load_model(#{
+2> Path = "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf".
+3> {ok, Bin} = file:read_file(Path).
+4> {ok, M} = erllama:load_model(#{
        backend     => erllama_model_llama,
-       model_path  => "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf",
-       fingerprint => crypto:hash(sha256,
-                                   element(2, file:read_file(
-                                       "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf")))
+       model_path  => Path,
+       fingerprint => crypto:hash(sha256, Bin)
    }).
-{ok, model_a3b1}
+{ok, <<"erllama_model_2375">>}
 
-3> {ok, Reply, _} = erllama:complete(M, <<"Once upon a time">>).
+5> {ok, Reply, _} = erllama:complete(M, <<"Once upon a time">>).
 %% ~3 s on a CPU box. Prompt prefill, async cold save fired.
 
-4> {ok, Reply2, _} = erllama:complete(M, <<"Once upon a time">>).
+6> {ok, Reply2, _} = erllama:complete(M, <<"Once upon a time">>).
 %% ~10 ms. Cache hit; KV state restored, one decode for fresh logits.
 
-5> {ok, _, _} = erllama:complete(M, <<"Once upon a time, in a quiet village">>).
+7> {ok, _, _} = erllama:complete(M, <<"Once upon a time, in a quiet village">>).
 %% ~50 ms. Longest-prefix walk found the cached row even though
 %% the new prompt is longer.
 ```
+
+`load_model/1` returns a binary `model_id` that is also the registered
+name for the underlying gen_statem. Pass it to `complete/2,3`,
+`unload/1`, etc.
 
 That is the whole pitch. The cache is on by default, runs under
 its own supervisor, and never returns approximate matches.
@@ -100,6 +104,8 @@ for the toolchain.
 | [Loading a model](guides/loading.md) | Every option to `erllama:load_model/1,2`, with examples and pitfalls. |
 | [Caching](guides/caching.md) | Tiers, save reasons, lookup paths, watermarks. The operator's manual. |
 | [Configuration](guides/configuration.md) | Full `sys.config` and per-model option reference. |
+| [Building](guides/building.md) | Platform-specific build notes (Linux, macOS, FreeBSD), CUDA/Metal toggles, common build issues. |
+| [Examples](guides/examples.md) | Drop-in patterns for one-shot completion, stateless HTTP servers, multi-turn sessions, concurrent agents, cache inspection. |
 
 For the API reference (`erllama`, `erllama_cache`, `erllama_scheduler`,
 `erllama_nif`), see the **[generated module docs on
@@ -117,12 +123,15 @@ For the design rationale behind the cache:
 
 ## A slightly longer example
 
-A real load with all the cache parameters:
+A real load with all the cache parameters. The disk tier requires a
+running `erllama_cache_disk_srv` started by the operator; the RAM tier
+(`erllama_cache_ram`) starts automatically with the application.
 
 ```erlang
-{ok, Bin} = file:read_file("/srv/models/llama-3.1-8b.Q4_K_M.gguf").
-Fp = crypto:hash(sha256, Bin).
-CtxHash = crypto:hash(sha256, term_to_binary({8192, 4096})).
+{ok, _} = erllama_cache_disk_srv:start_link(my_disk, "/var/lib/erllama/kvc"),
+{ok, Bin} = file:read_file("/srv/models/llama-3.1-8b.Q4_K_M.gguf"),
+Fp = crypto:hash(sha256, Bin),
+CtxHash = crypto:hash(sha256, term_to_binary({8192, 4096})),
 
 {ok, M} = erllama:load_model(#{
     backend          => erllama_model_llama,
@@ -135,7 +144,7 @@ CtxHash = crypto:hash(sha256, term_to_binary({8192, 4096})).
     quant_bits       => 4,
     ctx_params_hash  => CtxHash,
     context_size     => 8192,
-    tier_srv         => default_disk,
+    tier_srv         => my_disk,
     tier             => disk,
     policy           => #{
         boundary_trim_tokens   => 32,
@@ -148,8 +157,8 @@ CtxHash = crypto:hash(sha256, term_to_binary({8192, 4096})).
 Stateless OpenAI/Anthropic-shaped server:
 
 ```erlang
-handle_completion(Prompt) ->
-    {ok, Reply, _Tokens} = erllama:complete(model_a3b1, Prompt),
+handle_completion(ModelId, Prompt) ->
+    {ok, Reply, _Tokens} = erllama:complete(ModelId, Prompt),
     Reply.
 ```
 
@@ -158,13 +167,24 @@ configured stride and finds the longest cached prefix. If the new
 prompt is yesterday's conversation plus one fresh turn, the walk
 hits.
 
-Stateful Erlang-native multi-turn (skip the walk on the second
-turn onward):
+Stateful Erlang-native multi-turn: the session layer threads
+`parent_key` between turns. The previous turn's finish-save key is
+the parent of the next call. It is held by the calling session
+process, not retrieved from the cache.
 
 ```erlang
-{ok, R1, _} = erllama:complete(M, Prompt1),
-{ok, K1}    = erllama_cache:last_finish_key(M),
-{ok, R2, _} = erllama:complete(M, Prompt2, #{parent_key => K1}).
+%% First turn: cold prefill. The model fires an async finish save
+%% whose key is sha256(fingerprint || quant || ctx_params || tokens).
+{ok, R1, Tokens1} = erllama:complete(M, Prompt1),
+ParentKey = erllama_cache_key:make(#{
+    fingerprint => Fp,
+    quant_type  => q4_k_m,
+    ctx_params_hash => CtxHash,
+    tokens      => Tokens1
+}),
+
+%% Second turn: pass ParentKey to skip the longest-prefix walk.
+{ok, R2, _} = erllama:complete(M, Prompt2, #{parent_key => ParentKey}).
 ```
 
 Inspect cache state from a shell:
@@ -176,8 +196,10 @@ Inspect cache state from a shell:
   saves_finish => 31, evictions => 3, ...}
 
 2> erllama_cache_meta_srv:dump().
-[#{key => <<...>>, tier => disk, size => 8388608,
-   last_used_ns => 1737..., refcount => 0}, ...]
+%% List of raw ETS rows:
+%%   {Key, Tier, Size, LastUsedNs, Refcount, Status, HeaderBin,
+%%    Location, TokensRef, Hits}
+[{<<_:256>>, disk, 8388608, 1737..., 0, available, _, _, _, 4}, ...]
 ```
 
 ## Requirements

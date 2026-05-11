@@ -41,7 +41,8 @@
     cold_max_tokens := non_neg_integer(),
     continued_interval := pos_integer(),
     boundary_trim_tokens := non_neg_integer(),
-    boundary_align_tokens := pos_integer()
+    boundary_align_tokens := pos_integer(),
+    session_resume_wait_ms => non_neg_integer()
 }.
 
 %% =============================================================================

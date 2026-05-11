@@ -130,13 +130,15 @@ below `low_watermark`, scoped to the configured tiers.
 %% Hit/miss/save counters and per-path latency totals.
 erllama_cache:get_counters().
 
-%% Every row in the index, with tier, size, last_used, refcount.
+%% Every row in the index, raw tuples:
+%%   {Key, Tier, Size, LastUsedNs, Refcount, Status, HeaderBin,
+%%    Location, TokensRef, Hits}
 erllama_cache_meta_srv:dump().
 
-%% Synchronous full eviction pass.
+%% Synchronous full eviction pass: returns {evicted, N}.
 erllama_cache:gc().
 
-%% Free at least N bytes, oldest LRU first.
+%% Free at least N bytes, oldest LRU first: returns {evicted, N, BytesFreed}.
 erllama_cache:evict_bytes(256 * 1024 * 1024).
 erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 ```

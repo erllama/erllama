@@ -11,19 +11,24 @@ matters in practice.
 ## The minimal call
 
 ```erlang
-1> {ok, _} = application:ensure_all_started(erllama).
-2> {ok, M} = erllama:load_model(#{
+1> {ok, _}  = application:ensure_all_started(erllama).
+2> {ok, Bin} = file:read_file("/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf").
+3> {ok, M} = erllama:load_model(#{
        backend     => erllama_model_llama,
        model_path  => "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf",
-       fingerprint => crypto:hash(sha256,
-                                   element(2, file:read_file(
-                                       "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf")))
+       fingerprint => crypto:hash(sha256, Bin)
    }).
-{ok, model_42}
+{ok, <<"erllama_model_2375">>}
 ```
 
 That is enough to run a completion. erllama fills in the cache
-parameters from the application defaults.
+parameters from the application defaults; with no `tier`/`tier_srv`
+override the model writes to the RAM tier (the only one started by
+default).
+
+`M` is a binary registered name. Use it for every subsequent call:
+`erllama:complete(M, ...)`, `erllama:unload(M)`, etc. You can also
+pass an explicit id via `load_model/2` (also binary).
 
 ## The full option map
 
@@ -131,33 +136,46 @@ Plain integer copy of `n_ctx`. The cache uses it for bounds checks.
 
 Where saves go.
 
-- `tier_srv` is the registered name of the tier server (one per
-  configured root in `sys.config`). The defaults are
-  `default_ram`, `default_ramfile`, `default_disk`.
+- `tier_srv` is the registered name of the tier server. Only the RAM
+  tier (`erllama_cache_ram`) is started automatically by the
+  application. To use `ram_file` or `disk`, start a tier server
+  yourself and pass its name:
+
+  ```erlang
+  {ok, _} = erllama_cache_disk_srv:start_link(my_disk, "/var/lib/erllama/kvc"),
+  ...
+  tier_srv => my_disk,
+  tier => disk,
+  ```
+
 - `tier` is the symbolic tier (`ram | ram_file | disk`). It must
   match the backend the `tier_srv` was started with.
 
-For most deployments use the disk tier — it survives restarts and
-is the cheapest place to keep warm state.
+For production deployments use the disk tier — it survives restarts
+and is the cheapest place to keep warm state.
 
 ### `policy`
 
-Per-model overrides of the cache save-policy gates configured at the
-application level. See the [caching guide](caching.md) for what each
-gate means.
+Optional per-model overrides of the cache save-policy gates. Any
+keys you omit fall back to the application defaults declared in
+`erllama.app.src` (`min_tokens`, `cold_min_tokens`,
+`cold_max_tokens`, `continued_interval`, `boundary_trim_tokens`,
+`boundary_align_tokens`, `session_resume_wait_ms`). See the
+[caching guide](caching.md) for what each gate means. Pass an empty
+map (or omit the key entirely) to use the defaults.
 
 ## Loading multiple models
 
-`load_model/1` is idempotent against `{already_started, _}`: calling
-it twice with the same `model_id` returns `{error, already_loaded}`
-the second time. To run two distinct models concurrently, pass a
-2-arg form with explicit ids:
+`load_model/2` takes an explicit binary id and is idempotent against
+`{already_started, _}`: calling it twice with the same id returns
+`{error, already_loaded}` the second time. To run two distinct models
+concurrently:
 
 ```erlang
-{ok, _} = erllama:load_model(tiny,  TinyConfig).
-{ok, _} = erllama:load_model(big,   BigConfig).
-{ok, R, _} = erllama:complete(tiny, <<"hello">>).
-{ok, R2, _} = erllama:complete(big,  <<"hello">>).
+{ok, _}    = erllama:load_model(<<"tiny">>, TinyConfig).
+{ok, _}    = erllama:load_model(<<"big">>,  BigConfig).
+{ok, R, _} = erllama:complete(<<"tiny">>, <<"hello">>).
+{ok, R2, _} = erllama:complete(<<"big">>,  <<"hello">>).
 ```
 
 Both share one `erllama_cache` instance — cache rows are scoped by
