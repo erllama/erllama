@@ -39,26 +39,30 @@
     {modules, []},
     {licenses, ["MIT"]},
     {links, []},
-    %% Hex package manifest. Whitelist what to include and exclude
-    %% the parts of vendored llama.cpp that are not needed at build
-    %% time (docs, scripts, unused backends already pruned at
-    %% vendor time).
+    %% Hex package manifest. Whitelist what to include; exclude the
+    %% parts of vendored llama.cpp that are not needed at build time
+    %% (unused backends already pruned at vendor time, dotfiles,
+    %% packaging scripts).
     {files, [
         "rebar.config",
         "rebar.lock",
         "do_cmake.sh",
         "do_llama.sh",
         "README.md",
+        "CHANGELOG.md",
+        "ROADMAP.md",
         "AGENTS.md",
-        "CLAUDE.md",
         "LICENSE",
         "UPDATE_LLAMA.md",
         "config",
         "src",
         "include",
-        "test",
+        "guides",
+        "internals",
         "c_src/CMakeLists.txt",
+        "c_src/CMake",
         "c_src/erllama_nif.c",
+        "c_src/erllama_safe.cpp",
         "c_src/crc32c.c",
         "c_src/crc32c.h",
         "c_src/llama.cpp"
