@@ -52,9 +52,9 @@ each with its own `save_reason`:
 | `evict` | When a holder is asked to release its slab. Sync (pause decode, pack, release). |
 | `shutdown` | On `prep_stop` or `unload/1`. Sync, capped by `evict_save_timeout_ms`. |
 
-Async saves go through `erllama_cache_writer` (a poolboy pool of
-dirty-IO workers). Sync saves block the calling process until the
-file is on stable storage.
+Async saves go through `erllama_cache_writer` — a pool of dirty-IO
+workers. Sync saves block the calling process until the file is on
+stable storage.
 
 ## When does a hit happen?
 

@@ -98,8 +98,8 @@ Initial public release.
   longest-prefix walk for OpenAI/Anthropic-shaped clients.
 - `erllama_scheduler` memory-pressure poller with pluggable sources
   (`memsup`, `nvidia-smi`, custom callback). Off by default.
-- `erllama_cache_writer` poolboy-backed dirty-IO writer pool with
-  leak-proof reservation semaphore.
+- `erllama_cache_writer` dirty-IO writer pool with a leak-proof
+  reservation semaphore.
 - Persisted hit counters (u32 in disk header) so popular prefixes
   survive an LRU walk after restart.
 - End-to-end metrics: hits/misses/saves/evictions plus per-path

@@ -72,7 +72,7 @@ erllama_cache_sup
 │   └── erllama_cache_ramfile_srv  per ram_file root dir
 ├── erllama_cache_disk_sup
 │   └── erllama_cache_disk_srv     per disk root dir (plain read/write)
-└── erllama_cache_writer_pool  poolboy: dirty-IO save workers
+└── erllama_cache_writer       dirty-IO save workers
 ```
 
 Public API lives in `erllama_cache.erl` (a stateless facade). Hot-path
