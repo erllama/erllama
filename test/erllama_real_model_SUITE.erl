@@ -45,7 +45,11 @@
     apply_chat_template_renders/1,
     apply_chat_template_includes_system/1,
     set_grammar_constrains_output/1,
-    clear_sampler_resets_to_greedy/1
+    clear_sampler_resets_to_greedy/1,
+    seed_determinism/1,
+    seed_varies/1,
+    temperature_zero_is_greedy/1,
+    grammar_plus_sampler/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -73,7 +77,11 @@ all() ->
         apply_chat_template_renders,
         apply_chat_template_includes_system,
         set_grammar_constrains_output,
-        clear_sampler_resets_to_greedy
+        clear_sampler_resets_to_greedy,
+        seed_determinism,
+        seed_varies,
+        temperature_zero_is_greedy,
+        grammar_plus_sampler
     ].
 
 init_per_suite(Config) ->
@@ -373,6 +381,76 @@ drain(Ref, TimeoutMs, Acc) ->
         {erllama_error, Ref, R} -> {error, R}
     after TimeoutMs ->
         timeout
+    end.
+
+%% Run the same prompt twice under temperature > 0 with the same
+%% seed. With seed honoured, the per-step `dist` sampler is
+%% deterministic so both runs must produce identical token streams.
+%% A purely greedy run would also match, so we set temperature high
+%% enough that greedy and sampled outputs would diverge in practice.
+seed_determinism(Config) ->
+    Model = ?config(model, Config),
+    {ok, Tokens} = erllama:tokenize(Model, ?SHORT_PROMPT),
+    Params = #{response_tokens => 12, temperature => 0.9, seed => 42},
+    {Text1, _} = run_infer(Model, Tokens, Params),
+    {Text2, _} = run_infer(Model, Tokens, Params),
+    ?assertEqual(Text1, Text2),
+    ok.
+
+%% Same prompt, same temperature, different seeds. Two independent
+%% RNG streams must produce at least one differing token in a
+%% 12-token window; otherwise the seed is being ignored.
+seed_varies(Config) ->
+    Model = ?config(model, Config),
+    {ok, Tokens} = erllama:tokenize(Model, ?SHORT_PROMPT),
+    {Text1, _} = run_infer(
+        Model, Tokens, #{response_tokens => 12, temperature => 0.9, seed => 42}
+    ),
+    {Text2, _} = run_infer(
+        Model, Tokens, #{response_tokens => 12, temperature => 0.9, seed => 99}
+    ),
+    ?assertNotEqual(Text1, Text2),
+    ok.
+
+%% temperature => 0.0 falls back to greedy regardless of seed; two
+%% runs with different seeds must agree.
+temperature_zero_is_greedy(Config) ->
+    Model = ?config(model, Config),
+    {ok, Tokens} = erllama:tokenize(Model, ?SHORT_PROMPT),
+    {Text1, _} = run_infer(
+        Model, Tokens, #{response_tokens => 12, temperature => 0.0, seed => 1}
+    ),
+    {Text2, _} = run_infer(
+        Model, Tokens, #{response_tokens => 12, temperature => 0.0, seed => 2}
+    ),
+    ?assertEqual(Text1, Text2),
+    ok.
+
+%% Grammar combined with sampler params: the grammar still constrains
+%% every emitted token (must be `yes` or `no`), and identical seed +
+%% temperature pairs are deterministic among the constrained
+%% vocabulary.
+grammar_plus_sampler(Config) ->
+    Model = ?config(model, Config),
+    {ok, Tokens} = erllama:tokenize(Model, <<"Answer with yes or no:">>),
+    Params = #{
+        response_tokens => 6,
+        grammar => <<"root ::= \"yes\" | \"no\"">>,
+        temperature => 0.7,
+        seed => 7
+    },
+    {Text1, _} = run_infer(Model, Tokens, Params),
+    {Text2, _} = run_infer(Model, Tokens, Params),
+    Trimmed1 = string:trim(Text1),
+    ?assert(Trimmed1 =:= <<"yes">> orelse Trimmed1 =:= <<"no">>),
+    ?assertEqual(Text1, Text2),
+    ok.
+
+run_infer(Model, Tokens, Params) ->
+    {ok, Ref} = erllama:infer(Model, Tokens, Params, self()),
+    case drain(Ref, 60000) of
+        {Texts, Stats} -> {iolist_to_binary(Texts), Stats};
+        Other -> ct:fail({drain, Other})
     end.
 
 %% =============================================================================

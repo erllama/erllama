@@ -151,29 +151,44 @@ stats_carry_token_counts_test() ->
 %% Concurrency / busy
 %% =============================================================================
 
-second_infer_while_busy_returns_error_busy_test() ->
+second_infer_while_busy_is_queued_test() ->
+    %% Phase 4: concurrent calls no longer return {error, busy}; the
+    %% gen_statem queues them and dispatches each on return to idle.
+    %% Cancelling the first request makes room for the second.
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
-        %% Use a large target so the stream stays in flight long
-        %% enough for the second call to race. We also wait for the
-        %% first token to confirm the model is in `generating` state
-        %% before issuing the second call.
-        {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
+        {ok, Ref1} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
         receive
-            {erllama_token, Ref, _} -> ok
+            {erllama_token, Ref1, _} -> ok
         after 5000 -> ?assert(false)
         end,
-        Result = erllama:infer(Id, Tokens, #{response_tokens => 1}, self()),
-        ?assertEqual({error, busy}, Result),
-        %% Cancel and drain so unload is clean and quick.
-        ok = erllama:cancel(Ref),
+        %% Issue the second infer; it queues because the first is
+        %% still generating. The {ok, Ref2} reply comes back as soon
+        %% as the call is admitted (the gen_statem accepts the call
+        %% and returns the ref before dispatching prefill, so the
+        %% reply lands without waiting for the first to drain).
+        {ok, Ref2} = erllama:infer(
+            Id, Tokens, #{response_tokens => 1}, self()
+        ),
+        %% Cancel the long-running first; the queued second then
+        %% starts and finishes naturally.
+        ok = erllama:cancel(Ref1),
         receive
-            {erllama_done, Ref, _} -> ok
-        after 5000 -> ok
+            {erllama_done, Ref1, _} -> ok
+        after 5000 -> ?assert(false)
+        end,
+        receive
+            {erllama_done, Ref2, _} -> ok
+        after 5000 -> ?assert(false)
         end
     end).
 
-complete_while_streaming_returns_error_busy_test() ->
+complete_while_streaming_is_queued_test() ->
+    %% A sync complete/2 issued while an infer is in flight would
+    %% block this test process forever waiting for the queued reply,
+    %% so we run it from a spawned helper that signals when its
+    %% complete returns. The helper's call sits on the gen_statem
+    %% queue until the cancellation drains the infer.
     with_model(fun(Id) ->
         {ok, Tokens} = erllama:tokenize(Id, <<"hi">>),
         {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 10000}, self()),
@@ -181,13 +196,48 @@ complete_while_streaming_returns_error_busy_test() ->
             {erllama_token, Ref, _} -> ok
         after 5000 -> ?assert(false)
         end,
-        ?assertEqual({error, busy}, erllama:complete(Id, <<"another">>)),
+        Parent = self(),
+        spawn(fun() ->
+            Parent ! {complete_result, erllama:complete(Id, <<"another">>)}
+        end),
+        %% Give the spawned call time to enter the queue.
+        timer:sleep(50),
         ok = erllama:cancel(Ref),
         receive
             {erllama_done, Ref, _} -> ok
-        after 5000 -> ok
+        after 5000 -> ?assert(false)
+        end,
+        %% The queued complete now drains; expect a successful reply.
+        receive
+            {complete_result, {ok, _Reply, _Toks}} -> ok
+        after 5000 -> ?assert(false)
         end
     end).
+
+queued_requests_drain_in_fifo_order_test() ->
+    %% Three concurrent infer calls. First runs to natural completion;
+    %% the second and third are queued. The erllama_done messages
+    %% must arrive in submission order (FIFO queue semantics).
+    with_model(fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hi">>),
+        {ok, R1} = erllama:infer(Id, Tokens, #{response_tokens => 2}, self()),
+        {ok, R2} = erllama:infer(Id, Tokens, #{response_tokens => 2}, self()),
+        {ok, R3} = erllama:infer(Id, Tokens, #{response_tokens => 2}, self()),
+        ?assertNotEqual(R1, R2),
+        ?assertNotEqual(R2, R3),
+        Order = drain_done_in_order(3, 5000),
+        ?assertEqual([R1, R2, R3], Order)
+    end).
+
+drain_done_in_order(0, _Timeout) ->
+    [];
+drain_done_in_order(N, Timeout) ->
+    receive
+        {erllama_done, Ref, _} -> [Ref | drain_done_in_order(N - 1, Timeout)];
+        %% Tokens emitted while waiting for done are fine; ignore them.
+        {erllama_token, _, _} -> drain_done_in_order(N, Timeout)
+    after Timeout -> ?assert(false)
+    end.
 
 %% =============================================================================
 %% Cancellation

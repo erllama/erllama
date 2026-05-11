@@ -19,6 +19,7 @@
 -export([
     make/1,
     make/4,
+    effective_fingerprint/2,
     quant_byte/1,
     quant_atom/1,
     encode_tokens/1,
@@ -102,6 +103,39 @@ make(Fp, QT, CtxHash, TokensBin) when
 ->
     QuantByte = quant_byte(QT),
     crypto:hash(sha256, [Fp, <<QuantByte:8>>, CtxHash, TokensBin]).
+
+-doc """
+Compute an effective fingerprint from a base model fingerprint and a
+list of attached LoRA adapters.
+
+LoRA changes the model's logits, not its inputs, so attached
+adapters must enter the cache key. Two requests on the same model
+with different adapter sets / scales must never collide or false-hit
+each other.
+
+`effective_fp = sha256(model_fp || sorted_pairs)` where
+`sorted_pairs` is the byte concatenation of
+`(adapter_sha256 || u64_le(scale_q32))` for every attached adapter,
+sorted by `adapter_sha256` for determinism. `scale_q32` is the scale
+multiplied by `2^32` and rounded to `int64`, so floating-point
+representation isn't part of the key.
+
+An empty adapter list returns the base fingerprint unchanged.
+""".
+-spec effective_fingerprint(<<_:256>>, [{<<_:256>>, float()}]) -> <<_:256>>.
+effective_fingerprint(Fp, []) when
+    is_binary(Fp), byte_size(Fp) =:= 32
+->
+    Fp;
+effective_fingerprint(Fp, Adapters) when
+    is_binary(Fp), byte_size(Fp) =:= 32, is_list(Adapters)
+->
+    Sorted = lists:sort(Adapters),
+    Pairs = [
+        <<Sha/binary, (round(Scale * (1 bsl 32))):64/little-signed>>
+     || {Sha, Scale} <- Sorted, is_binary(Sha), byte_size(Sha) =:= 32
+    ],
+    crypto:hash(sha256, [Fp | Pairs]).
 
 -spec quant_byte(quant_type()) -> 0..255.
 quant_byte(f32) -> 0;

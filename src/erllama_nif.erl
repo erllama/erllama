@@ -35,13 +35,22 @@
     prefill/2,
     decode_one/1,
     kv_pack/3,
+    kv_pack/4,
     kv_unpack/3,
     kv_seq_rm/4,
     apply_chat_template/2,
     embed/2,
     set_grammar/2,
-    clear_sampler/1
+    configure_sampler/2,
+    clear_sampler/1,
+    adapter_load/2,
+    adapter_free/1,
+    set_adapters/2,
+    sampler_new/2,
+    sampler_free/1
 ]).
+
+-export_type([adapter_ref/0, sampler_ref/0]).
 
 -on_load(init/0).
 
@@ -49,6 +58,8 @@
 
 -type model_ref() :: reference().
 -type context_ref() :: reference().
+-type adapter_ref() :: reference().
+-type sampler_ref() :: reference().
 -type token_id() :: integer().
 
 -spec init() -> ok | {error, term()}.
@@ -103,6 +114,14 @@ decode_one(Ctx) -> nif_decode_one(Ctx).
     binary() | {error, atom()}.
 kv_pack(Ctx, Tokens, NTokens) -> nif_kv_pack(Ctx, Tokens, NTokens).
 
+%% Seq-aware kv_pack. Extract the KV state for a specific seq_id.
+%% Used by multi-sequence batching (v0.2+); existing v0.1 callers
+%% stay on the 3-arity which defaults to seq_id=0.
+-spec kv_pack(context_ref(), [token_id()], non_neg_integer(), non_neg_integer()) ->
+    binary() | {error, atom()}.
+kv_pack(Ctx, Tokens, NTokens, SeqId) when is_integer(SeqId), SeqId >= 0 ->
+    nif_kv_pack(Ctx, Tokens, NTokens, SeqId).
+
 -spec kv_unpack(context_ref(), binary(), non_neg_integer()) ->
     ok | {error, atom()}.
 kv_unpack(Ctx, Bin, SeqId) -> nif_kv_unpack(Ctx, Bin, SeqId).
@@ -134,13 +153,77 @@ embed(Ctx, Tokens) when is_list(Tokens) ->
 %% `decode_one/1` calls sample only tokens that keep the output on a
 %% valid grammar path. Use `clear_sampler/1` to drop the grammar
 %% (returns the context to greedy sampling on the next decode).
+%%
+%% Equivalent to `configure_sampler(Ctx, #{grammar => Grammar})`.
 -spec set_grammar(context_ref(), binary()) -> ok | {error, atom()}.
 set_grammar(Ctx, Grammar) when is_binary(Grammar) ->
     nif_set_grammar(Ctx, Grammar).
 
+%% Build the sampler chain in one shot from a config map. Recognised
+%% keys (all optional):
+%%
+%%   grammar             :: binary()           %% GBNF source
+%%   repetition_penalty  :: float()            %% > 1.0 penalises repeats
+%%   top_k               :: non_neg_integer()
+%%   top_p               :: float()            %% (0, 1]
+%%   min_p               :: float()            %% (0, 1]
+%%   temperature         :: float()            %% 0.0 == greedy
+%%   seed                :: non_neg_integer()  %% honoured only with temperature > 0
+%%
+%% Stages are appended in a deterministic order:
+%% grammar -> repetition_penalty -> top_k -> top_p -> min_p ->
+%% (temperature > 0 ? temp -> dist(seed) : greedy).
+%%
+%% Replaces any previously configured chain on the context atomically.
+-spec configure_sampler(context_ref(), map()) -> ok | {error, atom()}.
+configure_sampler(Ctx, Cfg) when is_map(Cfg) ->
+    nif_configure_sampler(Ctx, Cfg).
+
 -spec clear_sampler(context_ref()) -> ok.
 clear_sampler(Ctx) ->
     nif_clear_sampler(Ctx).
+
+%% Load a LoRA adapter from a GGUF file. Bound to the model: the
+%% adapter is freed when the model is, or earlier on
+%% `adapter_free/1`. The model is keep-referenced by the adapter
+%% resource so `free_model/1` returns `{ok, deferred}` until all
+%% attached adapters are dropped.
+-spec adapter_load(model_ref(), iodata()) ->
+    {ok, adapter_ref()} | {error, atom()}.
+adapter_load(Model, Path) ->
+    nif_adapter_load(Model, Path).
+
+%% Explicit free. Idempotent: a second call returns
+%% `{error, released}`. The implicit destructor handles the case
+%% where the user drops the reference without calling free.
+-spec adapter_free(adapter_ref()) -> ok | {error, atom()}.
+adapter_free(Adapter) ->
+    nif_adapter_free(Adapter).
+
+%% Install a list of {adapter_ref(), Scale} pairs on the context.
+%% Replaces any previously installed set; passing [] detaches
+%% everything.
+-spec set_adapters(context_ref(), [{adapter_ref(), float()}]) ->
+    ok | {error, atom()}.
+set_adapters(Ctx, Adapters) when is_list(Adapters) ->
+    nif_set_adapters(Ctx, Adapters).
+
+%% Build a standalone sampler chain from the same config map
+%% configure_sampler/2 accepts. Holds a keep-reference on the
+%% context so the context stays alive at least as long as the
+%% sampler. v0.1 callers don't need this - it's the building block
+%% for multi-seq batching coming in v0.2 (one sampler per request).
+-spec sampler_new(context_ref(), map()) ->
+    {ok, sampler_ref()} | {error, atom()}.
+sampler_new(Ctx, Cfg) when is_map(Cfg) ->
+    nif_sampler_new(Ctx, Cfg).
+
+%% Explicit free. Idempotent: a second call returns
+%% `{error, released}`. The implicit destructor handles unfreed
+%% samplers when the resource is garbage-collected.
+-spec sampler_free(sampler_ref()) -> ok | {error, atom()}.
+sampler_free(Sampler) ->
+    nif_sampler_free(Sampler).
 
 %% =============================================================================
 %% NIF stubs (replaced at on_load time)
@@ -157,9 +240,16 @@ nif_detokenize(_Model, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_prefill(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_decode_one(_Ctx) -> erlang:nif_error(nif_not_loaded).
 nif_kv_pack(_Ctx, _Tokens, _NTokens) -> erlang:nif_error(nif_not_loaded).
+nif_kv_pack(_Ctx, _Tokens, _NTokens, _SeqId) -> erlang:nif_error(nif_not_loaded).
 nif_kv_unpack(_Ctx, _Bin, _SeqId) -> erlang:nif_error(nif_not_loaded).
 nif_kv_seq_rm(_Ctx, _SeqId, _P0, _P1) -> erlang:nif_error(nif_not_loaded).
 nif_apply_chat_template(_Model, _Request) -> erlang:nif_error(nif_not_loaded).
 nif_embed(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_set_grammar(_Ctx, _Grammar) -> erlang:nif_error(nif_not_loaded).
+nif_configure_sampler(_Ctx, _Cfg) -> erlang:nif_error(nif_not_loaded).
 nif_clear_sampler(_Ctx) -> erlang:nif_error(nif_not_loaded).
+nif_adapter_load(_Model, _Path) -> erlang:nif_error(nif_not_loaded).
+nif_adapter_free(_Adapter) -> erlang:nif_error(nif_not_loaded).
+nif_set_adapters(_Ctx, _Adapters) -> erlang:nif_error(nif_not_loaded).
+nif_sampler_new(_Ctx, _Cfg) -> erlang:nif_error(nif_not_loaded).
+nif_sampler_free(_Sampler) -> erlang:nif_error(nif_not_loaded).

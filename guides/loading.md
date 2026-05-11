@@ -44,7 +44,7 @@ pass an explicit id via `load_model/2` (also binary).
   quant_bits        => 4,
   ctx_params_hash   => HashOfCtxParams,
   context_size      => 8192,
-  tier_srv          => default_disk,
+  tier_srv          => my_disk,
   tier              => disk,
   policy            => #{ ... }
 }
@@ -199,7 +199,8 @@ in-flight cache writes are awaited up to that timeout.
 - **Wrong `n_ctx`.** The cache key includes `ctx_params_hash`. If you
   bump `n_ctx` for a tenant, expect a one-shot cold prefill across
   every cached prefix until the new rows accumulate.
-- **Mismatched `tier` / `tier_srv`.** `tier => disk` against
-  `tier_srv => default_ram` is rejected at load time with an
-  explicit error, but it's worth checking the pair before you
-  deploy.
+- **Mismatched `tier` / `tier_srv`.** `tier => disk` against an
+  `erllama_cache_ram` server name fails at first save; verify the
+  pair before deploy. The RAM tier is the only one auto-started; for
+  `ram_file` / `disk`, start the relevant `erllama_cache_disk_srv`
+  yourself and pass its registered name.

@@ -99,7 +99,7 @@ Passed to `erllama:load_model/1,2`:
   quant_bits        => 4,
   ctx_params_hash   => <<32 bytes>>,
   context_size      => 4096,
-  tier_srv          => default_disk,
+  tier_srv          => my_disk,
   tier              => disk,
   policy            => #{
     min_tokens             => 256,

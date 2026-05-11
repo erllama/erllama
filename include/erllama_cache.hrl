@@ -54,7 +54,12 @@
 -define(C_HITS_LONGEST_PREFIX, 17).
 -define(C_LONGEST_PREFIX_PROBES, 18).
 -define(C_LONGEST_PREFIX_NS, 19).
--define(C_NSLOTS, 19).
+%% Bumped when erllama_cache_writer:save returns {error, max_concurrent}
+%% or {error, already_present}. The model layer fires saves as
+%% fire-and-forget; this counter is the only surface that reveals a
+%% back-pressured writer dropping a save the model wanted to fire.
+-define(C_SAVES_DROPPED, 20).
+-define(C_NSLOTS, 20).
 
 %% Public types live in `erllama_cache.erl`. Refer to them as
 %% `erllama_cache:cache_key()` etc. from outside this header.

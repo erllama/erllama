@@ -46,7 +46,12 @@ stubs get replaced; the cache integration is unaffected.
     tokenize/2,
     detokenize/2,
     apply_chat_template/2,
-    embed/2
+    embed/2,
+    load_adapter/2,
+    unload_adapter/2,
+    set_adapter_scale/3,
+    list_adapters/1,
+    get_backend_state/1
 ]).
 
 -export_type([
@@ -72,6 +77,10 @@ stubs get replaced; the cache integration is unaffected.
 }.
 
 -type cache_hit_kind() :: exact | partial | cold.
+
+-type pending_request() ::
+    {complete, gen_statem:from(), binary(), map()}
+    | {infer, gen_statem:from(), [non_neg_integer()], map(), pid()}.
 -type finish_reason() :: stop | length | cancelled.
 -type stats() :: #{
     prompt_tokens := non_neg_integer(),
@@ -83,10 +92,12 @@ stubs get replaced; the cache integration is unaffected.
     cancelled := boolean()
 }.
 
-%% Optional fields the caller may set on `infer/4`. `parent_key` and
-%% `response_tokens` mirror the existing `complete/3` opts; the rest
-%% are placeholders for sampling settings that bucket C will wire to
-%% the llama.cpp sampler.
+%% Optional fields the caller may set on `infer/4`. The same fields
+%% are honoured by `complete/3` Opts. The sampler chain is rebuilt
+%% per-request: grammar -> repetition_penalty -> top_k -> top_p ->
+%% min_p -> (temperature > 0 ? temp -> dist(seed) : greedy). `stop`
+%% is reserved for a future stop-sequence implementation; not used
+%% in 0.1.
 -type infer_params() :: #{
     response_tokens => pos_integer(),
     parent_key => term(),
@@ -94,7 +105,8 @@ stubs get replaced; the cache integration is unaffected.
     top_p => float(),
     top_k => pos_integer(),
     min_p => float(),
-    seed => integer(),
+    repetition_penalty => float(),
+    seed => non_neg_integer(),
     stop => [binary()],
     grammar => binary(),
     _ => _
@@ -113,6 +125,7 @@ stubs get replaced; the cache integration is unaffected.
     model_id :: binary(),
     tier_srv :: atom(),
     tier :: disk | ram_file,
+    %% Base model fingerprint; constant for the life of the model.
     fingerprint :: <<_:256>>,
     fingerprint_mode :: safe | gguf_chunked | fast_unsafe,
     quant_type :: erllama_cache_key:quant_type(),
@@ -123,6 +136,12 @@ stubs get replaced; the cache integration is unaffected.
     %% Inference backend: erllama_model_stub | erllama_model_llama.
     backend :: module(),
     backend_state :: term(),
+    %% Attached LoRA adapters. Each entry holds the backend's opaque
+    %% handle, the file sha256 (for cache-key derivation), and the
+    %% current scale. effective_fp = sha256(fingerprint || sorted
+    %% pairs of sha+scale). Recomputed on every attachment change.
+    adapters = [] :: [#{handle := term(), sha := <<_:256>>, scale := float()}],
+    effective_fp :: <<_:256>>,
     %% Per-request fields
     caller :: gen_statem:from() | undefined,
     prompt_tokens :: [non_neg_integer()],
@@ -131,6 +150,17 @@ stubs get replaced; the cache integration is unaffected.
     response_target :: non_neg_integer(),
     generated :: [non_neg_integer()],
     last_save_at :: non_neg_integer(),
+    %% effective_fp captured at request admission. Cache lookups and
+    %% saves run against this snapshot so a mid-request adapter
+    %% mutation can't corrupt the cache identity for the in-flight
+    %% request.
+    request_fp :: <<_:256>> | undefined,
+    %% FIFO queue of pending complete/infer calls that arrived while
+    %% the model was already busy. The head is dispatched on every
+    %% transition back to `idle`. Each entry is one of:
+    %%   {complete, From, Prompt, Opts}
+    %%   {infer,    From, Tokens, Params, CallerPid}
+    pending = [] :: [pending_request()],
     %% Streaming-mode fields (set by infer/4, unset by complete/2,3).
     mode = standard :: standard | streaming,
     caller_pid :: pid() | undefined,
@@ -176,11 +206,11 @@ asynchronous messages:
 
 `Tokens` is the prompt as a list of token ids - tokenisation is the
 caller's responsibility (use `tokenize/2` or apply a chat template
-first). `Params` is an `infer_params()` map; only `response_tokens`
-and `parent_key` are honoured in v0.1, the rest are reserved for
-bucket C.
+first). `Params` is an `infer_params()` map.
 
-Returns `{error, busy}` if the model is already serving another
+Calls that arrive while a previous request is in flight are queued
+FIFO. The reply `{ok, Ref}` is sent as soon as the call is admitted;
+streaming events follow once the queue head advances to this
 request.
 """.
 -spec infer(model(), [non_neg_integer()], infer_params(), pid()) ->
@@ -285,21 +315,67 @@ Compute an embedding vector for the given prompt tokens.
 embed(Model, Tokens) when is_list(Tokens) ->
     gen_statem:call(via(Model), {embed, Tokens}).
 
+-doc """
+Load a LoRA adapter from a GGUF file and attach it to the model
+with scale 1.0. Returns an opaque handle the caller threads into
+`unload_adapter/2` and `set_adapter_scale/3`. The adapter's sha256 is
+folded into the effective fingerprint so cache rows produced under
+this adapter never collide with rows from a different adapter set.
+""".
+-spec load_adapter(model(), file:filename_all()) ->
+    {ok, term()} | {error, term()}.
+load_adapter(Model, Path) ->
+    gen_statem:call(via(Model), {load_adapter, Path}).
+
+-doc """
+Detach + free a previously loaded adapter. Idempotent: a second call
+on the same handle returns `ok`.
+""".
+-spec unload_adapter(model(), term()) -> ok | {error, term()}.
+unload_adapter(Model, Handle) ->
+    gen_statem:call(via(Model), {unload_adapter, Handle}).
+
+-doc """
+Change an attached adapter's scale. Re-applies the full set on the
+underlying context.
+""".
+-spec set_adapter_scale(model(), term(), float()) -> ok | {error, term()}.
+set_adapter_scale(Model, Handle, Scale) when is_number(Scale) ->
+    gen_statem:call(via(Model), {set_adapter_scale, Handle, float(Scale)}).
+
+-doc """
+List currently attached adapters as `[#{handle => H, scale => F}]`.
+The handle is the same opaque value `load_adapter/2` returned.
+""".
+-spec list_adapters(model()) -> [#{handle := term(), scale := float()}].
+list_adapters(Model) ->
+    gen_statem:call(via(Model), list_adapters).
+
 %% =============================================================================
 %% gen_statem callbacks
 %% =============================================================================
 
 callback_mode() -> state_functions.
 
+%% Test-only: returns the current backend state. Used by sampler
+%% plumbing tests to assert that configure_sampler/2 lands the right
+%% map on the stub backend. Not part of the public API; the test
+%% suite is the only caller.
+-doc false.
+get_backend_state(Model) ->
+    {_State, Data} = sys:get_state(via(Model)),
+    Data#data.backend_state.
+
 init([ModelId, Config]) ->
     Backend = maps:get(backend, Config, erllama_model_stub),
     case Backend:init(Config) of
         {ok, BState} ->
+            Fp = maps:get(fingerprint, Config, default_fingerprint()),
             Data = #data{
                 model_id = ModelId,
                 tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
                 tier = maps:get(tier, Config, ram),
-                fingerprint = maps:get(fingerprint, Config, default_fingerprint()),
+                fingerprint = Fp,
                 fingerprint_mode = maps:get(fingerprint_mode, Config, safe),
                 quant_type = maps:get(quant_type, Config, f16),
                 quant_bits = maps:get(quant_bits, Config, 16),
@@ -308,6 +384,9 @@ init([ModelId, Config]) ->
                 policy = resolve_policy(Config),
                 backend = Backend,
                 backend_state = BState,
+                adapters = [],
+                %% No adapters at boot -> effective fp == base fp.
+                effective_fp = Fp,
                 prompt_tokens = [],
                 context_tokens = [],
                 response_target = 0,
@@ -339,13 +418,24 @@ terminate(_Reason, _State, #data{backend = B, backend_state = S}) ->
 terminate(_Reason, _State, _Data) ->
     ok.
 
-%% Placeholder fingerprint when none supplied. The cache key still
-%% segregates rows by this 32-byte tag, so different models that share
-%% the default never collide unless their tokens + ctx params also
-%% match - but pass a real fingerprint in production.
+%% Placeholder fingerprint when none supplied.
+%%
+%% Production code must always pass a real fingerprint via
+%% `crypto:hash(sha256, ModelBytes)`. The default exists only so the
+%% minimal `load_model/1` example in the docs runs without an
+%% operator having to compute a hash first.
+%%
+%% Sharing the default across two distinct models lets the cache
+%% accidentally false-hit between them (same default fp + same
+%% tokens + same ctx_params -> same key). Hardly anyone hits this
+%% in practice because real prompts differ, but it is unsafe under
+%% adversarial inputs.
 default_fingerprint() ->
     binary:copy(<<0>>, 32).
 
+%% Same caveat as default_fingerprint/0. Pass a real
+%% `crypto:hash(sha256, term_to_binary({Nctx, Nbatch}))` in
+%% production.
 default_ctx_params_hash() ->
     binary:copy(<<0>>, 32).
 
@@ -363,24 +453,33 @@ idle(EventType, EventContent, Data) ->
     handle_common(idle, EventType, EventContent, Data).
 
 start_complete(From, Prompt, Opts, Data) ->
-    PromptTokens = backend_call(Data, tokenize, [Prompt]),
-    Data1 = Data#data{
-        mode = standard,
-        caller = From,
-        caller_pid = undefined,
-        request_ref = undefined,
-        cancel_pending = false,
-        prompt_tokens = PromptTokens,
-        response_target = maps:get(response_tokens, Opts, 4),
-        generated = [],
-        prefill_started_at = erlang:monotonic_time(millisecond)
-    },
-    enter_after_lookup(maps:get(parent_key, Opts, undefined), Data1).
+    case configure_sampler_for(Opts, Data) of
+        {ok, Data0} ->
+            PromptTokens = backend_call(Data0, tokenize, [Prompt]),
+            Data1 = Data0#data{
+                mode = standard,
+                caller = From,
+                caller_pid = undefined,
+                request_ref = undefined,
+                cancel_pending = false,
+                prompt_tokens = PromptTokens,
+                response_target = maps:get(response_tokens, Opts, 4),
+                generated = [],
+                prefill_started_at = erlang:monotonic_time(millisecond),
+                %% Snapshot the effective fingerprint for the life of
+                %% the request. Any concurrent adapter mutation arriving
+                %% between tokens stays out of the cache identity until
+                %% this request finishes.
+                request_fp = Data0#data.effective_fp
+            },
+            enter_after_lookup(maps:get(parent_key, Opts, undefined), Data1);
+        {error, Reason} ->
+            {keep_state, Data, [{reply, From, {error, Reason}}]}
+    end.
 
 start_infer(From, Tokens, Params, CallerPid, Data) ->
     Ref = make_ref(),
-    Grammar = maps:get(grammar, Params, undefined),
-    case set_grammar(Grammar, Data) of
+    case configure_sampler_for(Params, Data) of
         {ok, Data0} ->
             ok = erllama_inflight:register(Ref, self()),
             Data1 = Data0#data{
@@ -392,7 +491,8 @@ start_infer(From, Tokens, Params, CallerPid, Data) ->
                 prompt_tokens = Tokens,
                 response_target = maps:get(response_tokens, Params, 64),
                 generated = [],
-                prefill_started_at = erlang:monotonic_time(millisecond)
+                prefill_started_at = erlang:monotonic_time(millisecond),
+                request_fp = Data0#data.effective_fp
             },
             %% Reply with the ref before kicking off prefill so the caller is
             %% guaranteed to have it before any erllama_token messages land.
@@ -449,11 +549,16 @@ generating(EventType, EventContent, Data) ->
 %% Common event handler
 %% =============================================================================
 
-handle_common(_State, {call, From}, {complete, _, _}, Data) ->
-    %% Reject concurrent complete/infer calls; only one in flight.
-    reply(From, {error, busy}, Data);
-handle_common(_State, {call, From}, {infer, _, _, _}, Data) ->
-    reply(From, {error, busy}, Data);
+handle_common(_State, {call, From}, {complete, Prompt, Opts}, Data) ->
+    %% Concurrent calls are queued, not rejected. The head of the
+    %% queue is dispatched whenever the state machine returns to
+    %% idle. This preserves all cache integration semantics: the
+    %% in-flight request finishes its lookups, saves, and pin-and-
+    %% load against its own request_fp snapshot before the queued
+    %% request even starts.
+    {keep_state, enqueue({complete, From, Prompt, Opts}, Data)};
+handle_common(_State, {call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
+    {keep_state, enqueue({infer, From, Tokens, Params, CallerPid}, Data)};
 handle_common(_State, cast, {cancel, Ref}, Data = #data{request_ref = Ref}) ->
     {keep_state, Data#data{cancel_pending = true}};
 handle_common(_State, cast, {cancel, _OtherRef}, Data) ->
@@ -473,8 +578,160 @@ handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
     reply(From, optional_backend_call(Data, apply_chat_template, [Request]), Data);
 handle_common(_State, {call, From}, {embed, Tokens}, Data) ->
     reply(From, optional_backend_call(Data, embed, [Tokens]), Data);
+handle_common(State, {call, From}, {load_adapter, Path}, Data) ->
+    handle_load_adapter(State, From, Path, Data);
+handle_common(State, {call, From}, {unload_adapter, Handle}, Data) ->
+    handle_unload_adapter(State, From, Handle, Data);
+handle_common(State, {call, From}, {set_adapter_scale, Handle, Scale}, Data) ->
+    handle_set_adapter_scale(State, From, Handle, Scale, Data);
+handle_common(_State, {call, From}, list_adapters, Data) ->
+    Listing = [
+        #{handle => H, scale => Scale}
+     || #{handle := H, scale := Scale} <- Data#data.adapters
+    ],
+    reply(From, Listing, Data);
 handle_common(_State, _EventType, _EventContent, Data) ->
     {keep_state, Data}.
+
+handle_load_adapter(_State, From, Path, Data) ->
+    Loaded =
+        case load_adapter_impl(Path, Data) of
+            {ok, Handle, Data1} -> {ok, Data1, {ok, Handle}};
+            {error, _} = E -> E
+        end,
+    case Loaded of
+        {ok, NewData, Reply} -> {keep_state, NewData, [{reply, From, Reply}]};
+        {error, _} = E2 -> {keep_state, Data, [{reply, From, E2}]}
+    end.
+
+handle_unload_adapter(_State, From, Handle, Data) ->
+    reply_with_data_update(From, Data, unload_adapter_impl(Handle, Data), ok).
+
+handle_set_adapter_scale(_State, From, Handle, Scale, Data) ->
+    reply_with_data_update(
+        From, Data, set_adapter_scale_impl(Handle, Scale, Data), ok
+    ).
+
+%% Helper: convert an `impl` function's `{ok, Data1} | {error, _}`
+%% return into a `keep_state` transition that replies to From either
+%% with OkReply (on success) or with the error tuple verbatim.
+reply_with_data_update(From, _OldData, {ok, Data1}, OkReply) ->
+    {keep_state, Data1, [{reply, From, OkReply}]};
+reply_with_data_update(From, OldData, {error, _} = E, _OkReply) ->
+    {keep_state, OldData, [{reply, From, E}]}.
+
+%% LoRA mutation helpers. Each call recomputes effective_fp from the
+%% updated adapter list and reapplies the full set on the backend. We
+%% read the adapter file once to derive its sha256 so the cache key
+%% can fold it in deterministically.
+load_adapter_impl(Path, Data) ->
+    Mod = Data#data.backend,
+    case erlang:function_exported(Mod, load_adapter, 2) of
+        false -> {error, not_supported};
+        true -> load_adapter_step1(Path, Data)
+    end.
+
+load_adapter_step1(Path, Data) ->
+    case adapter_sha256(Path) of
+        {ok, Sha} -> load_adapter_step2(Path, Sha, Data);
+        {error, _} = E -> E
+    end.
+
+load_adapter_step2(Path, Sha, Data) ->
+    Mod = Data#data.backend,
+    case Mod:load_adapter(Data#data.backend_state, Path) of
+        {ok, Handle, S1} ->
+            Entry = #{handle => Handle, sha => Sha, scale => 1.0},
+            New = Data#data.adapters ++ [Entry],
+            apply_and_recompute(
+                Data#data{backend_state = S1, adapters = New}, Handle
+            );
+        {error, _} = E ->
+            E
+    end.
+
+unload_adapter_impl(Handle, Data) ->
+    case find_adapter(Handle, Data#data.adapters) of
+        false ->
+            %% Idempotent: unknown / already removed.
+            {ok, Data};
+        {value, _Entry, Rest} ->
+            unload_adapter_step1(Handle, Rest, Data)
+    end.
+
+unload_adapter_step1(Handle, Rest, Data) ->
+    Mod = Data#data.backend,
+    case erlang:function_exported(Mod, unload_adapter, 2) of
+        false ->
+            {error, not_supported};
+        true ->
+            case Mod:unload_adapter(Data#data.backend_state, Handle) of
+                {ok, S1} ->
+                    apply_and_recompute(
+                        Data#data{backend_state = S1, adapters = Rest}, ok
+                    );
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+set_adapter_scale_impl(Handle, Scale, Data) ->
+    case find_adapter(Handle, Data#data.adapters) of
+        false ->
+            {error, not_found};
+        {value, Entry, Rest} ->
+            Updated = Entry#{scale => Scale},
+            Adapters1 = Rest ++ [Updated],
+            Data1 = Data#data{adapters = Adapters1},
+            apply_and_recompute(Data1, ok)
+    end.
+
+find_adapter(Handle, List) ->
+    case [E || E <- List, maps:get(handle, E) =:= Handle] of
+        [] -> false;
+        [E | _] -> {value, E, [X || X <- List, maps:get(handle, X) =/= Handle]}
+    end.
+
+%% Reapply the adapter set on the backend (if it supports it) and
+%% recompute the effective fingerprint. The Result is what the public
+%% API hands back to the caller: either an `ok` marker or
+%% `{ok, Handle}` for load.
+apply_and_recompute(Data, Result) ->
+    case apply_current_adapters(Data) of
+        {ok, S1} ->
+            finalize_recompute(Data#data{backend_state = S1}, Result);
+        {error, _} = E ->
+            E
+    end.
+
+apply_current_adapters(#data{backend = Mod, backend_state = S, adapters = A}) ->
+    case erlang:function_exported(Mod, apply_adapters, 2) of
+        true ->
+            Pairs = [{maps:get(handle, X), maps:get(scale, X)} || X <- A],
+            Mod:apply_adapters(S, Pairs);
+        false ->
+            {ok, S}
+    end.
+
+finalize_recompute(Data, Result) ->
+    ShaScales = [
+        {maps:get(sha, A), maps:get(scale, A)}
+     || A <- Data#data.adapters
+    ],
+    NewFp = erllama_cache_key:effective_fingerprint(
+        Data#data.fingerprint, ShaScales
+    ),
+    Data1 = Data#data{effective_fp = NewFp},
+    case Result of
+        ok -> {ok, Data1};
+        Handle -> {ok, Handle, Data1}
+    end.
+
+adapter_sha256(Path) ->
+    case file:read_file(Path) of
+        {ok, Bin} -> {ok, crypto:hash(sha256, Bin)};
+        {error, _} = E -> E
+    end.
 
 %% Helper: synchronous reply with no state change.
 reply(From, Reply, Data) ->
@@ -617,7 +874,10 @@ reset(Data) ->
         prompt_tokens = [],
         generated = [],
         response_target = 0,
-        last_save_at = 0
+        last_save_at = 0,
+        %% Drop the per-request fingerprint snapshot so the next
+        %% request picks up the current effective_fp.
+        request_fp = undefined
     }.
 
 maybe_fire_continued(Data) ->
@@ -641,11 +901,11 @@ finish_request(Data, FinishReason) ->
             Reply = backend_call(Data1, detokenize, [Data1#data.generated]),
             From = Data1#data.caller,
             Generated = Data1#data.generated,
-            {next_state, idle, reset(Data1), [{reply, From, {ok, Reply, Generated}}]};
+            return_to_idle(reset(Data1), [{reply, From, {ok, Reply, Generated}}]);
         streaming ->
             Stats = build_stats(FinishReason, false, Data1),
             send_done(Data1, Stats),
-            {next_state, idle, reset(Data1)}
+            return_to_idle(reset(Data1), [])
     end.
 
 finish_request_cancelled(Data) ->
@@ -655,7 +915,42 @@ finish_request_cancelled(Data) ->
     {ok, Data1} = clear_grammar(Data),
     Stats = build_stats(cancelled, true, Data1),
     send_done(Data1, Stats),
-    {next_state, idle, reset(Data1)}.
+    return_to_idle(reset(Data1), []).
+
+%% Drop back to idle. If a queued request exists, dispatch its head
+%% inline before yielding the scheduler. The reply action for the
+%% completing request is still emitted; the queued request just gets
+%% the state machine started.
+return_to_idle(Data, Actions) ->
+    case Data#data.pending of
+        [] -> {next_state, idle, Data, Actions};
+        [Head | Rest] -> dispatch_pending(Head, Data#data{pending = Rest}, Actions)
+    end.
+
+dispatch_pending({complete, From, Prompt, Opts}, Data, Actions) ->
+    merge_dispatch(start_complete(From, Prompt, Opts, Data), Actions);
+dispatch_pending({infer, From, Tokens, Params, CallerPid}, Data, Actions) ->
+    merge_dispatch(start_infer(From, Tokens, Params, CallerPid, Data), Actions).
+
+%% start_complete / start_infer return one of:
+%%   {keep_state, Data, [{reply, _, _}]}             (error path)
+%%   {next_state, generating, Data}                  (start_complete success
+%%                                                    relies on the implicit
+%%                                                    gen_statem reply that
+%%                                                    fires when the request
+%%                                                    finishes)
+%%   {next_state, NextState, Data, [{reply, _, _}]}  (start_infer success)
+%% Splice the completing request's actions in front so its reply
+%% lands first.
+merge_dispatch({keep_state, NewData, MoreActions}, Actions) ->
+    {next_state, idle, NewData, Actions ++ MoreActions};
+merge_dispatch({next_state, NextState, NewData}, Actions) ->
+    {next_state, NextState, NewData, Actions};
+merge_dispatch({next_state, NextState, NewData, MoreActions}, Actions) ->
+    {next_state, NextState, NewData, Actions ++ MoreActions}.
+
+enqueue(Item, Data) ->
+    Data#data{pending = Data#data.pending ++ [Item]}.
 
 send_done(#data{mode = streaming, caller_pid = Pid, request_ref = Ref}, Stats) ->
     erllama_inflight:unregister(Ref),
@@ -671,12 +966,51 @@ send_error(#data{mode = streaming, caller_pid = Pid, request_ref = Ref}, Reason)
 send_error(_, _) ->
     ok.
 
-%% Optional grammar setup. If the backend doesn't export set_grammar
-%% the caller's grammar (if any) is silently ignored. Returns the
-%% (possibly updated) Data on success.
+%% Build the sampler-config subset from request opts. Only the keys
+%% the sampler chain cares about; everything else (response_tokens,
+%% parent_key) is dropped.
+-define(SAMPLER_KEYS, [
+    grammar,
+    repetition_penalty,
+    top_k,
+    top_p,
+    min_p,
+    temperature,
+    seed
+]).
+
+sampler_cfg_from(Opts) ->
+    maps:with(?SAMPLER_KEYS, Opts).
+
+%% Configure the per-request sampler chain. Wired to both
+%% configure_sampler/2 (preferred) and the older set_grammar/2 callback
+%% as a fallback for backends that haven't been ported. If the caller
+%% passed no sampler keys at all we still call the backend so any
+%% leftover state from a previous request is reset.
+configure_sampler_for(Opts, Data) ->
+    Cfg = sampler_cfg_from(Opts),
+    configure_sampler_call(Cfg, Data).
+
+configure_sampler_call(Cfg, Data = #data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, configure_sampler, 2) of
+        true ->
+            case Mod:configure_sampler(S, Cfg) of
+                {ok, S1} -> {ok, Data#data{backend_state = S1}};
+                {error, _} = E -> E
+            end;
+        false ->
+            %% Backwards-compat: legacy backends only know set_grammar.
+            Grammar = maps:get(grammar, Cfg, undefined),
+            set_grammar(Grammar, Data)
+    end.
+
+%% Legacy grammar-only callback path. Kept so backends that only
+%% implement set_grammar/2 + clear_sampler/1 still work.
 set_grammar(undefined, Data) ->
     clear_grammar(Data);
-set_grammar(Grammar, Data = #data{backend = Mod, backend_state = S}) when is_binary(Grammar) ->
+set_grammar(Grammar, Data = #data{backend = Mod, backend_state = S}) when
+    is_binary(Grammar)
+->
     case erlang:function_exported(Mod, set_grammar, 2) of
         true ->
             case Mod:set_grammar(S, Grammar) of
@@ -751,7 +1085,7 @@ lookup_or_resume(PromptTokens, ParentKey, Data) ->
 %% cached prefix; fall through to cold if nothing matches.
 try_longest_prefix(PromptTokens, Data) ->
     KeyMeta = #{
-        fingerprint => Data#data.fingerprint,
+        fingerprint => request_fp(Data),
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash
     },
@@ -824,20 +1158,26 @@ pin_and_load(Key, Data) ->
     Result =
         case erllama_cache_meta_srv:checkout(Key, self()) of
             {ok, HolderRef, Tier, Loc, _Header, TokensBin} ->
-                Bin = load_payload(Tier, Loc, Key, Data),
-                case Bin of
-                    <<>> ->
-                        ok = erllama_cache_meta_srv:checkin(HolderRef),
-                        miss;
-                    _ ->
-                        ok = backend_call(Data, kv_unpack, [Bin]),
-                        ok = erllama_cache_meta_srv:checkin(HolderRef),
-                        Tokens =
-                            case TokensBin of
-                                undefined -> [];
-                                _ -> erllama_cache_key:decode_tokens(TokensBin)
-                            end,
-                        {ok, Tokens}
+                %% try/after guarantees the holder is released even if
+                %% load_payload or kv_unpack throws. Without it, recovery
+                %% relies on the meta server's process monitor firing,
+                %% which leaves a brief window where the slab is pinned.
+                try
+                    Bin = load_payload(Tier, Loc, Key, Data),
+                    case Bin of
+                        <<>> ->
+                            miss;
+                        _ ->
+                            ok = backend_call(Data, kv_unpack, [Bin]),
+                            Tokens =
+                                case TokensBin of
+                                    undefined -> [];
+                                    _ -> erllama_cache_key:decode_tokens(TokensBin)
+                                end,
+                            {ok, Tokens}
+                    end
+                after
+                    ok = erllama_cache_meta_srv:checkin(HolderRef)
                 end;
             {error, busy} ->
                 miss;
@@ -877,10 +1217,20 @@ fire_save_if(true, Reason, Tokens, Data) ->
     Payload = backend_call(Data, kv_pack, [Tokens]),
     Elapsed = erlang:monotonic_time(nanosecond) - T0,
     erllama_cache_counters:add(?C_PACK_TOTAL_NS, max(Elapsed, 0)),
-    _ = erllama_cache_writer:save(
-        Data#data.tier_srv, Data#data.tier, BuildMeta, Payload, 0
-    ),
-    ok.
+    case
+        erllama_cache_writer:save(
+            Data#data.tier_srv, Data#data.tier, BuildMeta, Payload, 0
+        )
+    of
+        {ok, _} ->
+            ok;
+        {error, _SaveErr} ->
+            %% Writer pool saturated or row already present. Either way
+            %% the save the model wanted to fire didn't land; surface
+            %% the drop via a counter so operators can see back-pressure.
+            erllama_cache_counters:incr(?C_SAVES_DROPPED),
+            ok
+    end.
 
 %% Evict and shutdown saves: fire unconditionally if there is any
 %% live context, regardless of `min_tokens`. The plan's policy
@@ -899,7 +1249,7 @@ build_meta_for(SaveReason, Tokens, Data) ->
     #{
         save_reason => SaveReason,
         quant_bits => Data#data.quant_bits,
-        fingerprint => Data#data.fingerprint,
+        fingerprint => request_fp(Data),
         fingerprint_mode => Data#data.fingerprint_mode,
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash,
@@ -910,11 +1260,18 @@ build_meta_for(SaveReason, Tokens, Data) ->
 
 make_key(Tokens, Data) ->
     erllama_cache_key:make(#{
-        fingerprint => Data#data.fingerprint,
+        fingerprint => request_fp(Data),
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash,
         tokens => Tokens
     }).
+
+%% Fingerprint to use for cache identity. Returns the per-request
+%% snapshot if one was captured at admission (so a mid-request
+%% adapter mutation can't shift the in-flight identity); otherwise
+%% the current effective fingerprint.
+request_fp(#data{request_fp = undefined, effective_fp = FP}) -> FP;
+request_fp(#data{request_fp = FP}) -> FP.
 
 is_strict_prefix([], _) -> true;
 is_strict_prefix([H | T1], [H | T2]) -> is_strict_prefix(T1, T2);

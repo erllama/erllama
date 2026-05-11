@@ -42,6 +42,9 @@ an explicit `model_id` in the config map.
     complete/3,
     infer/4,
     cancel/1,
+    status/1,
+    evict/1,
+    shutdown/1,
     models/0,
     list_models/0,
     model_info/1,
@@ -49,6 +52,10 @@ an explicit `model_id` in the config map.
     detokenize/2,
     apply_chat_template/2,
     embed/2,
+    load_adapter/2,
+    unload_adapter/2,
+    set_adapter_scale/3,
+    list_adapters/1,
     counters/0
 ]).
 
@@ -95,6 +102,20 @@ unload_model(Model) ->
 complete(Model, Prompt) ->
     erllama_model:complete(Model, Prompt).
 
+-doc """
+Run a completion against a loaded model with options.
+
+Recognised keys in `Opts`:
+
+- `response_tokens` (`non_neg_integer()`) — cap on the number of
+  tokens generated. Defaults to the model's `n_ctx` minus prompt
+  length.
+- `parent_key` (`erllama_cache:cache_key()`) — the previous turn's
+  finish-save key. Skips the longest-prefix walk and resumes
+  directly from that row.
+
+Returns `{ok, ReplyText, FullTokenList}` on success.
+""".
 -spec complete(model(), binary(), map()) ->
     {ok, binary(), [erllama_nif:token_id()]} | {error, term()}.
 complete(Model, Prompt, Opts) ->
@@ -132,6 +153,31 @@ Stats}` with `cancelled => true`.
 -spec cancel(reference()) -> ok.
 cancel(Ref) ->
     erllama_model:cancel(Ref).
+
+-doc """
+Current model state. `idle` means no request is in flight;
+`prefilling` and `generating` are the two active phases.
+""".
+-spec status(model()) -> idle | prefilling | generating.
+status(Model) ->
+    erllama_model:status(Model).
+
+-doc """
+Fire an `evict` save synchronously and release the model's live KV
+state. Used by an external memory-pressure scheduler when it wants
+this model's working set off the heap without unloading the model.
+""".
+-spec evict(model()) -> ok.
+evict(Model) ->
+    erllama_model:evict(Model).
+
+-doc """
+Fire a `shutdown` save synchronously and return. Called from a
+release stop hook; bounded by `evict_save_timeout_ms`.
+""".
+-spec shutdown(model()) -> ok.
+shutdown(Model) ->
+    erllama_model:shutdown(Model).
 
 -doc """
 List currently-loaded model pids (low-level supervisor view). Most
@@ -197,6 +243,44 @@ apply_chat_template(Model, Request) ->
     {ok, [float()]} | {error, term()}.
 embed(Model, Tokens) ->
     erllama_model:embed(Model, Tokens).
+
+-doc """
+Load a LoRA adapter from a GGUF file and attach it to the model with
+scale 1.0. Returns an opaque handle to pass to `set_adapter_scale/3`
+and `unload_adapter/2`.
+
+The adapter's file sha256 is folded into the model's effective
+fingerprint so cache rows produced with the adapter attached never
+collide with rows from a different attachment set. In-flight
+requests keep their original fingerprint snapshot; the new value
+takes effect from the next request.
+""".
+-spec load_adapter(model(), file:filename_all()) ->
+    {ok, term()} | {error, term()}.
+load_adapter(Model, Path) ->
+    erllama_model:load_adapter(Model, Path).
+
+-doc """
+Detach and free a previously loaded adapter. Idempotent.
+""".
+-spec unload_adapter(model(), term()) -> ok | {error, term()}.
+unload_adapter(Model, Handle) ->
+    erllama_model:unload_adapter(Model, Handle).
+
+-doc """
+Change an attached adapter's scale. The scale is folded into the
+effective fingerprint, so changes split the cache namespace.
+""".
+-spec set_adapter_scale(model(), term(), float()) -> ok | {error, term()}.
+set_adapter_scale(Model, Handle, Scale) ->
+    erllama_model:set_adapter_scale(Model, Handle, Scale).
+
+-doc """
+List currently attached adapters with their scales.
+""".
+-spec list_adapters(model()) -> [#{handle := term(), scale := float()}].
+list_adapters(Model) ->
+    erllama_model:list_adapters(Model).
 
 -doc "Snapshot of the cache subsystem operational counters.".
 -spec counters() -> #{atom() => non_neg_integer()}.
