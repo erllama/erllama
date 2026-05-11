@@ -17,6 +17,7 @@
 #include "llama.h"
 
 #include <climits>
+#include <cstring>
 #include <new>
 #include <pthread.h>
 #include <stdint.h>
@@ -24,6 +25,40 @@
 // Sentinel returned by erllama_safe_decode on a thrown exception.
 // Mirrors the macro in erllama_nif.c; both sides must agree.
 #define ERLLAMA_DECODE_EXC_SENTINEL INT_MIN
+
+// Model-load classification. Mirrored in erllama_nif.c; both
+// sides must agree on the integer values.
+typedef enum {
+    ERLLAMA_LOAD_OK        = 0,
+    ERLLAMA_LOAD_FAILED    = 1,  // generic NULL return
+    ERLLAMA_LOAD_MALFORMED = 2,  // captured ASSERT-style log line
+    ERLLAMA_LOAD_EXCEPTION = 3,  // C++ exception caught
+} erllama_load_status_t;
+
+// Best-effort capture of the most recent llama log line. The
+// _v2 model load wrapper clears the buffer immediately before
+// calling llama_model_load_from_file and inspects it on a NULL
+// return to classify malformed-GGUF cases. llama_log_set is
+// process-global, so the classification is **not** reliable
+// under concurrent loads -- the captured line may belong to
+// the other load. Treat MALFORMED vs FAILED as informational
+// only; they both mean "load did not succeed". A complete fix
+// would require subprocess isolation, out of scope here.
+static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_last_log_line[512] = {0};
+
+static void erllama_log_capture(enum ggml_log_level level,
+                                const char *text, void *user_data) noexcept {
+    (void) level;
+    (void) user_data;
+    if (!text) return;
+    pthread_mutex_lock(&g_log_mu);
+    size_t n = strlen(text);
+    if (n >= sizeof(g_last_log_line)) n = sizeof(g_last_log_line) - 1;
+    memcpy(g_last_log_line, text, n);
+    g_last_log_line[n] = '\0';
+    pthread_mutex_unlock(&g_log_mu);
+}
 
 extern "C" {
 
@@ -183,6 +218,9 @@ int erllama_safe_backend_init_once(void) noexcept {
     pthread_once(&once, []() noexcept {
         try {
             llama_backend_init();
+            // Best-effort log capture for malformed-GGUF
+            // classification. See erllama_log_capture comment.
+            llama_log_set(erllama_log_capture, nullptr);
             rc = 0;
         } catch (...) {
             rc = -1;
@@ -212,6 +250,41 @@ erllama_safe_model_load_from_file(const char *path,
     } catch (...) {
         return nullptr;
     }
+}
+
+// _v2 returns the model and writes a status to *out_status. Status
+// is the source of truth; the model pointer is NULL on every
+// non-OK status. The captured log buffer is cleared before the
+// call so a stale GGML_ASSERT line from a prior load cannot
+// mis-classify an unrelated NULL return as MALFORMED.
+struct llama_model *
+erllama_safe_model_load_from_file_v2(const char *path,
+                                     struct llama_model_params params,
+                                     erllama_load_status_t *out_status) noexcept {
+    if (out_status) *out_status = ERLLAMA_LOAD_FAILED;
+    pthread_mutex_lock(&g_log_mu);
+    g_last_log_line[0] = '\0';
+    pthread_mutex_unlock(&g_log_mu);
+
+    struct llama_model *m = nullptr;
+    try {
+        m = llama_model_load_from_file(path, params);
+    } catch (...) {
+        if (out_status) *out_status = ERLLAMA_LOAD_EXCEPTION;
+        return nullptr;
+    }
+    if (m) {
+        if (out_status) *out_status = ERLLAMA_LOAD_OK;
+        return m;
+    }
+
+    pthread_mutex_lock(&g_log_mu);
+    bool malformed = strstr(g_last_log_line, "GGML_ASSERT") != nullptr;
+    pthread_mutex_unlock(&g_log_mu);
+    if (out_status) {
+        *out_status = malformed ? ERLLAMA_LOAD_MALFORMED : ERLLAMA_LOAD_FAILED;
+    }
+    return nullptr;
 }
 
 int erllama_safe_model_free(struct llama_model *m) noexcept {
@@ -265,6 +338,22 @@ erllama_safe_model_get_vocab(const struct llama_model *m) noexcept {
 int32_t erllama_safe_vocab_n_tokens(const struct llama_vocab *v) noexcept {
     try {
         return llama_vocab_n_tokens(v);
+    } catch (...) {
+        return 0;
+    }
+}
+
+uint32_t erllama_safe_n_ctx(const struct llama_context *c) noexcept {
+    try {
+        return llama_n_ctx(c);
+    } catch (...) {
+        return 0;
+    }
+}
+
+uint32_t erllama_safe_n_batch(const struct llama_context *c) noexcept {
+    try {
+        return llama_n_batch(c);
     } catch (...) {
         return 0;
     }

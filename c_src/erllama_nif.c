@@ -39,6 +39,17 @@
  * sides must agree. */
 #define ERLLAMA_DECODE_EXC_SENTINEL INT_MIN
 
+/* Mirror of erllama_load_status_t in erllama_safe.cpp; both sides
+ * must agree on the integer values. Used by the _v2 model load
+ * wrapper to distinguish a generic NULL return from a captured
+ * GGML_ASSERT-flavoured failure. */
+typedef enum {
+    ERLLAMA_LOAD_OK        = 0,
+    ERLLAMA_LOAD_FAILED    = 1,
+    ERLLAMA_LOAD_MALFORMED = 2,
+    ERLLAMA_LOAD_EXCEPTION = 3,
+} erllama_load_status_t;
+
 #include "crc32c.h"
 #include "llama.h"
 
@@ -78,6 +89,9 @@ extern int erllama_safe_backend_init_once(void);
 extern int erllama_safe_backend_free(void);
 extern struct llama_model *erllama_safe_model_load_from_file(
     const char *path, struct llama_model_params params);
+extern struct llama_model *erllama_safe_model_load_from_file_v2(
+    const char *path, struct llama_model_params params,
+    erllama_load_status_t *out_status);
 extern int erllama_safe_model_free(struct llama_model *m);
 extern struct llama_context *erllama_safe_init_from_model(
     struct llama_model *m, struct llama_context_params params);
@@ -87,6 +101,8 @@ extern const struct llama_model *erllama_safe_get_model(
 extern const struct llama_vocab *erllama_safe_model_get_vocab(
     const struct llama_model *m);
 extern int32_t erllama_safe_vocab_n_tokens(const struct llama_vocab *v);
+extern uint32_t erllama_safe_n_ctx(const struct llama_context *c);
+extern uint32_t erllama_safe_n_batch(const struct llama_context *c);
 extern int erllama_safe_vocab_is_eog(const struct llama_vocab *v,
                                      llama_token tok);
 extern int32_t erllama_safe_tokenize(const struct llama_vocab *vocab,
@@ -149,6 +165,7 @@ extern int erllama_safe_set_embeddings(struct llama_context *c, bool value);
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_error;
 static ERL_NIF_TERM atom_load_failed;
+static ERL_NIF_TERM atom_malformed_gguf;
 static ERL_NIF_TERM atom_context_failed;
 static ERL_NIF_TERM atom_tokenize_failed;
 static ERL_NIF_TERM atom_pack_failed;
@@ -158,6 +175,8 @@ static ERL_NIF_TERM atom_false;
 static ERL_NIF_TERM atom_released;
 static ERL_NIF_TERM atom_too_large;
 static ERL_NIF_TERM atom_invalid_token;
+static ERL_NIF_TERM atom_context_overflow;
+static ERL_NIF_TERM atom_batch_overflow;
 static ERL_NIF_TERM atom_oom;
 static ERL_NIF_TERM atom_deferred;
 static ERL_NIF_TERM atom_exception;
@@ -167,6 +186,7 @@ static ERL_NIF_TERM atom_template_failed;
 static ERL_NIF_TERM atom_grammar_failed;
 static ERL_NIF_TERM atom_embed_failed;
 static ERL_NIF_TERM atom_not_supported;
+static ERL_NIF_TERM atom_invalid_content;
 
 /* Forward decl: build_default_greedy_chain is defined in the sampler
  * section but used as a lazy fallback in nif_decode_one. */
@@ -412,6 +432,7 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     atom_ok = enif_make_atom(env, "ok");
     atom_error = enif_make_atom(env, "error");
     atom_load_failed = enif_make_atom(env, "load_failed");
+    atom_malformed_gguf = enif_make_atom(env, "malformed_gguf");
     atom_context_failed = enif_make_atom(env, "context_failed");
     atom_tokenize_failed = enif_make_atom(env, "tokenize_failed");
     atom_pack_failed = enif_make_atom(env, "pack_failed");
@@ -421,6 +442,8 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     atom_released = enif_make_atom(env, "released");
     atom_too_large = enif_make_atom(env, "too_large");
     atom_invalid_token = enif_make_atom(env, "invalid_token");
+    atom_context_overflow = enif_make_atom(env, "context_overflow");
+    atom_batch_overflow = enif_make_atom(env, "batch_overflow");
     atom_oom = enif_make_atom(env, "oom");
     atom_deferred = enif_make_atom(env, "deferred");
     atom_exception = enif_make_atom(env, "exception");
@@ -430,6 +453,7 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     atom_grammar_failed = enif_make_atom(env, "grammar_failed");
     atom_embed_failed = enif_make_atom(env, "embed_failed");
     atom_not_supported = enif_make_atom(env, "not_supported");
+    atom_invalid_content = enif_make_atom(env, "invalid_content");
 
     MODEL_RT = enif_open_resource_type(
         env, NULL, "erllama_model", model_dtor, ERL_NIF_RT_CREATE, NULL);
@@ -586,9 +610,14 @@ static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     if (get_map_bool(env, argv[1], "use_mlock", &b)) params.use_mlock = b ? true : false;
     if (get_map_bool(env, argv[1], "vocab_only", &b)) params.vocab_only = b ? true : false;
 
-    struct llama_model *model = erllama_safe_model_load_from_file(path, params);
+    erllama_load_status_t status = ERLLAMA_LOAD_FAILED;
+    struct llama_model *model =
+        erllama_safe_model_load_from_file_v2(path, params, &status);
     if (!model) {
-        return enif_make_tuple2(env, atom_error, atom_load_failed);
+        ERL_NIF_TERM why = (status == ERLLAMA_LOAD_MALFORMED)
+                               ? atom_malformed_gguf
+                               : atom_load_failed;
+        return enif_make_tuple2(env, atom_error, why);
     }
 
     erllama_model_t *res = enif_alloc_resource(MODEL_RT, sizeof(*res));
@@ -1087,6 +1116,26 @@ static ERL_NIF_TERM nif_prefill(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
             return enif_make_tuple2(env, atom_error, atom_invalid_token);
         }
     }
+    /* Bounds-check against the live context. llama_decode dereferences
+     * past the KV slab when n_tokens >= n_ctx, and is undefined when
+     * n_tokens > n_batch -- both produce SIGSEGV under real load. */
+    uint32_t n_ctx = erllama_safe_n_ctx(c->ctx);
+    uint32_t n_batch = erllama_safe_n_batch(c->ctx);
+    if (n_ctx == 0 || n_batch == 0) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
+    if ((uint32_t) n >= n_ctx) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_context_overflow);
+    }
+    if ((uint32_t) n > n_batch) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_batch_overflow);
+    }
     struct llama_batch batch = llama_batch_get_one(tokens, n);
     int dr = erllama_safe_decode(c->ctx, batch);
     if (dr == 0) c->decode_ready = 1;
@@ -1410,7 +1459,11 @@ static void free_chat_msgs(struct llama_chat_message *msgs, int n) {
  * call (over its pre-call n_msgs range) does not overlap that range,
  * so no double-free is reachable.
  *
- * Returns the number of messages on success, -1 on bad input, -2 on OOM.
+ * Returns the number of messages on success, -1 on bad input
+ * (missing role/content key, role not iolist-binary), -2 on OOM,
+ * or -3 when `content` is present but not iolist-binary
+ * (Anthropic-style content blocks). The caller distinguishes -3
+ * to surface {error, invalid_content} rather than badarg.
  */
 static int build_chat_msgs_from_list(
     ErlNifEnv *env, ERL_NIF_TERM list,
@@ -1424,8 +1477,14 @@ static int build_chat_msgs_from_list(
         if (!enif_is_map(env, head)) { err = -1; goto cleanup; }
         ErlNifBinary role_bin, content_bin;
         if (!get_map_bin(env, head, "role", &role_bin)) { err = -1; goto cleanup; }
-        if (!get_map_bin(env, head, "content", &content_bin)) {
+        ERL_NIF_TERM content_term;
+        if (!enif_get_map_value(env, head, enif_make_atom(env, "content"),
+                                &content_term)) {
             err = -1;
+            goto cleanup;
+        }
+        if (!enif_inspect_iolist_as_binary(env, content_term, &content_bin)) {
+            err = -3;
             goto cleanup;
         }
         char *role = enif_alloc(role_bin.size + 1);
@@ -1575,9 +1634,11 @@ static ERL_NIF_TERM nif_apply_chat_template(ErlNifEnv *env, int argc,
     if (built < 0) {
         free_chat_msgs(msgs, n_msgs);
         enif_free(msgs);
-        return built == -2
-                   ? enif_make_tuple2(env, atom_error, atom_oom)
-                   : enif_make_badarg(env);
+        switch (built) {
+            case -2: return enif_make_tuple2(env, atom_error, atom_oom);
+            case -3: return enif_make_tuple2(env, atom_error, atom_invalid_content);
+            default: return enif_make_badarg(env);
+        }
     }
     n_msgs = built;
 
@@ -1761,6 +1822,26 @@ static ERL_NIF_TERM nif_embed(ErlNifEnv *env, int argc,
         pthread_mutex_unlock(&c->mu);
         enif_free(tokens);
         return enif_make_tuple2(env, atom_error, atom_embed_failed);
+    }
+    /* Bounds-check before touching context state. Same SIGSEGV path
+     * as nif_prefill: llama_decode walks past the KV slab when
+     * n_tokens >= n_ctx, undefined when n_tokens > n_batch. */
+    uint32_t n_ctx = erllama_safe_n_ctx(c->ctx);
+    uint32_t n_batch = erllama_safe_n_batch(c->ctx);
+    if (n_ctx == 0 || n_batch == 0) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
+    if ((uint32_t) n >= n_ctx) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_context_overflow);
+    }
+    if ((uint32_t) n > n_batch) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_batch_overflow);
     }
 
     /* Flip on embeddings for this call; the caller may have left it
