@@ -23,6 +23,46 @@ Transport is QUIC via [erlang_quic](https://github.com/benoitc/erlang_quic)
 (pure Erlang, no C NIF in the protocol path). Repository:
 <https://github.com/erllama/erllama_cluster>.
 
+### Pipeline parallelism: blocked on upstream llama.cpp
+
+The cluster's pipeline-parallelism strategy needs three new
+NIFs (`forward_partial/3`, `forward_continue/3`,
+`forward_final/3`) that run a configurable subrange of model
+layers and pass hidden states between nodes. llama.cpp's public
+API does not expose layer-range execution today: `llama_decode`
+always runs the full model, and `llama_model_n_layer/1` only
+exposes the count. Implementing the NIFs requires patching
+llama.cpp itself, which the cluster brief
+(`AGENTS_TASKS.md`) puts out of scope.
+
+The cluster already gates pipeline mode on
+`erlang:function_exported(erllama, forward_partial, 3)` and
+falls back to the other strategies (request distribution and
+speculative decoding) when the export is missing, so this is a
+graceful degradation rather than a blocker for the cluster's
+v1 release.
+
+If the NIFs become critical, the right next step is a separate
+upstream-llama.cpp investigation: identify the minimum patch to
+`llama_decode` (likely a `layer_start` / `layer_end` field on a
+new `llama_decode_params` struct) and either upstream it or
+maintain a fork.
+
+### Verifier context isolation (item 6 design note)
+
+The current `verify/4` implementation snapshots the caller's
+KV length, runs the verifier forward pass, and restores via
+`kv_seq_rm` plus a re-prefill of the last prefix token. The
+`decode_ready` flag is left in the "ready" state after verify
+regardless of its pre-call value, on the assumption that any
+caller of `verify/4` will follow up with a `decode_one`
+imminently. Callers that need bit-identical pre-call state
+beyond the sampling distribution (e.g. pre-call `decode_ready`
+preserved as `false`) should clear the sampler explicitly
+after verify. A v2 path that snapshots and restores
+`decode_ready` is straightforward but waits for a concrete
+caller need.
+
 ## Deferred from 0.1 to 0.2
 
 ### Concurrent multi-sequence decoding
