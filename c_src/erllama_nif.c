@@ -176,6 +176,13 @@ static struct llama_sampler *build_default_greedy_chain(void);
  * load callback. */
 static void adapter_dtor(ErlNifEnv *env, void *obj);
 
+/* Forward decl: sampler_dtor + the build helper, defined in the
+ * sampler section. */
+static void sampler_dtor(ErlNifEnv *env, void *obj);
+static struct llama_sampler *build_sampler_chain_from_map(
+    ErlNifEnv *env, ERL_NIF_TERM cfg, struct llama_context *ctx,
+    ERL_NIF_TERM *out_err_atom);
+
 /* =========================================================================
  * Resource types
  * ========================================================================= */
@@ -220,9 +227,23 @@ typedef struct {
     erllama_model_t *model_res;         /* keep_resource'd at init */
 } erllama_adapter_t;
 
+/* Sampler chain resource. Owned independently from the context so
+ * multi-seq batching (v0.2+) can hold one chain per in-flight
+ * request without contending on the context's cached `c->smpl`.
+ * The chain is built from the same config map configure_sampler/2
+ * consumes; freed explicitly via sampler_free/1 or implicitly by
+ * the dtor. */
+typedef struct {
+    pthread_mutex_t mu;
+    int mu_inited;
+    struct llama_sampler *chain;   /* NULL after explicit free */
+    erllama_context_t *ctx_res;    /* keep_resource'd at init */
+} erllama_sampler_t;
+
 static ErlNifResourceType *MODEL_RT;
 static ErlNifResourceType *CTX_RT;
 static ErlNifResourceType *ADAPTER_RT;
+static ErlNifResourceType *SAMPLER_RT;
 
 /* Drop the context's reference on its model; if a previous
  * free_model/1 returned {ok, deferred} and the model is now
@@ -303,6 +324,26 @@ static void ctx_dtor(ErlNifEnv *env, void *obj) {
     }
 }
 
+/* Sampler chain destructor. Frees the chain (which may be NULL if
+ * the user called sampler_free explicitly) and drops the
+ * keep-reference on the owning context. */
+static void sampler_dtor(ErlNifEnv *env, void *obj) {
+    (void) env;
+    erllama_sampler_t *s = (erllama_sampler_t *) obj;
+    if (s->chain) {
+        (void) erllama_safe_sampler_free(s->chain);
+        s->chain = NULL;
+    }
+    if (s->ctx_res) {
+        enif_release_resource(s->ctx_res);
+        s->ctx_res = NULL;
+    }
+    if (s->mu_inited) {
+        pthread_mutex_destroy(&s->mu);
+        s->mu_inited = 0;
+    }
+}
+
 /* Adapter destructor. Explicit nif_adapter_free zeroes
  * a->adapter under the lock, so this destructor is either a no-op
  * (already freed) or the implicit final cleanup. Either way it
@@ -380,6 +421,12 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     ADAPTER_RT = enif_open_resource_type(
         env, NULL, "erllama_adapter", adapter_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!ADAPTER_RT) {
+        return -1;
+    }
+
+    SAMPLER_RT = enif_open_resource_type(
+        env, NULL, "erllama_sampler", sampler_dtor, ERL_NIF_RT_CREATE, NULL);
+    if (!SAMPLER_RT) {
         return -1;
     }
 
@@ -795,15 +842,23 @@ static ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
  * ========================================================================= */
 
 static ERL_NIF_TERM nif_kv_pack(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
-    (void) argc;
     erllama_context_t *c;
     if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
         return enif_make_badarg(env);
     }
     /* Tokens (argv[1]) is informational; NTokens (argv[2]) ignored.
      * The model layer must have prefilled exactly the desired prefix
-     * before calling kv_pack. */
+     * before calling kv_pack. argv[3], when present (arity 4),
+     * specifies which sequence to extract from. Default 0 keeps
+     * existing 3-arity callers working. */
     llama_seq_id seq_id = 0;
+    if (argc == 4) {
+        int sid;
+        if (!enif_get_int(env, argv[3], &sid) || sid < 0) {
+            return enif_make_badarg(env);
+        }
+        seq_id = (llama_seq_id) sid;
+    }
 
     pthread_mutex_lock(&c->mu);
     if (!c->ctx) {
@@ -2145,9 +2200,81 @@ static ERL_NIF_TERM nif_set_adapters(ErlNifEnv *env, int argc,
     return atom_ok;
 }
 
+/* =========================================================================
+ * Per-request sampler resource (Phase 4 infrastructure)
+ *
+ * Wraps a llama_sampler_chain built by build_sampler_chain_from_map
+ * so multiple in-flight requests (v0.2+) can hold independent chains.
+ * The v0.1 model layer still uses configure_sampler/2 against the
+ * context's cached `c->smpl`; this resource is the building block
+ * for the eventual decode_and_sample_batch NIF.
+ * ========================================================================= */
+
+static ERL_NIF_TERM nif_sampler_new(ErlNifEnv *env, int argc,
+                                    const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    if (!enif_is_map(env, argv[1])) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&c->mu);
+    if (!c->ctx) {
+        pthread_mutex_unlock(&c->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    ERL_NIF_TERM err = atom_oom;
+    struct llama_sampler *chain =
+        build_sampler_chain_from_map(env, argv[1], c->ctx, &err);
+    pthread_mutex_unlock(&c->mu);
+    if (!chain) {
+        return enif_make_tuple2(env, atom_error, err);
+    }
+    erllama_sampler_t *res = enif_alloc_resource(SAMPLER_RT, sizeof(*res));
+    if (!res) {
+        (void) erllama_safe_sampler_free(chain);
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+    memset(res, 0, sizeof(*res));
+    if (pthread_mutex_init(&res->mu, NULL) != 0) {
+        enif_release_resource(res);
+        (void) erllama_safe_sampler_free(chain);
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+    res->mu_inited = 1;
+    res->chain = chain;
+    res->ctx_res = c;
+    enif_keep_resource(c);
+
+    ERL_NIF_TERM term = enif_make_resource(env, res);
+    enif_release_resource(res);
+    return enif_make_tuple2(env, atom_ok, term);
+}
+
+static ERL_NIF_TERM nif_sampler_free(ErlNifEnv *env, int argc,
+                                     const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_sampler_t *s;
+    if (!enif_get_resource(env, argv[0], SAMPLER_RT, (void **) &s)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&s->mu);
+    if (!s->chain) {
+        pthread_mutex_unlock(&s->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    (void) erllama_safe_sampler_free(s->chain);
+    s->chain = NULL;
+    pthread_mutex_unlock(&s->mu);
+    return atom_ok;
+}
+
 static ErlNifFunc nif_funcs[] = {
     {"nif_crc32c",       1, nif_crc32c,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      3, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_kv_pack",      4, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_unpack",    3, nif_kv_unpack,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_seq_rm",    4, nif_kv_seq_rm,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_fsync_dir",    1, nif_fsync_dir,    ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -2167,7 +2294,9 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_clear_sampler", 1, nif_clear_sampler, ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_adapter_load", 2, nif_adapter_load, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_adapter_free", 1, nif_adapter_free, ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_set_adapters", 2, nif_set_adapters, ERL_NIF_DIRTY_JOB_CPU_BOUND}
+    {"nif_set_adapters", 2, nif_set_adapters, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_sampler_new",  2, nif_sampler_new,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_sampler_free", 1, nif_sampler_free, ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, unload)

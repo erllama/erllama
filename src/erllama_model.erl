@@ -77,6 +77,10 @@ stubs get replaced; the cache integration is unaffected.
 }.
 
 -type cache_hit_kind() :: exact | partial | cold.
+
+-type pending_request() ::
+    {complete, gen_statem:from(), binary(), map()}
+    | {infer, gen_statem:from(), [non_neg_integer()], map(), pid()}.
 -type finish_reason() :: stop | length | cancelled.
 -type stats() :: #{
     prompt_tokens := non_neg_integer(),
@@ -151,6 +155,12 @@ stubs get replaced; the cache integration is unaffected.
     %% mutation can't corrupt the cache identity for the in-flight
     %% request.
     request_fp :: <<_:256>> | undefined,
+    %% FIFO queue of pending complete/infer calls that arrived while
+    %% the model was already busy. The head is dispatched on every
+    %% transition back to `idle`. Each entry is one of:
+    %%   {complete, From, Prompt, Opts}
+    %%   {infer,    From, Tokens, Params, CallerPid}
+    pending = [] :: [pending_request()],
     %% Streaming-mode fields (set by infer/4, unset by complete/2,3).
     mode = standard :: standard | streaming,
     caller_pid :: pid() | undefined,
@@ -196,11 +206,11 @@ asynchronous messages:
 
 `Tokens` is the prompt as a list of token ids - tokenisation is the
 caller's responsibility (use `tokenize/2` or apply a chat template
-first). `Params` is an `infer_params()` map; only `response_tokens`
-and `parent_key` are honoured in v0.1, the rest are reserved for
-bucket C.
+first). `Params` is an `infer_params()` map.
 
-Returns `{error, busy}` if the model is already serving another
+Calls that arrive while a previous request is in flight are queued
+FIFO. The reply `{ok, Ref}` is sent as soon as the call is admitted;
+streaming events follow once the queue head advances to this
 request.
 """.
 -spec infer(model(), [non_neg_integer()], infer_params(), pid()) ->
@@ -539,11 +549,16 @@ generating(EventType, EventContent, Data) ->
 %% Common event handler
 %% =============================================================================
 
-handle_common(_State, {call, From}, {complete, _, _}, Data) ->
-    %% Reject concurrent complete/infer calls; only one in flight.
-    reply(From, {error, busy}, Data);
-handle_common(_State, {call, From}, {infer, _, _, _}, Data) ->
-    reply(From, {error, busy}, Data);
+handle_common(_State, {call, From}, {complete, Prompt, Opts}, Data) ->
+    %% Concurrent calls are queued, not rejected. The head of the
+    %% queue is dispatched whenever the state machine returns to
+    %% idle. This preserves all cache integration semantics: the
+    %% in-flight request finishes its lookups, saves, and pin-and-
+    %% load against its own request_fp snapshot before the queued
+    %% request even starts.
+    {keep_state, enqueue({complete, From, Prompt, Opts}, Data)};
+handle_common(_State, {call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
+    {keep_state, enqueue({infer, From, Tokens, Params, CallerPid}, Data)};
 handle_common(_State, cast, {cancel, Ref}, Data = #data{request_ref = Ref}) ->
     {keep_state, Data#data{cancel_pending = true}};
 handle_common(_State, cast, {cancel, _OtherRef}, Data) ->
@@ -886,11 +901,11 @@ finish_request(Data, FinishReason) ->
             Reply = backend_call(Data1, detokenize, [Data1#data.generated]),
             From = Data1#data.caller,
             Generated = Data1#data.generated,
-            {next_state, idle, reset(Data1), [{reply, From, {ok, Reply, Generated}}]};
+            return_to_idle(reset(Data1), [{reply, From, {ok, Reply, Generated}}]);
         streaming ->
             Stats = build_stats(FinishReason, false, Data1),
             send_done(Data1, Stats),
-            {next_state, idle, reset(Data1)}
+            return_to_idle(reset(Data1), [])
     end.
 
 finish_request_cancelled(Data) ->
@@ -900,7 +915,42 @@ finish_request_cancelled(Data) ->
     {ok, Data1} = clear_grammar(Data),
     Stats = build_stats(cancelled, true, Data1),
     send_done(Data1, Stats),
-    {next_state, idle, reset(Data1)}.
+    return_to_idle(reset(Data1), []).
+
+%% Drop back to idle. If a queued request exists, dispatch its head
+%% inline before yielding the scheduler. The reply action for the
+%% completing request is still emitted; the queued request just gets
+%% the state machine started.
+return_to_idle(Data, Actions) ->
+    case Data#data.pending of
+        [] -> {next_state, idle, Data, Actions};
+        [Head | Rest] -> dispatch_pending(Head, Data#data{pending = Rest}, Actions)
+    end.
+
+dispatch_pending({complete, From, Prompt, Opts}, Data, Actions) ->
+    merge_dispatch(start_complete(From, Prompt, Opts, Data), Actions);
+dispatch_pending({infer, From, Tokens, Params, CallerPid}, Data, Actions) ->
+    merge_dispatch(start_infer(From, Tokens, Params, CallerPid, Data), Actions).
+
+%% start_complete / start_infer return one of:
+%%   {keep_state, Data, [{reply, _, _}]}             (error path)
+%%   {next_state, generating, Data}                  (start_complete success
+%%                                                    relies on the implicit
+%%                                                    gen_statem reply that
+%%                                                    fires when the request
+%%                                                    finishes)
+%%   {next_state, NextState, Data, [{reply, _, _}]}  (start_infer success)
+%% Splice the completing request's actions in front so its reply
+%% lands first.
+merge_dispatch({keep_state, NewData, MoreActions}, Actions) ->
+    {next_state, idle, NewData, Actions ++ MoreActions};
+merge_dispatch({next_state, NextState, NewData}, Actions) ->
+    {next_state, NextState, NewData, Actions};
+merge_dispatch({next_state, NextState, NewData, MoreActions}, Actions) ->
+    {next_state, NextState, NewData, Actions ++ MoreActions}.
+
+enqueue(Item, Data) ->
+    Data#data{pending = Data#data.pending ++ [Item]}.
 
 send_done(#data{mode = streaming, caller_pid = Pid, request_ref = Ref}, Stats) ->
     erllama_inflight:unregister(Ref),
