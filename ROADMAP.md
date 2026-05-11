@@ -3,6 +3,26 @@
 What erllama does not do yet, with rough scope and rationale for each
 item. Issues / PRs welcome.
 
+## Sister project: erllama_cluster (in development)
+
+A separate OTP application that coordinates a fleet of erllama nodes
+into one inference cluster. Each node still runs erllama as a
+standalone library; the cluster layer sits on top and decides which
+node serves which request.
+
+Three v1 strategies:
+
+- **Request distribution** with cache-affinity routing (follow-up
+  requests prefer the node that warmed the KV cache for the prefix).
+- **Speculative decoding across nodes** — small draft on one node,
+  large verifier on another.
+- **Pipeline parallelism** — models too large for one node split by
+  layer ranges, hidden states passed as Erlang binaries.
+
+Transport is QUIC via [erlang_quic](https://github.com/benoitc/erlang_quic)
+(pure Erlang, no C NIF in the protocol path). Repository:
+<https://github.com/erllama/erllama_cluster>.
+
 ## Deferred from 0.1 to 0.2
 
 ### Concurrent multi-sequence decoding
