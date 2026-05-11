@@ -39,3 +39,12 @@ draft_tokens_empty_prefix_test() ->
         {error, empty_prefix},
         erllama:draft_tokens(<<"any">>, [], #{max => 4})
     ).
+
+%% =============================================================================
+%% verify/4 unit tests (the snapshot/restore proof lives in the
+%% erllama_real_model_SUITE since it needs a loaded GGUF + the
+%% existing test infrastructure for cache + fingerprints).
+%% =============================================================================
+
+verify_rejects_non_binary_model_id_test() ->
+    ?assertError(function_clause, erllama:verify(not_a_binary, [1], [2], 1)).

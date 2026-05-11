@@ -50,7 +50,8 @@
     sampler_free/1,
     vram_info/0,
     model_size/1,
-    model_n_layer/1
+    model_n_layer/1,
+    forward_with_argmax/2
 ]).
 
 -export_type([adapter_ref/0, sampler_ref/0]).
@@ -254,6 +255,22 @@ model_size(Model) ->
 model_n_layer(Model) ->
     nif_model_n_layer(Model).
 
+%% Per-position argmax over the model vocab. Decodes `Tokens` with
+%% logits flagged on every position, then returns the argmax id at
+%% each position (mapped to the atom `eos` for end-of-generation
+%% tokens). Used by erllama:verify/4 for speculative-decoding
+%% candidate verification.
+%%
+%% Mutates KV state: after return, the context's seq_id=0 KV cells
+%% extend by length(Tokens). Callers that need to roll back must
+%% snapshot (KV length, decode_ready, last token) before the call
+%% and restore via kv_seq_rm + a re-prefill of the last pre-call
+%% token.
+-spec forward_with_argmax(context_ref(), [token_id()]) ->
+    {ok, [token_id() | eos]} | {error, atom()}.
+forward_with_argmax(Ctx, Tokens) when is_list(Tokens) ->
+    nif_forward_with_argmax(Ctx, Tokens).
+
 %% =============================================================================
 %% NIF stubs (replaced at on_load time)
 %% =============================================================================
@@ -285,3 +302,4 @@ nif_sampler_free(_Sampler) -> erlang:nif_error(nif_not_loaded).
 nif_vram_info() -> erlang:nif_error(nif_not_loaded).
 nif_model_size(_Model) -> erlang:nif_error(nif_not_loaded).
 nif_model_n_layer(_Model) -> erlang:nif_error(nif_not_loaded).
+nif_forward_with_argmax(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).

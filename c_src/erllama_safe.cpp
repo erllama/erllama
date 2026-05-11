@@ -499,6 +499,76 @@ int erllama_safe_memory_seq_rm(struct llama_context *c, int seq_id,
     }
 }
 
+// Largest position present in the seq_id's KV state, or -1 when
+// the sequence is empty (matches llama's own empty-sequence
+// sentinel). -2 on exception so callers can disambiguate.
+long erllama_safe_memory_seq_pos_max(struct llama_context *c,
+                                     int seq_id) noexcept {
+    try {
+        llama_memory_t mem = llama_get_memory(c);
+        if (!mem) return -2;
+        return (long) llama_memory_seq_pos_max(mem, (llama_seq_id) seq_id);
+    } catch (...) {
+        return -2;
+    }
+}
+
+// Speculative-decoding helper. Build a llama_batch with logits[i]=1
+// for every position, decode, fill out_argmax[i] with argmax over
+// the model vocab at each position. Used by erllama:verify/4.
+//
+// Sampler state is intentionally untouched: this path goes
+// straight through llama_get_logits_ith / argmax and bypasses any
+// configured sampler chain, so the caller's c->smpl stays clean.
+//
+// Returns 0 ok; -1 on llama_decode failure; -2 on batch_init OOM
+// or invalid n_tokens; -3 on C++ exception.
+int erllama_safe_forward_with_argmax(struct llama_context *c,
+                                     const llama_token *tokens,
+                                     int32_t n_tokens,
+                                     int32_t n_vocab,
+                                     long start_pos,
+                                     int32_t *out_argmax) noexcept {
+    if (n_tokens <= 0 || n_vocab <= 0 || !tokens || !out_argmax) {
+        return -2;
+    }
+    try {
+        struct llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+        if (!batch.token) {
+            return -2;
+        }
+        for (int32_t i = 0; i < n_tokens; i++) {
+            batch.token[i] = tokens[i];
+            batch.pos[i] = (llama_pos)(start_pos + i);
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = (llama_seq_id) 0;
+            batch.logits[i] = 1;
+        }
+        batch.n_tokens = n_tokens;
+        int rc = llama_decode(c, batch);
+        if (rc != 0) {
+            llama_batch_free(batch);
+            return -1;
+        }
+        for (int32_t i = 0; i < n_tokens; i++) {
+            float *logits = llama_get_logits_ith(c, i);
+            int32_t best = 0;
+            float best_v = logits[0];
+            for (int32_t v = 1; v < n_vocab; v++) {
+                if (logits[v] > best_v) {
+                    best_v = logits[v];
+                    best = v;
+                }
+            }
+            out_argmax[i] = best;
+        }
+        llama_batch_free(batch);
+        return 0;
+    } catch (...) {
+        return -3;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Chat templating (bucket C, C-NIF)
 // ---------------------------------------------------------------------------

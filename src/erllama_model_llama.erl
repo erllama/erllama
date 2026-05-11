@@ -34,7 +34,8 @@ Config (passed through `erllama_model:start_link/2`):
     load_adapter/2,
     unload_adapter/2,
     apply_adapters/2,
-    extra_metadata/1
+    extra_metadata/1,
+    verify/4
 ]).
 
 -record(s, {
@@ -160,3 +161,52 @@ extra_metadata(#s{
     model_size_bytes = SB, total_layers = TL, n_gpu_layers = NL
 }) ->
     #{model_size_bytes => SB, total_layers => TL, n_gpu_layers => NL}.
+
+%% Speculative-decoding verifier. Snapshot+restore protocol so
+%% the caller's KV view is unchanged after the call. Empty prefix
+%% is rejected: the acceptance / NextToken indexing both require
+%% at least one prefix token.
+verify(_S, [], _Candidates, _K) ->
+    {error, empty_prefix};
+verify(#s{ctx = Ctx} = S, PrefixTokens, Candidates, K) when
+    is_list(PrefixTokens), is_list(Candidates), is_integer(K), K > 0
+->
+    KCap = min(K, length(Candidates)),
+    Truncated = lists:sublist(Candidates, KCap),
+    Input = PrefixTokens ++ Truncated,
+    case erllama_nif:forward_with_argmax(Ctx, Input) of
+        {ok, Argmax} ->
+            P = length(PrefixTokens),
+            Accepted = count_accepted(0, P, Truncated, Argmax),
+            %% NextToken comes from logits at 0-indexed position
+            %% P - 1 + Accepted (the verifier's prediction given
+            %% the prefix and the accepted prefix of candidates).
+            %% lists:nth/2 is 1-indexed: P + Accepted.
+            NextToken = lists:nth(P + Accepted, Argmax),
+            ok = restore_after_verify(Ctx, P, lists:last(PrefixTokens)),
+            {ok, Accepted, NextToken, S};
+        {error, _} = E ->
+            E
+    end.
+
+count_accepted(Acc, _P, [], _Argmax) ->
+    Acc;
+count_accepted(Acc, P, [C | Rest], Argmax) ->
+    Predicted = lists:nth(P + Acc, Argmax),
+    case Predicted of
+        C when is_integer(C) -> count_accepted(Acc + 1, P, Rest, Argmax);
+        _ -> Acc
+    end.
+
+%% Bring the context's KV cells back to the caller's pre-call
+%% length P, then re-prefill the last prefix token so the logits
+%% buffer is in a sampleable state for any follow-up decode_one.
+%% The caller's pre-call decode_ready flag is not preserved: after
+%% verify the context is always ready to sample at the prefix end.
+%% Documented in the public erllama:verify/4 doc.
+restore_after_verify(Ctx, P, LastPrefixToken) ->
+    %% kv_seq_rm with p1 = -1 means "to infinity"; combined with
+    %% p0 = P, that drops every cell from the candidate batch.
+    _ = erllama_nif:kv_seq_rm(Ctx, 0, P, -1),
+    _ = erllama_nif:prefill(Ctx, [LastPrefixToken]),
+    ok.

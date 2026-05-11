@@ -52,7 +52,8 @@ stubs get replaced; the cache integration is unaffected.
     set_adapter_scale/3,
     list_adapters/1,
     get_backend_state/1,
-    cache_key_meta/1
+    cache_key_meta/1,
+    verify/4
 ]).
 
 -export_type([
@@ -400,6 +401,22 @@ get_backend_state(Model) ->
 cache_key_meta(Model) ->
     gen_statem:call(via(Model), cache_key_meta).
 
+%% Speculative-decoding verifier. Synchronous; runs the verifier
+%% pass against the model's context and returns
+%% {ok, AcceptedCount, NextToken}. Only allowed when the model
+%% gen_statem is idle: a concurrent in-flight infer would have its
+%% context state mutated by the verify pass, so we reject from
+%% other states with {error, busy}.
+-spec verify(
+    model(),
+    [erllama_nif:token_id()],
+    [erllama_nif:token_id()],
+    pos_integer()
+) ->
+    {ok, non_neg_integer(), erllama_nif:token_id() | eos} | {error, term()}.
+verify(Model, PrefixTokens, Candidates, K) ->
+    gen_statem:call(via(Model), {verify, PrefixTokens, Candidates, K}).
+
 init([ModelId, Config]) ->
     Backend = maps:get(backend, Config, erllama_model_stub),
     case Backend:init(Config) of
@@ -506,8 +523,29 @@ idle({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
     start_infer(From, Tokens, Params, CallerPid, Data);
 idle({call, From}, status, Data) ->
     {keep_state, Data, [{reply, From, idle}]};
+idle({call, From}, {verify, PrefixTokens, Candidates, K}, Data) ->
+    Reply = run_verify(PrefixTokens, Candidates, K, Data),
+    case Reply of
+        {ok, _, _, NewBState} ->
+            NewData = Data#data{backend_state = NewBState},
+            {keep_state, NewData, [{reply, From, public_verify_reply(Reply)}]};
+        {error, _} = E ->
+            {keep_state, Data, [{reply, From, E}]}
+    end;
 idle(EventType, EventContent, Data) ->
     handle_common(idle, EventType, EventContent, Data).
+
+run_verify(PrefixTokens, Candidates, K, Data) ->
+    Backend = Data#data.backend,
+    case erlang:function_exported(Backend, verify, 4) of
+        false ->
+            {error, not_supported};
+        true ->
+            Backend:verify(Data#data.backend_state, PrefixTokens, Candidates, K)
+    end.
+
+public_verify_reply({ok, Accepted, NextToken, _NewBState}) ->
+    {ok, Accepted, NextToken}.
 
 start_complete(From, Prompt, Opts, Data) ->
     case configure_sampler_for(Opts, Data) of
@@ -647,6 +685,10 @@ handle_common(_State, {call, From}, list_adapters, Data) ->
      || #{handle := H, scale := Scale} <- Data#data.adapters
     ],
     reply(From, Listing, Data);
+handle_common(_State, {call, From}, {verify, _, _, _}, Data) ->
+    %% verify mutates context state; reject from any non-idle
+    %% state so a concurrent infer's KV view stays consistent.
+    {keep_state, Data, [{reply, From, {error, busy}}]};
 handle_common(_State, {call, From}, cache_key_meta, Data) ->
     %% Effective fingerprint reflects the model's current LoRA
     %% composition. Using the base #data.fingerprint here would

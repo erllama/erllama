@@ -126,6 +126,14 @@ extern size_t erllama_safe_state_seq_set_data(struct llama_context *c,
                                               size_t size, int seq_id);
 extern int erllama_safe_memory_seq_rm(struct llama_context *c, int seq_id,
                                       int p0, int p1);
+extern long erllama_safe_memory_seq_pos_max(struct llama_context *c,
+                                            int seq_id);
+extern int erllama_safe_forward_with_argmax(struct llama_context *c,
+                                            const llama_token *tokens,
+                                            int32_t n_tokens,
+                                            int32_t n_vocab,
+                                            long start_pos,
+                                            int32_t *out_argmax);
 extern const char *erllama_safe_model_chat_template(const struct llama_model *m,
                                                     const char *name);
 extern int32_t erllama_safe_chat_apply_template(
@@ -196,6 +204,8 @@ static ERL_NIF_TERM atom_no_gpu;
 static ERL_NIF_TERM atom_total_b;
 static ERL_NIF_TERM atom_free_b;
 static ERL_NIF_TERM atom_used_b;
+static ERL_NIF_TERM atom_eos;
+static ERL_NIF_TERM atom_decode_failed;
 
 /* Forward decl: build_default_greedy_chain is defined in the sampler
  * section but used as a lazy fallback in nif_decode_one. */
@@ -467,6 +477,8 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     atom_total_b = enif_make_atom(env, "total_b");
     atom_free_b = enif_make_atom(env, "free_b");
     atom_used_b = enif_make_atom(env, "used_b");
+    atom_eos = enif_make_atom(env, "eos");
+    atom_decode_failed = enif_make_atom(env, "decode_failed");
 
     MODEL_RT = enif_open_resource_type(
         env, NULL, "erllama_model", model_dtor, ERL_NIF_RT_CREATE, NULL);
@@ -2004,6 +2016,126 @@ static ERL_NIF_TERM nif_embed(ErlNifEnv *env, int argc,
 }
 
 /* =========================================================================
+ * Speculative-decoding forward + per-position argmax
+ *
+ * nif_forward_with_argmax is the per-position argmax primitive used
+ * by erllama:verify/4. Builds a custom batch with logits[i]=1 on
+ * every position so llama_get_logits_ith(c, i) is valid for every
+ * i, decodes, and returns the argmax token at each position.
+ *
+ * Sampler state is intentionally bypassed: we go straight through
+ * llama_get_logits_ith and a manual argmax loop, so the cached
+ * c->smpl chain (and any seeded RNG state on it) is untouched.
+ *
+ * The caller (the model gen_statem's verify handler) is responsible
+ * for snapshot+restore around this call: the KV cache is mutated
+ * with the new tokens at positions [start_pos, start_pos+n) on
+ * seq_id=0, and the per-context logits buffer reflects the end of
+ * the supplied batch on return. Pre-call snapshot of (KvLen,
+ * decode_ready, last token) and post-call kv_seq_rm + re-prefill
+ * brings the context back to its pre-call observable state.
+ * ========================================================================= */
+static ERL_NIF_TERM nif_forward_with_argmax(ErlNifEnv *env, int argc,
+                                            const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    llama_token *tokens = NULL;
+    int32_t n = 0;
+    int rc = read_token_list(env, argv[1], &tokens, &n);
+    if (rc != 1) return token_list_error(env, rc);
+    if (n == 0) {
+        if (tokens) enif_free(tokens);
+        return enif_make_tuple2(env, atom_ok, enif_make_list(env, 0));
+    }
+
+    pthread_mutex_lock(&c->mu);
+    if (!c->ctx) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    const struct llama_model *model = erllama_safe_get_model(c->ctx);
+    const struct llama_vocab *vocab =
+        model ? erllama_safe_model_get_vocab(model) : NULL;
+    int32_t n_vocab = vocab ? erllama_safe_vocab_n_tokens(vocab) : 0;
+    if (n_vocab <= 0) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
+    for (int32_t i = 0; i < n; i++) {
+        if (tokens[i] >= n_vocab) {
+            pthread_mutex_unlock(&c->mu);
+            enif_free(tokens);
+            return enif_make_tuple2(env, atom_error, atom_invalid_token);
+        }
+    }
+    uint32_t n_ctx = erllama_safe_n_ctx(c->ctx);
+    uint32_t n_batch = erllama_safe_n_batch(c->ctx);
+    if (n_ctx == 0 || n_batch == 0) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
+    if ((uint32_t) n >= n_ctx) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_context_overflow);
+    }
+    if ((uint32_t) n > n_batch) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_batch_overflow);
+    }
+    long pos_max = erllama_safe_memory_seq_pos_max(c->ctx, 0);
+    if (pos_max == -2) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
+    long start_pos = (pos_max < 0) ? 0 : (pos_max + 1);
+
+    int32_t *out = enif_alloc(sizeof(int32_t) * (size_t) n);
+    if (!out) {
+        pthread_mutex_unlock(&c->mu);
+        enif_free(tokens);
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+    int frc = erllama_safe_forward_with_argmax(
+        c->ctx, tokens, n, n_vocab, start_pos, out
+    );
+    if (frc == 0) c->decode_ready = 1;
+    pthread_mutex_unlock(&c->mu);
+    enif_free(tokens);
+    if (frc != 0) {
+        enif_free(out);
+        ERL_NIF_TERM why = (frc == -2) ? atom_oom :
+                           (frc == -3) ? atom_exception :
+                           atom_decode_failed;
+        return enif_make_tuple2(env, atom_error, why);
+    }
+
+    /* EOG mapping happens here so the Erlang side gets a uniform
+     * `[non_neg_integer() | eos]` shape, no extra NIF round-trips
+     * for vocab_is_eog. */
+    ERL_NIF_TERM list = enif_make_list(env, 0);
+    for (int32_t i = n - 1; i >= 0; i--) {
+        ERL_NIF_TERM tok_term;
+        if (erllama_safe_vocab_is_eog(vocab, out[i])) {
+            tok_term = atom_eos;
+        } else {
+            tok_term = enif_make_int(env, out[i]);
+        }
+        list = enif_make_list_cell(env, tok_term, list);
+    }
+    enif_free(out);
+    return enif_make_tuple2(env, atom_ok, list);
+}
+
+/* =========================================================================
  * Sampler config
  *
  * configure_sampler/2 is the one entry point that builds the per-context
@@ -2574,6 +2706,8 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_vram_info",    0, nif_vram_info,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_size",   1, nif_model_size,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_model_n_layer",1, nif_model_n_layer,ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_forward_with_argmax", 2, nif_forward_with_argmax,
+        ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      3, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      4, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_unpack",    3, nif_kv_unpack,    ERL_NIF_DIRTY_JOB_CPU_BOUND},

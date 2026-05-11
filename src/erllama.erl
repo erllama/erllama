@@ -60,7 +60,8 @@ an explicit `model_id` in the config map.
     vram_info/0,
     queue_depth/0,
     list_cached_prefixes/2,
-    draft_tokens/3
+    draft_tokens/3,
+    verify/4
 ]).
 
 -export_type([model/0, model_id/0, model_info/0]).
@@ -427,6 +428,50 @@ drain_draft(Ref) ->
         {erllama_error, Ref, _} -> ok
     after 100 -> ok
     end.
+
+-doc """
+Speculative-decoding verifier. Runs `PrefixTokens ++ Candidates`
+(truncated to `K` candidates) through the model in a single
+forward pass with per-position argmax, returns the longest
+accepted prefix length and the model's own next token after it.
+
+Behaviour:
+- The verifier model gen_statem is locked for the duration of
+  the call; concurrent `infer/4` requests on the same model
+  return `{error, busy}`. Verify only proceeds when the model
+  is idle.
+- The context's KV cells are mutated during the forward pass
+  but restored before return: post-call the seq_id=0 KV ends at
+  the same length the caller had before, with logits buffered
+  for the last prefix token (so a follow-up `decode_one` is
+  immediately valid). The caller's pre-call `decode_ready`
+  flag is not preserved; after verify the context is always
+  ready to sample.
+- An empty `PrefixTokens` returns `{error, empty_prefix}`
+  because the acceptance and NextToken indexing both require
+  at least one prefix token.
+- `NextToken` may be the atom `eos` if the verifier's argmax
+  at the relevant position is an end-of-generation token; map
+  it to terminate the decode loop.
+
+Used by the upcoming erllama_cluster speculative-decoding
+strategy after `draft_tokens/3`.
+""".
+-spec verify(
+    model_id(),
+    [erllama_nif:token_id()],
+    [erllama_nif:token_id()],
+    pos_integer()
+) ->
+    {ok, non_neg_integer(), erllama_nif:token_id() | eos} | {error, term()}.
+verify(ModelId, PrefixTokens, Candidates, K) when
+    is_binary(ModelId),
+    is_list(PrefixTokens),
+    is_list(Candidates),
+    is_integer(K),
+    K > 0
+->
+    erllama_model:verify(ModelId, PrefixTokens, Candidates, K).
 
 %% =============================================================================
 %% Internal
