@@ -41,8 +41,13 @@
     embed/2,
     set_grammar/2,
     configure_sampler/2,
-    clear_sampler/1
+    clear_sampler/1,
+    adapter_load/2,
+    adapter_free/1,
+    set_adapters/2
 ]).
+
+-export_type([adapter_ref/0]).
 
 -on_load(init/0).
 
@@ -50,6 +55,7 @@
 
 -type model_ref() :: reference().
 -type context_ref() :: reference().
+-type adapter_ref() :: reference().
 -type token_id() :: integer().
 
 -spec init() -> ok | {error, term()}.
@@ -165,6 +171,31 @@ configure_sampler(Ctx, Cfg) when is_map(Cfg) ->
 clear_sampler(Ctx) ->
     nif_clear_sampler(Ctx).
 
+%% Load a LoRA adapter from a GGUF file. Bound to the model: the
+%% adapter is freed when the model is, or earlier on
+%% `adapter_free/1`. The model is keep-referenced by the adapter
+%% resource so `free_model/1` returns `{ok, deferred}` until all
+%% attached adapters are dropped.
+-spec adapter_load(model_ref(), iodata()) ->
+    {ok, adapter_ref()} | {error, atom()}.
+adapter_load(Model, Path) ->
+    nif_adapter_load(Model, Path).
+
+%% Explicit free. Idempotent: a second call returns
+%% `{error, released}`. The implicit destructor handles the case
+%% where the user drops the reference without calling free.
+-spec adapter_free(adapter_ref()) -> ok | {error, atom()}.
+adapter_free(Adapter) ->
+    nif_adapter_free(Adapter).
+
+%% Install a list of {adapter_ref(), Scale} pairs on the context.
+%% Replaces any previously installed set; passing [] detaches
+%% everything.
+-spec set_adapters(context_ref(), [{adapter_ref(), float()}]) ->
+    ok | {error, atom()}.
+set_adapters(Ctx, Adapters) when is_list(Adapters) ->
+    nif_set_adapters(Ctx, Adapters).
+
 %% =============================================================================
 %% NIF stubs (replaced at on_load time)
 %% =============================================================================
@@ -187,3 +218,6 @@ nif_embed(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_set_grammar(_Ctx, _Grammar) -> erlang:nif_error(nif_not_loaded).
 nif_configure_sampler(_Ctx, _Cfg) -> erlang:nif_error(nif_not_loaded).
 nif_clear_sampler(_Ctx) -> erlang:nif_error(nif_not_loaded).
+nif_adapter_load(_Model, _Path) -> erlang:nif_error(nif_not_loaded).
+nif_adapter_free(_Adapter) -> erlang:nif_error(nif_not_loaded).
+nif_set_adapters(_Ctx, _Adapters) -> erlang:nif_error(nif_not_loaded).

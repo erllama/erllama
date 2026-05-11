@@ -47,6 +47,10 @@ stubs get replaced; the cache integration is unaffected.
     detokenize/2,
     apply_chat_template/2,
     embed/2,
+    load_adapter/2,
+    unload_adapter/2,
+    set_adapter_scale/3,
+    list_adapters/1,
     get_backend_state/1
 ]).
 
@@ -117,6 +121,7 @@ stubs get replaced; the cache integration is unaffected.
     model_id :: binary(),
     tier_srv :: atom(),
     tier :: disk | ram_file,
+    %% Base model fingerprint; constant for the life of the model.
     fingerprint :: <<_:256>>,
     fingerprint_mode :: safe | gguf_chunked | fast_unsafe,
     quant_type :: erllama_cache_key:quant_type(),
@@ -127,6 +132,12 @@ stubs get replaced; the cache integration is unaffected.
     %% Inference backend: erllama_model_stub | erllama_model_llama.
     backend :: module(),
     backend_state :: term(),
+    %% Attached LoRA adapters. Each entry holds the backend's opaque
+    %% handle, the file sha256 (for cache-key derivation), and the
+    %% current scale. effective_fp = sha256(fingerprint || sorted
+    %% pairs of sha+scale). Recomputed on every attachment change.
+    adapters = [] :: [#{handle := term(), sha := <<_:256>>, scale := float()}],
+    effective_fp :: <<_:256>>,
     %% Per-request fields
     caller :: gen_statem:from() | undefined,
     prompt_tokens :: [non_neg_integer()],
@@ -135,6 +146,11 @@ stubs get replaced; the cache integration is unaffected.
     response_target :: non_neg_integer(),
     generated :: [non_neg_integer()],
     last_save_at :: non_neg_integer(),
+    %% effective_fp captured at request admission. Cache lookups and
+    %% saves run against this snapshot so a mid-request adapter
+    %% mutation can't corrupt the cache identity for the in-flight
+    %% request.
+    request_fp :: <<_:256>> | undefined,
     %% Streaming-mode fields (set by infer/4, unset by complete/2,3).
     mode = standard :: standard | streaming,
     caller_pid :: pid() | undefined,
@@ -289,6 +305,42 @@ Compute an embedding vector for the given prompt tokens.
 embed(Model, Tokens) when is_list(Tokens) ->
     gen_statem:call(via(Model), {embed, Tokens}).
 
+-doc """
+Load a LoRA adapter from a GGUF file and attach it to the model
+with scale 1.0. Returns an opaque handle the caller threads into
+`unload_adapter/2` and `set_adapter_scale/3`. The adapter's sha256 is
+folded into the effective fingerprint so cache rows produced under
+this adapter never collide with rows from a different adapter set.
+""".
+-spec load_adapter(model(), file:filename_all()) ->
+    {ok, term()} | {error, term()}.
+load_adapter(Model, Path) ->
+    gen_statem:call(via(Model), {load_adapter, Path}).
+
+-doc """
+Detach + free a previously loaded adapter. Idempotent: a second call
+on the same handle returns `ok`.
+""".
+-spec unload_adapter(model(), term()) -> ok | {error, term()}.
+unload_adapter(Model, Handle) ->
+    gen_statem:call(via(Model), {unload_adapter, Handle}).
+
+-doc """
+Change an attached adapter's scale. Re-applies the full set on the
+underlying context.
+""".
+-spec set_adapter_scale(model(), term(), float()) -> ok | {error, term()}.
+set_adapter_scale(Model, Handle, Scale) when is_number(Scale) ->
+    gen_statem:call(via(Model), {set_adapter_scale, Handle, float(Scale)}).
+
+-doc """
+List currently attached adapters as `[#{handle => H, scale => F}]`.
+The handle is the same opaque value `load_adapter/2` returned.
+""".
+-spec list_adapters(model()) -> [#{handle := term(), scale := float()}].
+list_adapters(Model) ->
+    gen_statem:call(via(Model), list_adapters).
+
 %% =============================================================================
 %% gen_statem callbacks
 %% =============================================================================
@@ -308,11 +360,12 @@ init([ModelId, Config]) ->
     Backend = maps:get(backend, Config, erllama_model_stub),
     case Backend:init(Config) of
         {ok, BState} ->
+            Fp = maps:get(fingerprint, Config, default_fingerprint()),
             Data = #data{
                 model_id = ModelId,
                 tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
                 tier = maps:get(tier, Config, ram),
-                fingerprint = maps:get(fingerprint, Config, default_fingerprint()),
+                fingerprint = Fp,
                 fingerprint_mode = maps:get(fingerprint_mode, Config, safe),
                 quant_type = maps:get(quant_type, Config, f16),
                 quant_bits = maps:get(quant_bits, Config, 16),
@@ -321,6 +374,9 @@ init([ModelId, Config]) ->
                 policy = resolve_policy(Config),
                 backend = Backend,
                 backend_state = BState,
+                adapters = [],
+                %% No adapters at boot -> effective fp == base fp.
+                effective_fp = Fp,
                 prompt_tokens = [],
                 context_tokens = [],
                 response_target = 0,
@@ -399,7 +455,12 @@ start_complete(From, Prompt, Opts, Data) ->
                 prompt_tokens = PromptTokens,
                 response_target = maps:get(response_tokens, Opts, 4),
                 generated = [],
-                prefill_started_at = erlang:monotonic_time(millisecond)
+                prefill_started_at = erlang:monotonic_time(millisecond),
+                %% Snapshot the effective fingerprint for the life of
+                %% the request. Any concurrent adapter mutation arriving
+                %% between tokens stays out of the cache identity until
+                %% this request finishes.
+                request_fp = Data0#data.effective_fp
             },
             enter_after_lookup(maps:get(parent_key, Opts, undefined), Data1);
         {error, Reason} ->
@@ -420,7 +481,8 @@ start_infer(From, Tokens, Params, CallerPid, Data) ->
                 prompt_tokens = Tokens,
                 response_target = maps:get(response_tokens, Params, 64),
                 generated = [],
-                prefill_started_at = erlang:monotonic_time(millisecond)
+                prefill_started_at = erlang:monotonic_time(millisecond),
+                request_fp = Data0#data.effective_fp
             },
             %% Reply with the ref before kicking off prefill so the caller is
             %% guaranteed to have it before any erllama_token messages land.
@@ -501,8 +563,160 @@ handle_common(_State, {call, From}, {apply_chat_template, Request}, Data) ->
     reply(From, optional_backend_call(Data, apply_chat_template, [Request]), Data);
 handle_common(_State, {call, From}, {embed, Tokens}, Data) ->
     reply(From, optional_backend_call(Data, embed, [Tokens]), Data);
+handle_common(State, {call, From}, {load_adapter, Path}, Data) ->
+    handle_load_adapter(State, From, Path, Data);
+handle_common(State, {call, From}, {unload_adapter, Handle}, Data) ->
+    handle_unload_adapter(State, From, Handle, Data);
+handle_common(State, {call, From}, {set_adapter_scale, Handle, Scale}, Data) ->
+    handle_set_adapter_scale(State, From, Handle, Scale, Data);
+handle_common(_State, {call, From}, list_adapters, Data) ->
+    Listing = [
+        #{handle => H, scale => Scale}
+     || #{handle := H, scale := Scale} <- Data#data.adapters
+    ],
+    reply(From, Listing, Data);
 handle_common(_State, _EventType, _EventContent, Data) ->
     {keep_state, Data}.
+
+handle_load_adapter(_State, From, Path, Data) ->
+    Loaded =
+        case load_adapter_impl(Path, Data) of
+            {ok, Handle, Data1} -> {ok, Data1, {ok, Handle}};
+            {error, _} = E -> E
+        end,
+    case Loaded of
+        {ok, NewData, Reply} -> {keep_state, NewData, [{reply, From, Reply}]};
+        {error, _} = E2 -> {keep_state, Data, [{reply, From, E2}]}
+    end.
+
+handle_unload_adapter(_State, From, Handle, Data) ->
+    reply_with_data_update(From, Data, unload_adapter_impl(Handle, Data), ok).
+
+handle_set_adapter_scale(_State, From, Handle, Scale, Data) ->
+    reply_with_data_update(
+        From, Data, set_adapter_scale_impl(Handle, Scale, Data), ok
+    ).
+
+%% Helper: convert an `impl` function's `{ok, Data1} | {error, _}`
+%% return into a `keep_state` transition that replies to From either
+%% with OkReply (on success) or with the error tuple verbatim.
+reply_with_data_update(From, _OldData, {ok, Data1}, OkReply) ->
+    {keep_state, Data1, [{reply, From, OkReply}]};
+reply_with_data_update(From, OldData, {error, _} = E, _OkReply) ->
+    {keep_state, OldData, [{reply, From, E}]}.
+
+%% LoRA mutation helpers. Each call recomputes effective_fp from the
+%% updated adapter list and reapplies the full set on the backend. We
+%% read the adapter file once to derive its sha256 so the cache key
+%% can fold it in deterministically.
+load_adapter_impl(Path, Data) ->
+    Mod = Data#data.backend,
+    case erlang:function_exported(Mod, load_adapter, 2) of
+        false -> {error, not_supported};
+        true -> load_adapter_step1(Path, Data)
+    end.
+
+load_adapter_step1(Path, Data) ->
+    case adapter_sha256(Path) of
+        {ok, Sha} -> load_adapter_step2(Path, Sha, Data);
+        {error, _} = E -> E
+    end.
+
+load_adapter_step2(Path, Sha, Data) ->
+    Mod = Data#data.backend,
+    case Mod:load_adapter(Data#data.backend_state, Path) of
+        {ok, Handle, S1} ->
+            Entry = #{handle => Handle, sha => Sha, scale => 1.0},
+            New = Data#data.adapters ++ [Entry],
+            apply_and_recompute(
+                Data#data{backend_state = S1, adapters = New}, Handle
+            );
+        {error, _} = E ->
+            E
+    end.
+
+unload_adapter_impl(Handle, Data) ->
+    case find_adapter(Handle, Data#data.adapters) of
+        false ->
+            %% Idempotent: unknown / already removed.
+            {ok, Data};
+        {value, _Entry, Rest} ->
+            unload_adapter_step1(Handle, Rest, Data)
+    end.
+
+unload_adapter_step1(Handle, Rest, Data) ->
+    Mod = Data#data.backend,
+    case erlang:function_exported(Mod, unload_adapter, 2) of
+        false ->
+            {error, not_supported};
+        true ->
+            case Mod:unload_adapter(Data#data.backend_state, Handle) of
+                {ok, S1} ->
+                    apply_and_recompute(
+                        Data#data{backend_state = S1, adapters = Rest}, ok
+                    );
+                {error, _} = E ->
+                    E
+            end
+    end.
+
+set_adapter_scale_impl(Handle, Scale, Data) ->
+    case find_adapter(Handle, Data#data.adapters) of
+        false ->
+            {error, not_found};
+        {value, Entry, Rest} ->
+            Updated = Entry#{scale => Scale},
+            Adapters1 = Rest ++ [Updated],
+            Data1 = Data#data{adapters = Adapters1},
+            apply_and_recompute(Data1, ok)
+    end.
+
+find_adapter(Handle, List) ->
+    case [E || E <- List, maps:get(handle, E) =:= Handle] of
+        [] -> false;
+        [E | _] -> {value, E, [X || X <- List, maps:get(handle, X) =/= Handle]}
+    end.
+
+%% Reapply the adapter set on the backend (if it supports it) and
+%% recompute the effective fingerprint. The Result is what the public
+%% API hands back to the caller: either an `ok` marker or
+%% `{ok, Handle}` for load.
+apply_and_recompute(Data, Result) ->
+    case apply_current_adapters(Data) of
+        {ok, S1} ->
+            finalize_recompute(Data#data{backend_state = S1}, Result);
+        {error, _} = E ->
+            E
+    end.
+
+apply_current_adapters(#data{backend = Mod, backend_state = S, adapters = A}) ->
+    case erlang:function_exported(Mod, apply_adapters, 2) of
+        true ->
+            Pairs = [{maps:get(handle, X), maps:get(scale, X)} || X <- A],
+            Mod:apply_adapters(S, Pairs);
+        false ->
+            {ok, S}
+    end.
+
+finalize_recompute(Data, Result) ->
+    ShaScales = [
+        {maps:get(sha, A), maps:get(scale, A)}
+     || A <- Data#data.adapters
+    ],
+    NewFp = erllama_cache_key:effective_fingerprint(
+        Data#data.fingerprint, ShaScales
+    ),
+    Data1 = Data#data{effective_fp = NewFp},
+    case Result of
+        ok -> {ok, Data1};
+        Handle -> {ok, Handle, Data1}
+    end.
+
+adapter_sha256(Path) ->
+    case file:read_file(Path) of
+        {ok, Bin} -> {ok, crypto:hash(sha256, Bin)};
+        {error, _} = E -> E
+    end.
 
 %% Helper: synchronous reply with no state change.
 reply(From, Reply, Data) ->
@@ -645,7 +859,10 @@ reset(Data) ->
         prompt_tokens = [],
         generated = [],
         response_target = 0,
-        last_save_at = 0
+        last_save_at = 0,
+        %% Drop the per-request fingerprint snapshot so the next
+        %% request picks up the current effective_fp.
+        request_fp = undefined
     }.
 
 maybe_fire_continued(Data) ->
@@ -818,7 +1035,7 @@ lookup_or_resume(PromptTokens, ParentKey, Data) ->
 %% cached prefix; fall through to cold if nothing matches.
 try_longest_prefix(PromptTokens, Data) ->
     KeyMeta = #{
-        fingerprint => Data#data.fingerprint,
+        fingerprint => request_fp(Data),
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash
     },
@@ -982,7 +1199,7 @@ build_meta_for(SaveReason, Tokens, Data) ->
     #{
         save_reason => SaveReason,
         quant_bits => Data#data.quant_bits,
-        fingerprint => Data#data.fingerprint,
+        fingerprint => request_fp(Data),
         fingerprint_mode => Data#data.fingerprint_mode,
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash,
@@ -993,11 +1210,18 @@ build_meta_for(SaveReason, Tokens, Data) ->
 
 make_key(Tokens, Data) ->
     erllama_cache_key:make(#{
-        fingerprint => Data#data.fingerprint,
+        fingerprint => request_fp(Data),
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash,
         tokens => Tokens
     }).
+
+%% Fingerprint to use for cache identity. Returns the per-request
+%% snapshot if one was captured at admission (so a mid-request
+%% adapter mutation can't shift the in-flight identity); otherwise
+%% the current effective fingerprint.
+request_fp(#data{request_fp = undefined, effective_fp = FP}) -> FP;
+request_fp(#data{request_fp = FP}) -> FP.
 
 is_strict_prefix([], _) -> true;
 is_strict_prefix([H | T1], [H | T2]) -> is_strict_prefix(T1, T2);

@@ -30,7 +30,10 @@ Config (passed through `erllama_model:start_link/2`):
     embed/2,
     set_grammar/2,
     configure_sampler/2,
-    clear_sampler/1
+    clear_sampler/1,
+    load_adapter/2,
+    unload_adapter/2,
+    apply_adapters/2
 ]).
 
 -record(s, {
@@ -113,3 +116,22 @@ configure_sampler(#s{ctx = C} = S, Cfg) when is_map(Cfg) ->
 clear_sampler(#s{ctx = C} = S) ->
     ok = erllama_nif:clear_sampler(C),
     {ok, S}.
+
+load_adapter(#s{model = M} = S, Path) ->
+    case erllama_nif:adapter_load(M, Path) of
+        {ok, AdapterRef} -> {ok, AdapterRef, S};
+        {error, _} = E -> E
+    end.
+
+unload_adapter(#s{} = S, AdapterRef) ->
+    case erllama_nif:adapter_free(AdapterRef) of
+        ok -> {ok, S};
+        {error, released} -> {ok, S};
+        {error, _} = E -> E
+    end.
+
+apply_adapters(#s{ctx = C} = S, Adapters) ->
+    case erllama_nif:set_adapters(C, Adapters) of
+        ok -> {ok, S};
+        {error, _} = E -> E
+    end.

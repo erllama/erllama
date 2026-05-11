@@ -113,6 +113,12 @@ extern int32_t erllama_safe_chat_apply_template(
 extern struct llama_sampler *erllama_safe_sampler_init_grammar(
     const struct llama_vocab *vocab, const char *grammar_str,
     const char *grammar_root);
+extern struct llama_adapter_lora *erllama_safe_adapter_lora_init(
+    struct llama_model *model, const char *path);
+extern void erllama_safe_adapter_lora_free(struct llama_adapter_lora *a);
+extern int erllama_safe_set_adapters_lora(struct llama_context *ctx,
+                                          struct llama_adapter_lora **adapters,
+                                          size_t n_adapters, float *scales);
 extern float *erllama_safe_get_embeddings_seq(struct llama_context *c,
                                               int seq_id);
 extern float *erllama_safe_get_embeddings(struct llama_context *c);
@@ -166,6 +172,10 @@ static ERL_NIF_TERM atom_not_supported;
  * section but used as a lazy fallback in nif_decode_one. */
 static struct llama_sampler *build_default_greedy_chain(void);
 
+/* Forward decl: adapter_dtor is defined later but registered in the
+ * load callback. */
+static void adapter_dtor(ErlNifEnv *env, void *obj);
+
 /* =========================================================================
  * Resource types
  * ========================================================================= */
@@ -198,8 +208,21 @@ typedef struct {
     struct llama_sampler *smpl;
 } erllama_context_t;
 
+/* LoRA adapter resource. The adapter is bound to a model and stays
+ * valid until the model is freed or adapter_lora_free is called
+ * explicitly. The wrapping resource holds a keep-reference on its
+ * model_res so the underlying llama_model* outlives the adapter even
+ * if the user free_model's it. */
+typedef struct {
+    pthread_mutex_t mu;
+    int mu_inited;
+    struct llama_adapter_lora *adapter; /* NULL after explicit free */
+    erllama_model_t *model_res;         /* keep_resource'd at init */
+} erllama_adapter_t;
+
 static ErlNifResourceType *MODEL_RT;
 static ErlNifResourceType *CTX_RT;
+static ErlNifResourceType *ADAPTER_RT;
 
 /* Drop the context's reference on its model; if a previous
  * free_model/1 returned {ok, deferred} and the model is now
@@ -280,6 +303,27 @@ static void ctx_dtor(ErlNifEnv *env, void *obj) {
     }
 }
 
+/* Adapter destructor. Explicit nif_adapter_free zeroes
+ * a->adapter under the lock, so this destructor is either a no-op
+ * (already freed) or the implicit final cleanup. Either way it
+ * releases the keep-reference on the model. */
+static void adapter_dtor(ErlNifEnv *env, void *obj) {
+    (void) env;
+    erllama_adapter_t *a = (erllama_adapter_t *) obj;
+    if (a->adapter) {
+        erllama_safe_adapter_lora_free(a->adapter);
+        a->adapter = NULL;
+    }
+    if (a->model_res) {
+        enif_release_resource(a->model_res);
+        a->model_res = NULL;
+    }
+    if (a->mu_inited) {
+        pthread_mutex_destroy(&a->mu);
+        a->mu_inited = 0;
+    }
+}
+
 /* =========================================================================
  * Load callback
  * ========================================================================= */
@@ -330,6 +374,12 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     CTX_RT = enif_open_resource_type(
         env, NULL, "erllama_context", ctx_dtor, ERL_NIF_RT_CREATE, NULL);
     if (!CTX_RT) {
+        return -1;
+    }
+
+    ADAPTER_RT = enif_open_resource_type(
+        env, NULL, "erllama_adapter", adapter_dtor, ERL_NIF_RT_CREATE, NULL);
+    if (!ADAPTER_RT) {
         return -1;
     }
 
@@ -1939,6 +1989,162 @@ static ERL_NIF_TERM nif_clear_sampler(ErlNifEnv *env, int argc,
     return atom_ok;
 }
 
+/* =========================================================================
+ * LoRA adapters
+ * ========================================================================= */
+
+static ERL_NIF_TERM nif_adapter_load(ErlNifEnv *env, int argc,
+                                     const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    char path[4097];
+    if (!copy_path(env, argv[1], path, sizeof(path))) {
+        return enif_make_badarg(env);
+    }
+
+    pthread_mutex_lock(&m->mu);
+    if (!m->model) {
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    struct llama_adapter_lora *adapter =
+        erllama_safe_adapter_lora_init(m->model, path);
+    pthread_mutex_unlock(&m->mu);
+    if (!adapter) {
+        return enif_make_tuple2(env, atom_error, atom_load_failed);
+    }
+
+    erllama_adapter_t *res =
+        enif_alloc_resource(ADAPTER_RT, sizeof(*res));
+    if (!res) {
+        erllama_safe_adapter_lora_free(adapter);
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+    memset(res, 0, sizeof(*res));
+    if (pthread_mutex_init(&res->mu, NULL) != 0) {
+        enif_release_resource(res);
+        erllama_safe_adapter_lora_free(adapter);
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+    res->mu_inited = 1;
+    res->adapter = adapter;
+    res->model_res = m;
+    enif_keep_resource(m);
+
+    ERL_NIF_TERM term = enif_make_resource(env, res);
+    enif_release_resource(res);
+    return enif_make_tuple2(env, atom_ok, term);
+}
+
+static ERL_NIF_TERM nif_adapter_free(ErlNifEnv *env, int argc,
+                                     const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_adapter_t *a;
+    if (!enif_get_resource(env, argv[0], ADAPTER_RT, (void **) &a)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&a->mu);
+    if (!a->adapter) {
+        pthread_mutex_unlock(&a->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    erllama_safe_adapter_lora_free(a->adapter);
+    a->adapter = NULL;
+    pthread_mutex_unlock(&a->mu);
+    return atom_ok;
+}
+
+/* Install a set of adapters with scales on a context. Takes a list of
+ * {AdapterRes, Scale} pairs; an empty list detaches everything.
+ * The model layer is responsible for tracking the current attachment
+ * set; this NIF just plumbs through to llama_set_adapters_lora. */
+static ERL_NIF_TERM nif_set_adapters(ErlNifEnv *env, int argc,
+                                     const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    ERL_NIF_TERM list = argv[1];
+    unsigned n;
+    if (!enif_get_list_length(env, list, &n)) {
+        return enif_make_badarg(env);
+    }
+
+    struct llama_adapter_lora **adapters = NULL;
+    float *scales = NULL;
+    if (n > 0) {
+        adapters = enif_alloc(sizeof(*adapters) * n);
+        scales = enif_alloc(sizeof(*scales) * n);
+        if (!adapters || !scales) {
+            if (adapters) enif_free(adapters);
+            if (scales) enif_free(scales);
+            return enif_make_tuple2(env, atom_error, atom_oom);
+        }
+    }
+
+    ERL_NIF_TERM head, tail = list;
+    unsigned i = 0;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        int arity;
+        const ERL_NIF_TERM *pair;
+        if (!enif_get_tuple(env, head, &arity, &pair) || arity != 2) {
+            if (adapters) enif_free(adapters);
+            if (scales) enif_free(scales);
+            return enif_make_badarg(env);
+        }
+        erllama_adapter_t *a;
+        if (!enif_get_resource(env, pair[0], ADAPTER_RT, (void **) &a)) {
+            if (adapters) enif_free(adapters);
+            if (scales) enif_free(scales);
+            return enif_make_badarg(env);
+        }
+        double scale;
+        if (!enif_get_double(env, pair[1], &scale)) {
+            long ll;
+            if (enif_get_long(env, pair[1], &ll)) {
+                scale = (double) ll;
+            } else {
+                if (adapters) enif_free(adapters);
+                if (scales) enif_free(scales);
+                return enif_make_badarg(env);
+            }
+        }
+        pthread_mutex_lock(&a->mu);
+        if (!a->adapter) {
+            pthread_mutex_unlock(&a->mu);
+            if (adapters) enif_free(adapters);
+            if (scales) enif_free(scales);
+            return enif_make_tuple2(env, atom_error, atom_released);
+        }
+        adapters[i] = a->adapter;
+        scales[i] = (float) scale;
+        pthread_mutex_unlock(&a->mu);
+        i++;
+    }
+
+    pthread_mutex_lock(&c->mu);
+    if (!c->ctx) {
+        pthread_mutex_unlock(&c->mu);
+        if (adapters) enif_free(adapters);
+        if (scales) enif_free(scales);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    int rc = erllama_safe_set_adapters_lora(c->ctx, adapters, n, scales);
+    pthread_mutex_unlock(&c->mu);
+
+    if (adapters) enif_free(adapters);
+    if (scales) enif_free(scales);
+
+    if (rc != 0) {
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
+    return atom_ok;
+}
+
 static ErlNifFunc nif_funcs[] = {
     {"nif_crc32c",       1, nif_crc32c,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      3, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
@@ -1958,7 +2164,10 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_set_grammar",  2, nif_set_grammar,  ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_configure_sampler", 2, nif_configure_sampler,
         ERL_NIF_DIRTY_JOB_CPU_BOUND},
-    {"nif_clear_sampler", 1, nif_clear_sampler, ERL_NIF_DIRTY_JOB_CPU_BOUND}
+    {"nif_clear_sampler", 1, nif_clear_sampler, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_adapter_load", 2, nif_adapter_load, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"nif_adapter_free", 1, nif_adapter_free, ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_set_adapters", 2, nif_set_adapters, ERL_NIF_DIRTY_JOB_CPU_BOUND}
 };
 
 ERL_NIF_INIT(erllama_nif, nif_funcs, load, NULL, NULL, unload)

@@ -27,10 +27,14 @@
     set_grammar/2,
     configure_sampler/2,
     clear_sampler/1,
+    load_adapter/2,
+    unload_adapter/2,
+    apply_adapters/2,
     %% Test helpers: read back what the most recent configure_sampler
-    %% / clear_sampler call saw.
+    %% / clear_sampler / apply_adapters call saw.
     last_sampler_cfg/1,
-    cleared/1
+    cleared/1,
+    applied_adapters/1
 ]).
 
 %% Stub state.
@@ -43,7 +47,11 @@
 -record(stub, {
     sampler = #{} :: map(),
     last_sampler = #{} :: map(),
-    cleared = false :: boolean()
+    cleared = false :: boolean(),
+    %% Most recently applied adapter set, as the {Ref, Scale} list the
+    %% model layer passed to apply_adapters/2. Tests read this back to
+    %% assert the snapshot rules.
+    applied = [] :: [{reference(), float()}]
 }).
 
 init(_Config) ->
@@ -116,6 +124,19 @@ clear_sampler(#stub{} = S) ->
 
 last_sampler_cfg(#stub{last_sampler = Cfg}) -> Cfg.
 cleared(#stub{cleared = C}) -> C.
+applied_adapters(#stub{applied = A}) -> A.
+
+%% LoRA stubs: the adapter handle is a fresh reference per load so
+%% tests can distinguish multiple adapters; unload is a no-op;
+%% apply_adapters just records the call.
+load_adapter(#stub{} = S, _Path) ->
+    {ok, make_ref(), S}.
+
+unload_adapter(#stub{} = S, _Ref) ->
+    {ok, S}.
+
+apply_adapters(#stub{} = S, Adapters) when is_list(Adapters) ->
+    {ok, S#stub{applied = Adapters}}.
 
 %% =============================================================================
 %% Internal: chat-template rendering

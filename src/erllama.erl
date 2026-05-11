@@ -52,6 +52,10 @@ an explicit `model_id` in the config map.
     detokenize/2,
     apply_chat_template/2,
     embed/2,
+    load_adapter/2,
+    unload_adapter/2,
+    set_adapter_scale/3,
+    list_adapters/1,
     counters/0
 ]).
 
@@ -239,6 +243,44 @@ apply_chat_template(Model, Request) ->
     {ok, [float()]} | {error, term()}.
 embed(Model, Tokens) ->
     erllama_model:embed(Model, Tokens).
+
+-doc """
+Load a LoRA adapter from a GGUF file and attach it to the model with
+scale 1.0. Returns an opaque handle to pass to `set_adapter_scale/3`
+and `unload_adapter/2`.
+
+The adapter's file sha256 is folded into the model's effective
+fingerprint so cache rows produced with the adapter attached never
+collide with rows from a different attachment set. In-flight
+requests keep their original fingerprint snapshot; the new value
+takes effect from the next request.
+""".
+-spec load_adapter(model(), file:filename_all()) ->
+    {ok, term()} | {error, term()}.
+load_adapter(Model, Path) ->
+    erllama_model:load_adapter(Model, Path).
+
+-doc """
+Detach and free a previously loaded adapter. Idempotent.
+""".
+-spec unload_adapter(model(), term()) -> ok | {error, term()}.
+unload_adapter(Model, Handle) ->
+    erllama_model:unload_adapter(Model, Handle).
+
+-doc """
+Change an attached adapter's scale. The scale is folded into the
+effective fingerprint, so changes split the cache namespace.
+""".
+-spec set_adapter_scale(model(), term(), float()) -> ok | {error, term()}.
+set_adapter_scale(Model, Handle, Scale) ->
+    erllama_model:set_adapter_scale(Model, Handle, Scale).
+
+-doc """
+List currently attached adapters with their scales.
+""".
+-spec list_adapters(model()) -> [#{handle := term(), scale := float()}].
+list_adapters(Model) ->
+    erllama_model:list_adapters(Model).
 
 -doc "Snapshot of the cache subsystem operational counters.".
 -spec counters() -> #{atom() => non_neg_integer()}.

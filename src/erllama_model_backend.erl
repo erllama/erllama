@@ -82,13 +82,33 @@ inference, etc.) can plug in via this same surface.
 
 -callback clear_sampler(state()) -> {ok, state()} | {error, term()}.
 
+%% Optional LoRA support. `load_adapter/2` returns an opaque handle
+%% identifying the adapter; the handle is passed back to
+%% `set_adapter_scale/3` and `unload_adapter/2`. `apply_adapters/2`
+%% installs the current attachment set on the underlying context;
+%% the model layer calls it whenever the attachment set or any scale
+%% changes. The Adapters argument is a list of
+%% `{Handle, Scale :: float()}` tuples; an empty list detaches
+%% everything. Backends without LoRA support can omit the entire
+%% group; the model layer returns `{error, not_supported}` to the
+%% public API.
+-callback load_adapter(state(), Path :: iodata()) ->
+    {ok, term(), state()} | {error, term()}.
+-callback unload_adapter(state(), Handle :: term()) ->
+    {ok, state()} | {error, term()}.
+-callback apply_adapters(state(), [{term(), float()}]) ->
+    {ok, state()} | {error, term()}.
+
 -optional_callbacks([
     seq_rm_last/2,
     apply_chat_template/2,
     embed/2,
     set_grammar/2,
     configure_sampler/2,
-    clear_sampler/1
+    clear_sampler/1,
+    load_adapter/2,
+    unload_adapter/2,
+    apply_adapters/2
 ]).
 
 -type sampler_opts() :: #{

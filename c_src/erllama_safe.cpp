@@ -408,6 +408,47 @@ erllama_safe_sampler_init_grammar(const struct llama_vocab *vocab,
 }
 
 // ---------------------------------------------------------------------------
+// LoRA adapters
+// ---------------------------------------------------------------------------
+
+// Load an adapter from a GGUF file. Bound to the model: stays valid
+// until the model is freed (or until adapter_lora_free is called).
+struct llama_adapter_lora *
+erllama_safe_adapter_lora_init(struct llama_model *model,
+                               const char *path) noexcept {
+    try {
+        return llama_adapter_lora_init(model, path);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+// Explicit free. Safe to call once at most per adapter; the model
+// destructor frees any adapter that wasn't explicitly freed.
+void erllama_safe_adapter_lora_free(struct llama_adapter_lora *a) noexcept {
+    if (!a) return;
+    try {
+        llama_adapter_lora_free(a);
+    } catch (...) {
+        // swallow; double-free or destructor exception is unrecoverable
+        // but must not unwind into BEAM.
+    }
+}
+
+// Install a set of adapters with their scales on a context. Passing
+// n_adapters = 0 detaches everything.
+int erllama_safe_set_adapters_lora(struct llama_context *ctx,
+                                   struct llama_adapter_lora **adapters,
+                                   size_t n_adapters,
+                                   float *scales) noexcept {
+    try {
+        return llama_set_adapters_lora(ctx, adapters, n_adapters, scales);
+    } catch (...) {
+        return -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Embeddings (bucket C, C-NIF)
 // ---------------------------------------------------------------------------
 
