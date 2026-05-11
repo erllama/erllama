@@ -103,17 +103,34 @@ quant_byte_round_trip_test() ->
     Quants = [
         f32,
         f16,
+        bf16,
         q4_0,
         q4_1,
         q5_0,
         q5_1,
         q8_0,
+        q2_k,
+        q3_k_s,
+        q3_k_m,
+        q3_k_l,
         q4_k_m,
         q4_k_s,
         q5_k_m,
         q5_k_s,
         q6_k,
-        q8_k
+        q8_k,
+        iq1_s,
+        iq1_m,
+        iq2_xxs,
+        iq2_xs,
+        iq2_s,
+        iq2_m,
+        iq3_xxs,
+        iq3_xs,
+        iq3_s,
+        iq3_m,
+        iq4_nl,
+        iq4_xs
     ],
     [
         ?assertEqual({ok, Q}, erllama_cache_key:quant_atom(erllama_cache_key:quant_byte(Q)))
@@ -121,7 +138,12 @@ quant_byte_round_trip_test() ->
     ].
 
 quant_atom_unknown_test() ->
-    ?assertEqual({error, unknown_quant}, erllama_cache_key:quant_atom(255)).
+    ?assertEqual({error, unknown_quant}, erllama_cache_key:quant_atom(254)).
+
+quant_byte_unknown_atom_test() ->
+    %% Catch-all clause maps any unknown atom to byte 255 so cache
+    %% key derivation never crashes the model gen_statem.
+    ?assertEqual(255, erllama_cache_key:quant_byte(future_q9_x)).
 
 encode_decode_tokens_round_trip_test() ->
     Tokens = [0, 1, 16#FFFFFFFF, 12345, 67890],
