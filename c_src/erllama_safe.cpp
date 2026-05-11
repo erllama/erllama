@@ -343,6 +343,27 @@ int32_t erllama_safe_vocab_n_tokens(const struct llama_vocab *v) noexcept {
     }
 }
 
+// Total byte size of the model on disk, used by list_models to
+// derive vram_estimate_b. Returns 0 on exception (caller treats as
+// "unknown").
+uint64_t erllama_safe_model_size(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_size(m);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Total layer count, used to turn n_gpu_layers into a fraction
+// for vram_estimate_b. Returns 0 on exception.
+int32_t erllama_safe_model_n_layer(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_n_layer(m);
+    } catch (...) {
+        return 0;
+    }
+}
+
 uint32_t erllama_safe_n_ctx(const struct llama_context *c) noexcept {
     try {
         return llama_n_ctx(c);

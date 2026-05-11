@@ -33,23 +33,40 @@ Config (passed through `erllama_model:start_link/2`):
     clear_sampler/1,
     load_adapter/2,
     unload_adapter/2,
-    apply_adapters/2
+    apply_adapters/2,
+    extra_metadata/1
 ]).
 
 -record(s, {
     model :: erllama_nif:model_ref(),
-    ctx :: erllama_nif:context_ref()
+    ctx :: erllama_nif:context_ref(),
+    %% Captured once at init for vram_estimate_b derivation. The
+    %% values are immutable once the model is loaded; the gen_statem
+    %% reads them via extra_metadata/1 at its own init time and
+    %% caches the derived estimate in #data.
+    model_size_bytes = 0 :: non_neg_integer(),
+    total_layers = 0 :: non_neg_integer(),
+    %% Signed: llama.cpp uses negative (typically -1) to mean
+    %% "offload all layers".
+    n_gpu_layers = 0 :: integer()
 }).
 
 init(Config) ->
     Path = maps:get(model_path, Config),
     MOpts = maps:get(model_opts, Config, #{}),
     COpts = maps:get(context_opts, Config, #{}),
+    NGpuLayers = maps:get(n_gpu_layers, MOpts, 0),
     case erllama_nif:load_model(Path, MOpts) of
         {ok, Model} ->
             case erllama_nif:new_context(Model, COpts) of
                 {ok, Ctx} ->
-                    {ok, #s{model = Model, ctx = Ctx}};
+                    {ok, #s{
+                        model = Model,
+                        ctx = Ctx,
+                        model_size_bytes = safe_uint(erllama_nif:model_size(Model)),
+                        total_layers = safe_uint(erllama_nif:model_n_layer(Model)),
+                        n_gpu_layers = NGpuLayers
+                    }};
                 {error, _} = E ->
                     erllama_nif:free_model(Model),
                     E
@@ -57,6 +74,9 @@ init(Config) ->
         {error, _} = E ->
             E
     end.
+
+safe_uint(N) when is_integer(N), N >= 0 -> N;
+safe_uint(_) -> 0.
 
 terminate(#s{ctx = Ctx, model = Model}) ->
     erllama_nif:free_context(Ctx),
@@ -135,3 +155,8 @@ apply_adapters(#s{ctx = C} = S, Adapters) ->
         ok -> {ok, S};
         {error, _} = E -> E
     end.
+
+extra_metadata(#s{
+    model_size_bytes = SB, total_layers = TL, n_gpu_layers = NL
+}) ->
+    #{model_size_bytes => SB, total_layers => TL, n_gpu_layers => NL}.

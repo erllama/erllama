@@ -101,6 +101,8 @@ extern const struct llama_model *erllama_safe_get_model(
 extern const struct llama_vocab *erllama_safe_model_get_vocab(
     const struct llama_model *m);
 extern int32_t erllama_safe_vocab_n_tokens(const struct llama_vocab *v);
+extern uint64_t erllama_safe_model_size(const struct llama_model *m);
+extern int32_t erllama_safe_model_n_layer(const struct llama_model *m);
 extern uint32_t erllama_safe_n_ctx(const struct llama_context *c);
 extern uint32_t erllama_safe_n_batch(const struct llama_context *c);
 extern size_t erllama_safe_backend_dev_count(void);
@@ -590,6 +592,45 @@ static ERL_NIF_TERM nif_crc32c(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
     }
     uint32_t crc = erllama_crc32c_update(0, bin.data, bin.size);
     return enif_make_uint(env, crc);
+}
+
+/* =========================================================================
+ * Model accessors (size, layer count)
+ *
+ * Used by erllama_model to derive `vram_estimate_b` for `list_models`
+ * metadata. Read-only, take the model resource lock for safety
+ * against a concurrent free.
+ * ========================================================================= */
+static ERL_NIF_TERM nif_model_size(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&m->mu);
+    if (!m->model) {
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    uint64_t sz = erllama_safe_model_size(m->model);
+    pthread_mutex_unlock(&m->mu);
+    return enif_make_uint64(env, sz);
+}
+
+static ERL_NIF_TERM nif_model_n_layer(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_model_t *m;
+    if (!enif_get_resource(env, argv[0], MODEL_RT, (void **) &m)) {
+        return enif_make_badarg(env);
+    }
+    pthread_mutex_lock(&m->mu);
+    if (!m->model) {
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+    int32_t n = erllama_safe_model_n_layer(m->model);
+    pthread_mutex_unlock(&m->mu);
+    return enif_make_int(env, n);
 }
 
 /* =========================================================================
@@ -2531,6 +2572,8 @@ static ERL_NIF_TERM nif_sampler_free(ErlNifEnv *env, int argc,
 static ErlNifFunc nif_funcs[] = {
     {"nif_crc32c",       1, nif_crc32c,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_vram_info",    0, nif_vram_info,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_model_size",   1, nif_model_size,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_model_n_layer",1, nif_model_n_layer,ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      3, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      4, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_unpack",    3, nif_kv_unpack,    ERL_NIF_DIRTY_JOB_CPU_BOUND},

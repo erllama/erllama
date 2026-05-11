@@ -67,14 +67,28 @@ stubs get replaced; the cache integration is unaffected.
 -type model() :: erllama_registry:model_id() | pid().
 -type model_info() :: #{
     id := binary(),
+    %% Alias for `id`. Added for cluster registry rows so callers
+    %% match on a name that does not collide with their own
+    %% process-id-typed `id` fields.
+    model_id := binary(),
     pid := pid(),
     status := idle | prefilling | generating,
     backend := module(),
     context_size := non_neg_integer(),
     quant_type := atom(),
     quant_bits := non_neg_integer(),
+    %% String tag like <<"q4_k_m">> / <<"f16">>. Derived from
+    %% quant_type + quant_bits.
+    quant_tag := binary(),
     tier := disk | ram_file,
-    fingerprint := binary()
+    fingerprint := binary(),
+    %% erlang:monotonic_time(nanosecond) at gen_statem init.
+    loaded_at_monotonic := integer(),
+    %% Best-effort estimate of VRAM footprint for the model when
+    %% the gpu offload is configured. 0 if no GPU layers are
+    %% offloaded or if the backend cannot report the underlying
+    %% sizes (stub backend, etc.).
+    vram_estimate_b := non_neg_integer()
 }.
 
 -type cache_hit_kind() :: exact | partial | cold.
@@ -137,6 +151,12 @@ stubs get replaced; the cache integration is unaffected.
     %% Inference backend: erllama_model_stub | erllama_model_llama.
     backend :: module(),
     backend_state :: term(),
+    %% Captured at init for list_models metadata.
+    loaded_at_monotonic :: integer(),
+    %% Best-effort VRAM footprint of the loaded model, in bytes.
+    %% 0 when no GPU layers are offloaded or when the backend does
+    %% not report enough metadata to derive it.
+    vram_estimate_b = 0 :: non_neg_integer(),
     %% Attached LoRA adapters. Each entry holds the backend's opaque
     %% handle, the file sha256 (for cache-key derivation), and the
     %% current scale. effective_fp = sha256(fingerprint || sorted
@@ -397,6 +417,8 @@ init([ModelId, Config]) ->
                 adapters = [],
                 %% No adapters at boot -> effective fp == base fp.
                 effective_fp = Fp,
+                loaded_at_monotonic = erlang:monotonic_time(nanosecond),
+                vram_estimate_b = compute_vram_estimate(Backend, BState),
                 prompt_tokens = [],
                 context_tokens = [],
                 response_target = 0,
@@ -406,6 +428,27 @@ init([ModelId, Config]) ->
             {ok, idle, Data};
         {error, Reason} ->
             {stop, Reason}
+    end.
+
+%% Best-effort: ask the backend for the byte size, total layer count,
+%% and n_gpu_layers it captured at load time. Backends without the
+%% optional callback (or that return missing keys) get 0.
+compute_vram_estimate(Backend, BState) ->
+    case erlang:function_exported(Backend, extra_metadata, 1) of
+        false ->
+            0;
+        true ->
+            Meta = Backend:extra_metadata(BState),
+            Size = maps:get(model_size_bytes, Meta, 0),
+            Total = maps:get(total_layers, Meta, 0),
+            NGpu = maps:get(n_gpu_layers, Meta, 0),
+            case {Size, Total, NGpu} of
+                {0, _, _} -> 0;
+                {_, 0, _} -> 0;
+                {_, _, NG} when NG =< 0 -> Size;
+                {_, T, NG} when NG >= T -> Size;
+                {S, T, NG} -> (S * NG) div T
+            end
     end.
 
 %% Per-model policy. Caller can override any subset; missing keys
@@ -775,14 +818,20 @@ optional_backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
 build_model_info(State, Data) ->
     #{
         id => Data#data.model_id,
+        model_id => Data#data.model_id,
         pid => self(),
         status => State,
         backend => Data#data.backend,
         context_size => Data#data.context_size,
         quant_type => Data#data.quant_type,
         quant_bits => Data#data.quant_bits,
+        quant_tag => erllama_cache_key:quant_tag(
+            Data#data.quant_type, Data#data.quant_bits
+        ),
         tier => Data#data.tier,
-        fingerprint => Data#data.fingerprint
+        fingerprint => Data#data.fingerprint,
+        loaded_at_monotonic => Data#data.loaded_at_monotonic,
+        vram_estimate_b => Data#data.vram_estimate_b
     }.
 
 %% =============================================================================

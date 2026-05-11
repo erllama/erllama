@@ -48,7 +48,9 @@
     set_adapters/2,
     sampler_new/2,
     sampler_free/1,
-    vram_info/0
+    vram_info/0,
+    model_size/1,
+    model_n_layer/1
 ]).
 
 -export_type([adapter_ref/0, sampler_ref/0]).
@@ -240,6 +242,18 @@ sampler_free(Sampler) ->
 vram_info() ->
     nif_vram_info().
 
+%% Total byte size of the loaded model on disk. Used to derive
+%% vram_estimate_b for list_models metadata. 0 on exception.
+-spec model_size(model_ref()) -> non_neg_integer() | {error, atom()}.
+model_size(Model) ->
+    nif_model_size(Model).
+
+%% Total layer count of the loaded model. Used together with
+%% n_gpu_layers to compute the offload fraction for vram_estimate_b.
+-spec model_n_layer(model_ref()) -> non_neg_integer() | {error, atom()}.
+model_n_layer(Model) ->
+    nif_model_n_layer(Model).
+
 %% =============================================================================
 %% NIF stubs (replaced at on_load time)
 %% =============================================================================
@@ -269,3 +283,5 @@ nif_set_adapters(_Ctx, _Adapters) -> erlang:nif_error(nif_not_loaded).
 nif_sampler_new(_Ctx, _Cfg) -> erlang:nif_error(nif_not_loaded).
 nif_sampler_free(_Sampler) -> erlang:nif_error(nif_not_loaded).
 nif_vram_info() -> erlang:nif_error(nif_not_loaded).
+nif_model_size(_Model) -> erlang:nif_error(nif_not_loaded).
+nif_model_n_layer(_Model) -> erlang:nif_error(nif_not_loaded).
