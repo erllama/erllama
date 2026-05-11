@@ -51,7 +51,8 @@ stubs get replaced; the cache integration is unaffected.
     unload_adapter/2,
     set_adapter_scale/3,
     list_adapters/1,
-    get_backend_state/1
+    get_backend_state/1,
+    cache_key_meta/1
 ]).
 
 -export_type([
@@ -366,6 +367,15 @@ get_backend_state(Model) ->
     {_State, Data} = sys:get_state(via(Model)),
     Data#data.backend_state.
 
+%% Snapshot of the cache key triple a probe needs to hit the
+%% cache for this model's current state. Effective fingerprint
+%% (with attached LoRA composition) so the lookup matches what
+%% runtime requests would hit.
+-spec cache_key_meta(model()) ->
+    #{fingerprint := binary(), quant_type := atom(), ctx_params_hash := binary()}.
+cache_key_meta(Model) ->
+    gen_statem:call(via(Model), cache_key_meta).
+
 init([ModelId, Config]) ->
     Backend = maps:get(backend, Config, erllama_model_stub),
     case Backend:init(Config) of
@@ -590,6 +600,16 @@ handle_common(_State, {call, From}, list_adapters, Data) ->
      || #{handle := H, scale := Scale} <- Data#data.adapters
     ],
     reply(From, Listing, Data);
+handle_common(_State, {call, From}, cache_key_meta, Data) ->
+    %% Effective fingerprint reflects the model's current LoRA
+    %% composition. Using the base #data.fingerprint here would
+    %% mis-key cache lookups whenever an adapter is attached.
+    Meta = #{
+        fingerprint => Data#data.effective_fp,
+        quant_type => Data#data.quant_type,
+        ctx_params_hash => Data#data.ctx_params_hash
+    },
+    reply(From, Meta, Data);
 handle_common(_State, _EventType, _EventContent, Data) ->
     {keep_state, Data}.
 

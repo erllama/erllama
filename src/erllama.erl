@@ -58,7 +58,8 @@ an explicit `model_id` in the config map.
     list_adapters/1,
     counters/0,
     vram_info/0,
-    queue_depth/0
+    queue_depth/0,
+    list_cached_prefixes/2
 ]).
 
 -export_type([model/0, model_id/0, model_info/0]).
@@ -323,6 +324,37 @@ client-side outgoing-request counters.
 -spec queue_depth() -> non_neg_integer().
 queue_depth() ->
     erllama_inflight:queue_depth().
+
+-doc """
+Probe how much of `PromptTokens` is already cached for `ModelId`
+on this node. Returns `{ok, MatchLen}` where `MatchLen` is the
+length of the longest cached prefix of `PromptTokens` (across all
+tiers: RAM, ram_file, disk). Returns `{ok, 0}` if no prefix is
+cached or the prompt is empty. Returns `{error, model_not_loaded}`
+if `ModelId` is not registered locally.
+
+Lookup uses the model's effective fingerprint, so attached LoRA
+adapters are honoured: cached rows produced under one adapter set
+will not match a probe taken under a different adapter set.
+
+Used by the `erllama_cluster` cache-affinity router to route
+prompts to the node with the longest matching cached prefix.
+""".
+-spec list_cached_prefixes(model_id(), [erllama_nif:token_id()]) ->
+    {ok, non_neg_integer()} | {error, term()}.
+list_cached_prefixes(_ModelId, []) ->
+    {ok, 0};
+list_cached_prefixes(ModelId, PromptTokens) when is_binary(ModelId), is_list(PromptTokens) ->
+    case erllama_registry:whereis_name(ModelId) of
+        undefined ->
+            {error, model_not_loaded};
+        _Pid ->
+            KeyMeta = erllama_model:cache_key_meta(ModelId),
+            case erllama_cache:lookup_longest_prefix(KeyMeta, PromptTokens) of
+                {ok, MatchLen, _Row} -> {ok, MatchLen};
+                miss -> {ok, 0}
+            end
+    end.
 
 %% =============================================================================
 %% Internal
