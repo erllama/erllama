@@ -57,7 +57,8 @@ an explicit `model_id` in the config map.
     set_adapter_scale/3,
     list_adapters/1,
     counters/0,
-    vram_info/0
+    vram_info/0,
+    queue_depth/0
 ]).
 
 -export_type([model/0, model_id/0, model_info/0]).
@@ -307,6 +308,21 @@ placement.
     | {error, atom()}.
 vram_info() ->
     erllama_nif:vram_info().
+
+-doc """
+O(1) snapshot of currently-admitted streaming inference requests
+across all loaded models. Counts only rows registered in
+`erllama_inflight` from the `infer/4` admission path; pending
+requests queued inside an individual model gen_statem are not
+included.
+
+Used by the `erllama_cluster` load balancer (least_loaded,
+power_of_two strategies) as a more accurate alternative to
+client-side outgoing-request counters.
+""".
+-spec queue_depth() -> non_neg_integer().
+queue_depth() ->
+    erllama_inflight:queue_depth().
 
 %% =============================================================================
 %% Internal
