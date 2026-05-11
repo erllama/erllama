@@ -56,7 +56,8 @@ an explicit `model_id` in the config map.
     unload_adapter/2,
     set_adapter_scale/3,
     list_adapters/1,
-    counters/0
+    counters/0,
+    vram_info/0
 ]).
 
 -export_type([model/0, model_id/0, model_info/0]).
@@ -286,6 +287,26 @@ list_adapters(Model) ->
 -spec counters() -> #{atom() => non_neg_integer()}.
 counters() ->
     erllama_cache:get_counters().
+
+-doc """
+VRAM probe across all loaded ggml backends. Sums free / total bytes
+across non-CPU devices (GPU, integrated GPU, accelerator). Returns
+`{error, no_gpu}` on a CPU-only build rather than reporting a fake
+number; the caller should fall back to a system memory probe of its
+own choosing in that case.
+
+Used by the `erllama_cluster` scheduler for bin-packing model
+placement.
+""".
+-spec vram_info() ->
+    {ok, #{
+        total_b := non_neg_integer(),
+        free_b := non_neg_integer(),
+        used_b := non_neg_integer()
+    }}
+    | {error, atom()}.
+vram_info() ->
+    erllama_nif:vram_info().
 
 %% =============================================================================
 %% Internal

@@ -359,6 +359,38 @@ uint32_t erllama_safe_n_batch(const struct llama_context *c) noexcept {
     }
 }
 
+// Backend device enumeration. Used by nif_vram_info to walk all
+// loaded ggml backends and sum free/total memory across non-CPU
+// devices. ggml_backend_dev_t is opaque, so we expose only an
+// index-based interface across the C ABI rather than passing
+// pointers through the NIF boundary.
+size_t erllama_safe_backend_dev_count(void) noexcept {
+    try {
+        return ggml_backend_dev_count();
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Look up the device at `idx` and write its memory + type to the
+// out-params. Returns 0 on success, -1 on exception or invalid
+// index. On failure the out-params are left untouched.
+int erllama_safe_backend_dev_info(size_t idx, size_t *free_b,
+                                  size_t *total_b, int *dev_type) noexcept {
+    try {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(idx);
+        if (!dev) return -1;
+        size_t free_v = 0, total_v = 0;
+        ggml_backend_dev_memory(dev, &free_v, &total_v);
+        if (free_b) *free_b = free_v;
+        if (total_b) *total_b = total_v;
+        if (dev_type) *dev_type = (int) ggml_backend_dev_type(dev);
+        return 0;
+    } catch (...) {
+        return -1;
+    }
+}
+
 int erllama_safe_vocab_is_eog(const struct llama_vocab *v,
                               llama_token tok) noexcept {
     try {

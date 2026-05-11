@@ -103,6 +103,9 @@ extern const struct llama_vocab *erllama_safe_model_get_vocab(
 extern int32_t erllama_safe_vocab_n_tokens(const struct llama_vocab *v);
 extern uint32_t erllama_safe_n_ctx(const struct llama_context *c);
 extern uint32_t erllama_safe_n_batch(const struct llama_context *c);
+extern size_t erllama_safe_backend_dev_count(void);
+extern int erllama_safe_backend_dev_info(size_t idx, size_t *free_b,
+                                         size_t *total_b, int *dev_type);
 extern int erllama_safe_vocab_is_eog(const struct llama_vocab *v,
                                      llama_token tok);
 extern int32_t erllama_safe_tokenize(const struct llama_vocab *vocab,
@@ -187,6 +190,10 @@ static ERL_NIF_TERM atom_grammar_failed;
 static ERL_NIF_TERM atom_embed_failed;
 static ERL_NIF_TERM atom_not_supported;
 static ERL_NIF_TERM atom_invalid_content;
+static ERL_NIF_TERM atom_no_gpu;
+static ERL_NIF_TERM atom_total_b;
+static ERL_NIF_TERM atom_free_b;
+static ERL_NIF_TERM atom_used_b;
 
 /* Forward decl: build_default_greedy_chain is defined in the sampler
  * section but used as a lazy fallback in nif_decode_one. */
@@ -454,6 +461,10 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
     atom_embed_failed = enif_make_atom(env, "embed_failed");
     atom_not_supported = enif_make_atom(env, "not_supported");
     atom_invalid_content = enif_make_atom(env, "invalid_content");
+    atom_no_gpu = enif_make_atom(env, "no_gpu");
+    atom_total_b = enif_make_atom(env, "total_b");
+    atom_free_b = enif_make_atom(env, "free_b");
+    atom_used_b = enif_make_atom(env, "used_b");
 
     MODEL_RT = enif_open_resource_type(
         env, NULL, "erllama_model", model_dtor, ERL_NIF_RT_CREATE, NULL);
@@ -579,6 +590,54 @@ static ERL_NIF_TERM nif_crc32c(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
     }
     uint32_t crc = erllama_crc32c_update(0, bin.data, bin.size);
     return enif_make_uint(env, crc);
+}
+
+/* =========================================================================
+ * VRAM probe
+ *
+ * Walks every loaded ggml backend and sums free / total memory across
+ * non-CPU devices (GPU, integrated GPU, accelerator). META is a
+ * pseudo-device used by ggml internals and is excluded. CPU memory is
+ * also excluded: callers asking for vram_info want VRAM, and there is
+ * no good answer for "VRAM on a CPU-only build" -- we return
+ * {error, no_gpu} so the caller can fall back to system memory probes
+ * of its own choosing rather than reporting a fake number.
+ *
+ * The probe is rare (cluster scheduler) and runs on the dirty CPU
+ * scheduler.
+ * ========================================================================= */
+static ERL_NIF_TERM nif_vram_info(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    (void) argv;
+    if (erllama_safe_backend_init_once() != 0) {
+        return enif_make_tuple2(env, atom_error, atom_exception);
+    }
+    size_t n = erllama_safe_backend_dev_count();
+    size_t total_sum = 0, free_sum = 0;
+    int found_non_cpu = 0;
+    for (size_t i = 0; i < n; i++) {
+        size_t f = 0, t = 0;
+        int dt = 0;
+        if (erllama_safe_backend_dev_info(i, &f, &t, &dt) != 0) {
+            continue;
+        }
+        if (dt == GGML_BACKEND_DEVICE_TYPE_GPU
+            || dt == GGML_BACKEND_DEVICE_TYPE_IGPU
+            || dt == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
+            total_sum += t;
+            free_sum += f;
+            found_non_cpu = 1;
+        }
+    }
+    if (!found_non_cpu) {
+        return enif_make_tuple2(env, atom_error, atom_no_gpu);
+    }
+    size_t used_sum = (total_sum > free_sum) ? (total_sum - free_sum) : 0;
+    ERL_NIF_TERM map = enif_make_new_map(env);
+    enif_make_map_put(env, map, atom_total_b, enif_make_uint64(env, total_sum), &map);
+    enif_make_map_put(env, map, atom_free_b, enif_make_uint64(env, free_sum), &map);
+    enif_make_map_put(env, map, atom_used_b, enif_make_uint64(env, used_sum), &map);
+    return enif_make_tuple2(env, atom_ok, map);
 }
 
 /* =========================================================================
@@ -2471,6 +2530,7 @@ static ERL_NIF_TERM nif_sampler_free(ErlNifEnv *env, int argc,
 
 static ErlNifFunc nif_funcs[] = {
     {"nif_crc32c",       1, nif_crc32c,       ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_vram_info",    0, nif_vram_info,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      3, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_pack",      4, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_unpack",    3, nif_kv_unpack,    ERL_NIF_DIRTY_JOB_CPU_BOUND},

@@ -82,6 +82,32 @@ load_model_rejects_non_existent_path_test_() ->
     end}.
 
 %% =============================================================================
+%% VRAM probe
+%% =============================================================================
+
+%% nif_vram_info triggers the lazy llama_backend_init (pthread_once)
+%% on first call, which on macOS includes Metal device discovery and
+%% can take several seconds. Same 60 s timeout pattern as the load
+%% test above.
+vram_info_returns_ok_or_no_gpu_test_() ->
+    {timeout, 60, fun() ->
+        case erllama_nif:vram_info() of
+            {ok, M} ->
+                ?assert(is_map(M)),
+                ?assert(maps:is_key(total_b, M)),
+                ?assert(maps:is_key(free_b, M)),
+                ?assert(maps:is_key(used_b, M)),
+                ?assertEqual(
+                    maps:get(total_b, M),
+                    maps:get(free_b, M) + maps:get(used_b, M)
+                );
+            {error, no_gpu} ->
+                %% CPU-only build: documented contract.
+                ok
+        end
+    end}.
+
+%% =============================================================================
 %% End-to-end smoke (gated by LLAMA_TEST_MODEL env var)
 %% =============================================================================
 

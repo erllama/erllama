@@ -47,7 +47,8 @@
     adapter_free/1,
     set_adapters/2,
     sampler_new/2,
-    sampler_free/1
+    sampler_free/1,
+    vram_info/0
 ]).
 
 -export_type([adapter_ref/0, sampler_ref/0]).
@@ -225,6 +226,20 @@ sampler_new(Ctx, Cfg) when is_map(Cfg) ->
 sampler_free(Sampler) ->
     nif_sampler_free(Sampler).
 
+%% Walk every loaded ggml backend and sum free / total memory across
+%% non-CPU devices (GPU, integrated GPU, accelerator). Returns
+%% `{error, no_gpu}` on a CPU-only build (no faked numbers). Used by
+%% the cluster scheduler for bin-packing model placement.
+-spec vram_info() ->
+    {ok, #{
+        total_b := non_neg_integer(),
+        free_b := non_neg_integer(),
+        used_b := non_neg_integer()
+    }}
+    | {error, atom()}.
+vram_info() ->
+    nif_vram_info().
+
 %% =============================================================================
 %% NIF stubs (replaced at on_load time)
 %% =============================================================================
@@ -253,3 +268,4 @@ nif_adapter_free(_Adapter) -> erlang:nif_error(nif_not_loaded).
 nif_set_adapters(_Ctx, _Adapters) -> erlang:nif_error(nif_not_loaded).
 nif_sampler_new(_Ctx, _Cfg) -> erlang:nif_error(nif_not_loaded).
 nif_sampler_free(_Sampler) -> erlang:nif_error(nif_not_loaded).
+nif_vram_info() -> erlang:nif_error(nif_not_loaded).
