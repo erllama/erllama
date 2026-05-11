@@ -6,6 +6,52 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-05-12
+
+NIF safety and SIGSEGV hardening. No public API additions; new
+error tuples surface paths that previously crashed the BEAM or
+raised `badarg` across a dirty scheduler.
+
+### Fixed
+
+- Adapter use-after-free / double-free when `free_model/1` ran
+  while adapter wrappers still referenced the model. The model
+  resource now tracks `active_adapters` alongside `active_contexts`
+  and defers `llama_model_free` until both reach zero (#10).
+- Race in `set_adapters/2` where a concurrent `adapter_free` could
+  null the underlying pointer between the per-adapter mutex
+  release and the `llama_set_adapters_lora` call. Locks are now
+  held across the llama call in pointer-sorted order to defeat
+  AB-BA between concurrent callers (#10).
+- Per-message memory leak in `apply_chat_template` when the
+  message list was malformed or allocation failed mid-build. The
+  helper now releases its own role/content allocations on every
+  error path (#10).
+- `prefill/2` and `embed/2` walked past the KV slab when the
+  prompt size reached `n_ctx`, and produced undefined behaviour
+  when it exceeded `n_batch`. Both now bounds-check against the
+  live context before touching state, returning
+  `{error, context_overflow}` or `{error, batch_overflow}` (#11).
+- `apply_chat_template/2` raised `badarg` across the dirty
+  scheduler when `content` was a list-of-maps (Anthropic-style
+  content blocks) instead of a binary. Returns
+  `{error, invalid_content}` (#11).
+- `load_model/2` surfaced a generic `{error, load_failed}` for
+  malformed GGUF files. Now returns `{error, malformed_gguf}` on
+  a best-effort basis when the captured llama log line contains
+  `GGML_ASSERT`. Best-effort only: `llama_log_set` is process
+  global and concurrent loads can mis-attribute classification.
+  A `GGML_ASSERT` that hits `abort()` still terminates the BEAM
+  process; subprocess isolation would be required for a complete
+  fix and is intentionally out of scope (#11).
+
+### Added
+
+- New error atoms returned by the NIF: `context_overflow`,
+  `batch_overflow`, `invalid_content`, `malformed_gguf`. Callers
+  matching `{error, _}` are unaffected; callers that care about
+  the specific reason should match the new atoms.
+
 ## [0.1.0] — 2026-05-11
 
 Initial public release.
@@ -206,5 +252,6 @@ Initial public release.
 
 Same idea as [antirez/ds4](https://github.com/antirez/ds4).
 
-[Unreleased]: https://github.com/erllama/erllama/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/erllama/erllama/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/erllama/erllama/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/erllama/erllama/releases/tag/v0.1.0
