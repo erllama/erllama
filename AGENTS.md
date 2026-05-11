@@ -99,7 +99,6 @@ save announce) go through `erllama_cache_meta_srv` via
   multi-GB GGUF weights, so a second mapping per cache restore
   doubles the VM footprint, and a region binary surviving the NIF
   call would expose the BEAM to SIGBUS from any external truncation.
-  ds4 makes the same choice.
 
 ### Multi-turn warmth
 

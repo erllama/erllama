@@ -112,9 +112,8 @@ The disk tier reads cache files via `file:read_file/1` into a
 fresh BEAM heap binary. mmap was an option in earlier revisions
 but was removed: the process already mmaps the GGUF (multi-GB),
 and a region binary that survives the NIF call would expose the
-BEAM to SIGBUS from any external truncation. ds4 makes the same
-choice. See [internals/nif-safety.md](nif-safety.md) for the
-fuller rationale.
+BEAM to SIGBUS from any external truncation. See
+[internals/nif-safety.md](nif-safety.md) for the fuller rationale.
 
 ## Test surface
 

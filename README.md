@@ -47,6 +47,11 @@ its own supervisor, and never returns approximate matches.
 
 ## What you get
 
+- **Many models in one BEAM.** Load TinyLlama and Llama-3-8B side by
+  side, hot-swap a model without bouncing the cache, give each model
+  its own `policy` and `tier`. One shared cache; rows are
+  fingerprint-segregated so models never collide on identical
+  prompts.
 - **Token-exact hits.** Cache key is
   `sha256(model_fp || quant || ctx_params || tokens_le32)`. Same
   tokens, same key, guaranteed-correct restore.
@@ -58,6 +63,9 @@ its own supervisor, and never returns approximate matches.
   A 70B model in Q4 already takes ~40 GB of weights; the disk tier
   holds the warm KV state your working set needs without crowding
   weights out of RAM.
+- **Shared-prefix hits across agents.** Spawn N workers that all
+  start with the same system prompt: the first cold-prefills, every
+  subsequent worker gets a longest-prefix hit on the shared part.
 - **Multi-turn warmth.** Pass the previous turn's `parent_key` and
   the cache waits up to `session_resume_wait_ms` for the in-flight
   finish save to publish.
@@ -71,7 +79,7 @@ its own supervisor, and never returns approximate matches.
   (`memsup`, `nvidia-smi`, or your own callback). Off by default.
 - **Always-on metrics.** Hits, misses, saves, evictions, and
   per-path latency totals exposed via `erllama_cache:get_counters/0`.
-  Per-counter cost is ~10–20 ns; you cannot meaningfully turn them
+  Per-counter cost is ~10-20 ns; you cannot meaningfully turn them
   off.
 
 ## Installation
@@ -120,6 +128,38 @@ For the design rationale behind the cache:
   five-stage crash-safe save protocol.
 - [NIF safety](internals/nif-safety.md) — two-resource lifetime,
   exception shim, why disk reads use plain `file:read_file/1`.
+
+## Many models in one BEAM
+
+Each loaded model is its own supervised `gen_statem` under
+`erllama_model_sup`. The cache is process-wide and segregates rows
+by fingerprint, so the only thing two models share is the byte
+budget.
+
+```erlang
+{ok, _} = erllama:load_model(<<"tiny">>, TinyConfig).
+{ok, _} = erllama:load_model(<<"big">>,  BigConfig).
+
+{ok, R1, _} = erllama:complete(<<"tiny">>, <<"summarise: ...">>).
+{ok, R2, _} = erllama:complete(<<"big">>,  <<"deep analysis of: ...">>).
+
+ok = erllama:unload(<<"tiny">>).
+```
+
+| Capability | How |
+|---|---|
+| N models in one BEAM | `load_model/2` per binary id; each is one `gen_statem` |
+| No cross-model collisions | Cache key includes the model fingerprint |
+| Hot-swap a model | `unload/1` then `load_model/2`; the cache survives |
+| Per-model `policy` | `policy => #{...}` on the load; merges over app-env defaults |
+| Per-model `tier` | `tier_srv => MyDisk, tier => disk` per model |
+| Shared-prefix hits across agents | Longest-prefix walk on every cold prompt |
+| Concurrent saves bounded | Single writer pool with a leak-proof semaphore |
+
+Tested end-to-end in
+`test/erllama_SUITE.erl:concurrent_complete_under_writer_cap` —
+four models with distinct fingerprints running parallel completions
+under one writer cap.
 
 ## A slightly longer example
 
@@ -278,15 +318,7 @@ Bumping the vendored llama.cpp: see [UPDATE_LLAMA.md](UPDATE_LLAMA.md).
 
 ## Acknowledgements
 
-The on-disk `KVC` file format (48-byte header, `"KVC"` magic), the
-save-reasons taxonomy, and the `boundary_trim_tokens` /
-`boundary_align_tokens` defaults are direct ports from
-[antirez/ds4](https://github.com/antirez/ds4). ds4 pioneered the
-"disk KV cache as a first-class resume mechanism" idea for
-DeepSeek V4; erllama generalises that pattern as an Erlang/OTP
-library across any GGUF llama.cpp can load. The rest — multi-tier
-storage, supervised writer pool, longest-prefix walk indexing,
-memory-pressure scheduler, exception-safe NIF — is erllama's own.
+Same idea as [antirez/ds4](https://github.com/antirez/ds4).
 
 ## License
 
