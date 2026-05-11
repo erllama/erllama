@@ -199,7 +199,8 @@ typedef struct {
     int mu_inited;                 /* guard pthread_mutex_destroy on error path */
     struct llama_model *model;     /* NULL after successful release */
     int active_contexts;           /* nif_new_context bumps; ctx_dtor decrements */
-    int release_pending;           /* free_model when active_contexts hit 0 */
+    int active_adapters;           /* nif_adapter_load bumps; adapter_dtor decrements */
+    int release_pending;           /* free_model defers while either counter > 0 */
 } erllama_model_t;
 
 typedef struct {
@@ -245,18 +246,39 @@ static ErlNifResourceType *CTX_RT;
 static ErlNifResourceType *ADAPTER_RT;
 static ErlNifResourceType *SAMPLER_RT;
 
-/* Drop the context's reference on its model; if a previous
- * free_model/1 returned {ok, deferred} and the model is now
- * unreferenced, actually free the underlying llama_model* here. The
- * decision is made under the lock so concurrent context destructions
- * can't double-free. The free itself runs while the lock is still
- * held to keep the pointer non-observable mid-teardown. */
+/* Drop the context's (or adapter's) reference on its model; if a
+ * previous free_model/1 returned {ok, deferred} and the model is now
+ * unreferenced by both contexts and adapters, actually free the
+ * underlying llama_model* here. The decision is made under the lock
+ * so concurrent destructions can't double-free. The free itself
+ * runs while the lock is still held to keep the pointer
+ * non-observable mid-teardown.
+ *
+ * Adapters share this gating because llama_model_free implicitly
+ * frees any adapter that wasn't explicitly freed; if we freed the
+ * model with an adapter wrapper still holding a (now dangling)
+ * llama_adapter_lora* the next adapter_dtor would crash. */
 static void context_drops_model(erllama_model_t *m) {
     pthread_mutex_lock(&m->mu);
     if (m->active_contexts > 0) {
         m->active_contexts--;
     }
-    if (m->release_pending && m->active_contexts == 0 && m->model) {
+    if (m->release_pending && m->active_contexts == 0
+        && m->active_adapters == 0 && m->model) {
+        (void) erllama_safe_model_free(m->model);
+        m->model = NULL;
+        m->release_pending = 0;
+    }
+    pthread_mutex_unlock(&m->mu);
+}
+
+static void model_drops_adapter(erllama_model_t *m) {
+    pthread_mutex_lock(&m->mu);
+    if (m->active_adapters > 0) {
+        m->active_adapters--;
+    }
+    if (m->release_pending && m->active_contexts == 0
+        && m->active_adapters == 0 && m->model) {
         (void) erllama_safe_model_free(m->model);
         m->model = NULL;
         m->release_pending = 0;
@@ -347,7 +369,9 @@ static void sampler_dtor(ErlNifEnv *env, void *obj) {
 /* Adapter destructor. Explicit nif_adapter_free zeroes
  * a->adapter under the lock, so this destructor is either a no-op
  * (already freed) or the implicit final cleanup. Either way it
- * releases the keep-reference on the model. */
+ * decrements the model's adapter count via model_drops_adapter
+ * (which may complete a deferred free_model/1) and releases the
+ * keep-reference on the model. */
 static void adapter_dtor(ErlNifEnv *env, void *obj) {
     (void) env;
     erllama_adapter_t *a = (erllama_adapter_t *) obj;
@@ -356,6 +380,7 @@ static void adapter_dtor(ErlNifEnv *env, void *obj) {
         a->adapter = NULL;
     }
     if (a->model_res) {
+        model_drops_adapter(a->model_res);
         enif_release_resource(a->model_res);
         a->model_res = NULL;
     }
@@ -591,9 +616,10 @@ static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
 
 /* free_model/1 returns:
  *   ok                 -> released; subsequent ops on the term return error
- *   {ok, deferred}     -> contexts still hold this model; release flagged.
- *                         The last context destruction performs the actual
- *                         llama_model_free under context_drops_model.
+ *   {ok, deferred}     -> contexts or adapters still hold this model;
+ *                         release flagged. The last context or adapter
+ *                         destruction performs the actual llama_model_free
+ *                         under context_drops_model / model_drops_adapter.
  *   {error, released}  -> already released
  *
  * The lock blocks for the duration of any concurrent dirty NIF using
@@ -610,7 +636,7 @@ static ERL_NIF_TERM nif_free_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
-    if (m->active_contexts > 0) {
+    if (m->active_contexts > 0 || m->active_adapters > 0) {
         m->release_pending = 1;
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_ok, atom_deferred);
@@ -1367,10 +1393,22 @@ static int get_map_bin(ErlNifEnv *env, ERL_NIF_TERM map, const char *key,
     return 1;
 }
 
+static void free_chat_msgs(struct llama_chat_message *msgs, int n) {
+    for (int i = 0; i < n; i++) {
+        if (msgs[i].role) enif_free((char *) msgs[i].role);
+        if (msgs[i].content) enif_free((char *) msgs[i].content);
+    }
+}
+
 /* Iterate over a list of message maps and fill `out_msgs` with
  * llama_chat_message structs. Each message is `#{role := ..., content := ...}`.
  * The role and content strings are allocated with enif_alloc and the
  * caller must free them via free_chat_msgs.
+ *
+ * On error the helper frees the role+content allocations it placed
+ * into out[idx0..idx-1] before returning. The caller's free_chat_msgs
+ * call (over its pre-call n_msgs range) does not overlap that range,
+ * so no double-free is reachable.
  *
  * Returns the number of messages on success, -1 on bad input, -2 on OOM.
  */
@@ -1379,21 +1417,26 @@ static int build_chat_msgs_from_list(
     struct llama_chat_message *out, int max_out, int idx0
 ) {
     int idx = idx0;
+    int err = 0;
     ERL_NIF_TERM head, tail = list;
     while (enif_get_list_cell(env, tail, &head, &tail)) {
-        if (idx >= max_out) return -1;
-        if (!enif_is_map(env, head)) return -1;
+        if (idx >= max_out) { err = -1; goto cleanup; }
+        if (!enif_is_map(env, head)) { err = -1; goto cleanup; }
         ErlNifBinary role_bin, content_bin;
-        if (!get_map_bin(env, head, "role", &role_bin)) return -1;
-        if (!get_map_bin(env, head, "content", &content_bin)) return -1;
+        if (!get_map_bin(env, head, "role", &role_bin)) { err = -1; goto cleanup; }
+        if (!get_map_bin(env, head, "content", &content_bin)) {
+            err = -1;
+            goto cleanup;
+        }
         char *role = enif_alloc(role_bin.size + 1);
-        if (!role) return -2;
+        if (!role) { err = -2; goto cleanup; }
         memcpy(role, role_bin.data, role_bin.size);
         role[role_bin.size] = '\0';
         char *content = enif_alloc(content_bin.size + 1);
         if (!content) {
             enif_free(role);
-            return -2;
+            err = -2;
+            goto cleanup;
         }
         memcpy(content, content_bin.data, content_bin.size);
         content[content_bin.size] = '\0';
@@ -1402,13 +1445,10 @@ static int build_chat_msgs_from_list(
         idx++;
     }
     return idx;
-}
 
-static void free_chat_msgs(struct llama_chat_message *msgs, int n) {
-    for (int i = 0; i < n; i++) {
-        if (msgs[i].role) enif_free((char *) msgs[i].role);
-        if (msgs[i].content) enif_free((char *) msgs[i].content);
-    }
+cleanup:
+    free_chat_msgs(out + idx0, idx - idx0);
+    return err;
 }
 
 /* Build a synthetic system content string that prepends the user-
@@ -2065,29 +2105,39 @@ static ERL_NIF_TERM nif_adapter_load(ErlNifEnv *env, int argc,
         pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
+    /* Mirror nif_new_context: refuse to attach a new adapter once
+     * free_model/1 has flagged the model for deferred release.
+     * Otherwise a new wrapper could resurrect an outgoing model. */
+    if (m->release_pending) {
+        pthread_mutex_unlock(&m->mu);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
     struct llama_adapter_lora *adapter =
         erllama_safe_adapter_lora_init(m->model, path);
-    pthread_mutex_unlock(&m->mu);
     if (!adapter) {
+        pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_load_failed);
     }
-
     erllama_adapter_t *res =
         enif_alloc_resource(ADAPTER_RT, sizeof(*res));
     if (!res) {
         erllama_safe_adapter_lora_free(adapter);
+        pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
     memset(res, 0, sizeof(*res));
     if (pthread_mutex_init(&res->mu, NULL) != 0) {
         enif_release_resource(res);
         erllama_safe_adapter_lora_free(adapter);
+        pthread_mutex_unlock(&m->mu);
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
     res->mu_inited = 1;
     res->adapter = adapter;
     res->model_res = m;
+    m->active_adapters++;
     enif_keep_resource(m);
+    pthread_mutex_unlock(&m->mu);
 
     ERL_NIF_TERM term = enif_make_resource(env, res);
     enif_release_resource(res);
@@ -2115,7 +2165,30 @@ static ERL_NIF_TERM nif_adapter_free(ErlNifEnv *env, int argc,
 /* Install a set of adapters with scales on a context. Takes a list of
  * {AdapterRes, Scale} pairs; an empty list detaches everything.
  * The model layer is responsible for tracking the current attachment
- * set; this NIF just plumbs through to llama_set_adapters_lora. */
+ * set; this NIF just plumbs through to llama_set_adapters_lora.
+ *
+ * Concurrency: every unique adapter wrapper's mu is held for the
+ * full duration of the llama call. nif_adapter_free, which also
+ * takes a->mu, is therefore blocked from racing the read of
+ * a->adapter against its use in the native call. To avoid AB-BA
+ * between two concurrent set_adapters callers passing overlapping
+ * adapter sets in different orders, locks are taken in pointer
+ * order (qsort by wrapper address). The user-supplied list order
+ * is preserved in the arrays passed to llama via orig_idx. */
+typedef struct {
+    erllama_adapter_t *w;
+    float scale;
+    unsigned orig_idx;
+} adapter_entry_t;
+
+static int adapter_entry_cmp(const void *a, const void *b) {
+    erllama_adapter_t *aw = ((const adapter_entry_t *) a)->w;
+    erllama_adapter_t *bw = ((const adapter_entry_t *) b)->w;
+    if (aw < bw) return -1;
+    if (aw > bw) return 1;
+    return 0;
+}
+
 static ERL_NIF_TERM nif_set_adapters(ErlNifEnv *env, int argc,
                                      const ERL_NIF_TERM argv[]) {
     (void) argc;
@@ -2131,31 +2204,32 @@ static ERL_NIF_TERM nif_set_adapters(ErlNifEnv *env, int argc,
 
     struct llama_adapter_lora **adapters = NULL;
     float *scales = NULL;
+    adapter_entry_t *entries = NULL;
     if (n > 0) {
         adapters = enif_alloc(sizeof(*adapters) * n);
         scales = enif_alloc(sizeof(*scales) * n);
-        if (!adapters || !scales) {
+        entries = enif_alloc(sizeof(*entries) * n);
+        if (!adapters || !scales || !entries) {
             if (adapters) enif_free(adapters);
             if (scales) enif_free(scales);
+            if (entries) enif_free(entries);
             return enif_make_tuple2(env, atom_error, atom_oom);
         }
     }
 
+    /* Resolve the list in user order. No locks taken yet: we just
+     * gather the wrapper pointers and scales. */
     ERL_NIF_TERM head, tail = list;
     unsigned i = 0;
     while (enif_get_list_cell(env, tail, &head, &tail)) {
         int arity;
         const ERL_NIF_TERM *pair;
         if (!enif_get_tuple(env, head, &arity, &pair) || arity != 2) {
-            if (adapters) enif_free(adapters);
-            if (scales) enif_free(scales);
-            return enif_make_badarg(env);
+            goto badarg;
         }
         erllama_adapter_t *a;
         if (!enif_get_resource(env, pair[0], ADAPTER_RT, (void **) &a)) {
-            if (adapters) enif_free(adapters);
-            if (scales) enif_free(scales);
-            return enif_make_badarg(env);
+            goto badarg;
         }
         double scale;
         if (!enif_get_double(env, pair[1], &scale)) {
@@ -2163,41 +2237,84 @@ static ERL_NIF_TERM nif_set_adapters(ErlNifEnv *env, int argc,
             if (enif_get_long(env, pair[1], &ll)) {
                 scale = (double) ll;
             } else {
-                if (adapters) enif_free(adapters);
-                if (scales) enif_free(scales);
-                return enif_make_badarg(env);
+                goto badarg;
             }
         }
-        pthread_mutex_lock(&a->mu);
-        if (!a->adapter) {
-            pthread_mutex_unlock(&a->mu);
-            if (adapters) enif_free(adapters);
-            if (scales) enif_free(scales);
-            return enif_make_tuple2(env, atom_error, atom_released);
-        }
-        adapters[i] = a->adapter;
-        scales[i] = (float) scale;
-        pthread_mutex_unlock(&a->mu);
+        entries[i].w = a;
+        entries[i].scale = (float) scale;
+        entries[i].orig_idx = i;
         i++;
     }
 
+    /* Sort by wrapper pointer so locks always go in a consistent
+     * order across concurrent set_adapters callers. Same wrapper
+     * appearing twice (caller error or duplicate-scale convention)
+     * collapses to one lock acquisition; the user-supplied
+     * adapters[]/scales[] still receive both entries via orig_idx. */
+    if (n > 1) qsort(entries, n, sizeof(*entries), adapter_entry_cmp);
+
+    /* Lock each unique wrapper in sorted order. On a released
+     * adapter, unlock everything held so far and bail out. */
+    unsigned k = 0;
+    for (k = 0; k < n; k++) {
+        if (k > 0 && entries[k].w == entries[k - 1].w) continue;
+        pthread_mutex_lock(&entries[k].w->mu);
+        if (!entries[k].w->adapter) {
+            for (unsigned j = 0; j <= k; j++) {
+                if (j > 0 && entries[j].w == entries[j - 1].w) continue;
+                pthread_mutex_unlock(&entries[j].w->mu);
+            }
+            if (adapters) enif_free(adapters);
+            if (scales) enif_free(scales);
+            if (entries) enif_free(entries);
+            return enif_make_tuple2(env, atom_error, atom_released);
+        }
+    }
+
+    /* Build native arrays in the user's original order. All
+     * a->adapter reads happen under the corresponding a->mu held
+     * above, so a concurrent nif_adapter_free cannot null any of
+     * these pointers between read and use. */
+    for (k = 0; k < n; k++) {
+        adapters[entries[k].orig_idx] = entries[k].w->adapter;
+        scales[entries[k].orig_idx] = entries[k].scale;
+    }
+
     pthread_mutex_lock(&c->mu);
+    int rc;
     if (!c->ctx) {
         pthread_mutex_unlock(&c->mu);
+        for (k = 0; k < n; k++) {
+            if (k > 0 && entries[k].w == entries[k - 1].w) continue;
+            pthread_mutex_unlock(&entries[k].w->mu);
+        }
         if (adapters) enif_free(adapters);
         if (scales) enif_free(scales);
+        if (entries) enif_free(entries);
         return enif_make_tuple2(env, atom_error, atom_released);
     }
-    int rc = erllama_safe_set_adapters_lora(c->ctx, adapters, n, scales);
+    rc = erllama_safe_set_adapters_lora(c->ctx, adapters, n, scales);
     pthread_mutex_unlock(&c->mu);
+
+    for (k = 0; k < n; k++) {
+        if (k > 0 && entries[k].w == entries[k - 1].w) continue;
+        pthread_mutex_unlock(&entries[k].w->mu);
+    }
 
     if (adapters) enif_free(adapters);
     if (scales) enif_free(scales);
+    if (entries) enif_free(entries);
 
     if (rc != 0) {
         return enif_make_tuple2(env, atom_error, atom_exception);
     }
     return atom_ok;
+
+badarg:
+    if (adapters) enif_free(adapters);
+    if (scales) enif_free(scales);
+    if (entries) enif_free(entries);
+    return enif_make_badarg(env);
 }
 
 /* =========================================================================
