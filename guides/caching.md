@@ -37,8 +37,7 @@ out to the right tier.
 The disk tier is **a first-class citizen**: large models that
 wouldn't fit alongside a working set of warm KV state in RAM can
 let the disk tier hold most of the cache, and warm-restore in
-milliseconds when a hit comes in. This is the same idea ds4 uses
-for DeepSeek V4, generalised here to any GGUF llama.cpp can load.
+milliseconds when a hit comes in.
 
 ## When does a save happen?
 

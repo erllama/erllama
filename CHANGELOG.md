@@ -14,7 +14,7 @@ this project adheres to [Semantic Versioning](https://semver.org).
   `erllama_cache_disk_srv:start_link/4` form are gone. The process
   already mmaps multi-GB GGUF weights, and a region binary that
   outlived its closing NIF call would have exposed the BEAM to
-  SIGBUS from any external truncation. ds4 makes the same choice.
+  SIGBUS from any external truncation.
 
 ### Changed
 
@@ -162,13 +162,7 @@ Initial public release.
 
 ### Acknowledgements
 
-The on-disk `KVC` file format (48-byte header, `"KVC"` magic), the
-save-reasons taxonomy, and the `boundary_trim_tokens` /
-`boundary_align_tokens` defaults are direct ports from
-[antirez/ds4](https://github.com/antirez/ds4). ds4 pioneered the
-"disk KV cache as a first-class resume mechanism" idea for
-DeepSeek V4; erllama generalises that pattern as an Erlang/OTP
-library across any GGUF llama.cpp can load.
+Same idea as [antirez/ds4](https://github.com/antirez/ds4).
 
 [Unreleased]: https://github.com/erllama/erllama/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/erllama/erllama/releases/tag/v0.1.0

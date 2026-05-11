@@ -118,10 +118,8 @@ removed it because:
   call. Any external truncation of the cache file then crashes the
   VM with SIGBUS in places no NIF can intercept (sub-binary
   creation, message send, GC).
-- ds4 — the design erllama draws from — makes the same choice for
-  the same reasons.
 
-For typical cache files (1–100 MB) the kernel page cache already
+For typical cache files (1-100 MB) the kernel page cache already
 makes the second `read(2)` cheap; mmap's zero-copy benefit only
 shows up at sizes where the trade-off ceases to be acceptable.
 

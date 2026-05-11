@@ -91,11 +91,6 @@ The async/sync distinction is load-bearing. `cold` and `continued`
 must not block the request path; `evict` and `shutdown` must block
 because the holder is going away.
 
-The taxonomy is a direct port from
-[antirez/ds4](https://github.com/antirez/ds4). We kept the names
-because the semantics map cleanly and any future reader of either
-codebase wins by recognising them.
-
 ## What the cache is not
 
 - **Not a session manager.** It does not track conversations or
@@ -106,9 +101,8 @@ codebase wins by recognising them.
   limiting live above the cache. The cache only owns "the
   on-disk/in-RAM mapping from token-prefix to KV bytes".
 - **Not a generic blob store.** Slab format is opinionated:
-  fixed-size per-layer regions, ds4-derived 48-byte header, CRC32C
-  trailer. Repurposing the format for non-llama.cpp data would be
-  miserable.
+  fixed-size per-layer regions, 48-byte header, CRC32C trailer.
+  Repurposing the format for non-llama.cpp data would be miserable.
 - **Not GPU-aware.** The cache stores KV bytes; whether they go on
   GPU or CPU is a property of the `llama_context*` that consumes
   them. The cache doesn't care.
