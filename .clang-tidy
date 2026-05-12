@@ -1,0 +1,12 @@
+---
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-macro-parentheses
+WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*'
+HeaderFilterRegex: '^.*/c_src/(erllama_nif|erllama_safe|crc32c)\.(h|hpp)$'
+FormatStyle: none
