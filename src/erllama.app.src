@@ -38,7 +38,7 @@
     ]},
     {modules, []},
     {licenses, ["MIT"]},
-    {links, []},
+    {links, [{<<"GitHub">>, <<"https://github.com/erllama/erllama">>}]},
     %% Hex package manifest. Whitelist what to include; exclude the
     %% parts of vendored llama.cpp that are not needed at build time
     %% (unused backends already pruned at vendor time, dotfiles,
