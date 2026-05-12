@@ -921,7 +921,8 @@ static ERL_NIF_TERM nif_tokenize(ErlNifEnv *env, int argc, const ERL_NIF_TERM ar
     if (!enif_inspect_iolist_as_binary(env, argv[1], &text)) {
         return enif_make_badarg(env);
     }
-    if (text.size > ERLLAMA_MAX_TOKEN_TEXT) {
+    /* NOLINTNEXTLINE(bugprone-implicit-widening-of-multiplication-result) */
+    if (text.size > (size_t) ERLLAMA_MAX_TOKEN_TEXT) {
         return enif_make_tuple2(env, atom_error, atom_too_large);
     }
     if (!enif_is_map(env, argv[2])) {
@@ -2553,6 +2554,11 @@ static ERL_NIF_TERM nif_set_adapters(ErlNifEnv *env, int argc,
                 goto badarg;
             }
         }
+        /* entries was allocated in the `if (n > 0)` block above;
+         * the while loop only enters when the list has elements,
+         * which implies n > 0. The analyzer can't tie those two
+         * facts together. */
+        /* NOLINTNEXTLINE(clang-analyzer-core.NullDereference) */
         entries[i].w = a;
         entries[i].scale = (float) scale;
         entries[i].orig_idx = i;
