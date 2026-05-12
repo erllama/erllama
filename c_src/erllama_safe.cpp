@@ -343,6 +343,27 @@ int32_t erllama_safe_vocab_n_tokens(const struct llama_vocab *v) noexcept {
     }
 }
 
+// Total byte size of the model on disk, used by list_models to
+// derive vram_estimate_b. Returns 0 on exception (caller treats as
+// "unknown").
+uint64_t erllama_safe_model_size(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_size(m);
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Total layer count, used to turn n_gpu_layers into a fraction
+// for vram_estimate_b. Returns 0 on exception.
+int32_t erllama_safe_model_n_layer(const struct llama_model *m) noexcept {
+    try {
+        return llama_model_n_layer(m);
+    } catch (...) {
+        return 0;
+    }
+}
+
 uint32_t erllama_safe_n_ctx(const struct llama_context *c) noexcept {
     try {
         return llama_n_ctx(c);
@@ -356,6 +377,38 @@ uint32_t erllama_safe_n_batch(const struct llama_context *c) noexcept {
         return llama_n_batch(c);
     } catch (...) {
         return 0;
+    }
+}
+
+// Backend device enumeration. Used by nif_vram_info to walk all
+// loaded ggml backends and sum free/total memory across non-CPU
+// devices. ggml_backend_dev_t is opaque, so we expose only an
+// index-based interface across the C ABI rather than passing
+// pointers through the NIF boundary.
+size_t erllama_safe_backend_dev_count(void) noexcept {
+    try {
+        return ggml_backend_dev_count();
+    } catch (...) {
+        return 0;
+    }
+}
+
+// Look up the device at `idx` and write its memory + type to the
+// out-params. Returns 0 on success, -1 on exception or invalid
+// index. On failure the out-params are left untouched.
+int erllama_safe_backend_dev_info(size_t idx, size_t *free_b,
+                                  size_t *total_b, int *dev_type) noexcept {
+    try {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(idx);
+        if (!dev) return -1;
+        size_t free_v = 0, total_v = 0;
+        ggml_backend_dev_memory(dev, &free_v, &total_v);
+        if (free_b) *free_b = free_v;
+        if (total_b) *total_b = total_v;
+        if (dev_type) *dev_type = (int) ggml_backend_dev_type(dev);
+        return 0;
+    } catch (...) {
+        return -1;
     }
 }
 
@@ -443,6 +496,76 @@ int erllama_safe_memory_seq_rm(struct llama_context *c, int seq_id,
                    : -1;
     } catch (...) {
         return -1;
+    }
+}
+
+// Largest position present in the seq_id's KV state, or -1 when
+// the sequence is empty (matches llama's own empty-sequence
+// sentinel). -2 on exception so callers can disambiguate.
+long erllama_safe_memory_seq_pos_max(struct llama_context *c,
+                                     int seq_id) noexcept {
+    try {
+        llama_memory_t mem = llama_get_memory(c);
+        if (!mem) return -2;
+        return (long) llama_memory_seq_pos_max(mem, (llama_seq_id) seq_id);
+    } catch (...) {
+        return -2;
+    }
+}
+
+// Speculative-decoding helper. Build a llama_batch with logits[i]=1
+// for every position, decode, fill out_argmax[i] with argmax over
+// the model vocab at each position. Used by erllama:verify/4.
+//
+// Sampler state is intentionally untouched: this path goes
+// straight through llama_get_logits_ith / argmax and bypasses any
+// configured sampler chain, so the caller's c->smpl stays clean.
+//
+// Returns 0 ok; -1 on llama_decode failure; -2 on batch_init OOM
+// or invalid n_tokens; -3 on C++ exception.
+int erllama_safe_forward_with_argmax(struct llama_context *c,
+                                     const llama_token *tokens,
+                                     int32_t n_tokens,
+                                     int32_t n_vocab,
+                                     long start_pos,
+                                     int32_t *out_argmax) noexcept {
+    if (n_tokens <= 0 || n_vocab <= 0 || !tokens || !out_argmax) {
+        return -2;
+    }
+    try {
+        struct llama_batch batch = llama_batch_init(n_tokens, 0, 1);
+        if (!batch.token) {
+            return -2;
+        }
+        for (int32_t i = 0; i < n_tokens; i++) {
+            batch.token[i] = tokens[i];
+            batch.pos[i] = (llama_pos)(start_pos + i);
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = (llama_seq_id) 0;
+            batch.logits[i] = 1;
+        }
+        batch.n_tokens = n_tokens;
+        int rc = llama_decode(c, batch);
+        if (rc != 0) {
+            llama_batch_free(batch);
+            return -1;
+        }
+        for (int32_t i = 0; i < n_tokens; i++) {
+            float *logits = llama_get_logits_ith(c, i);
+            int32_t best = 0;
+            float best_v = logits[0];
+            for (int32_t v = 1; v < n_vocab; v++) {
+                if (logits[v] > best_v) {
+                    best_v = logits[v];
+                    best = v;
+                }
+            }
+            out_argmax[i] = best;
+        }
+        llama_batch_free(batch);
+        return 0;
+    } catch (...) {
+        return -3;
     }
 }
 

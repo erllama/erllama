@@ -49,7 +49,9 @@
     seed_determinism/1,
     seed_varies/1,
     temperature_zero_is_greedy/1,
-    grammar_plus_sampler/1
+    grammar_plus_sampler/1,
+    verify_does_not_mutate_caller_visible_state/1,
+    verify_accepted_count_le_k/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -81,7 +83,9 @@ all() ->
         seed_determinism,
         seed_varies,
         temperature_zero_is_greedy,
-        grammar_plus_sampler
+        grammar_plus_sampler,
+        verify_does_not_mutate_caller_visible_state,
+        verify_accepted_count_le_k
     ].
 
 init_per_suite(Config) ->
@@ -452,6 +456,66 @@ run_infer(Model, Tokens, Params) ->
         {Texts, Stats} -> {iolist_to_binary(Texts), Stats};
         Other -> ct:fail({drain, Other})
     end.
+
+%% verify/4 must leave the context's sampling distribution
+%% indistinguishable from its pre-call state. We prove it by:
+%%   1. Prefill prompt + decode_one to record T1.
+%%   2. Reset the KV state and re-prefill (clean baseline matching
+%%      step 1).
+%%   3. Run verify with arbitrary candidates.
+%%   4. Decode_one and record T2.
+%%   5. Assert T1 == T2.
+%% If the snapshot/restore protocol skips a piece (KV cells, logits
+%% buffer), step 4 picks up the wrong distribution and T2 diverges.
+verify_does_not_mutate_caller_visible_state(Config) ->
+    Model = ?config(model, Config),
+    {ok, Prompt} = erllama:tokenize(Model, ?SHORT_PROMPT),
+    BState = erllama_model:get_backend_state(Model),
+    Ctx = element(3, BState),
+    %% Pre-call sequence: prefill prompt, decode_one to get T1.
+    ok = erllama_nif:prefill(Ctx, Prompt),
+    {Tag1, T1} = erllama_nif:decode_one(Ctx),
+    ?assert(Tag1 =:= ok orelse Tag1 =:= eog),
+    %% Reset to a clean baseline matching step 1.
+    %% kv_seq_rm with p1 = -1 drops everything past p0.
+    ok = erllama_nif:kv_seq_rm(Ctx, 0, length(Prompt), -1),
+    ok = erllama_nif:prefill(Ctx, Prompt),
+    %% Run verify; the candidates here are arbitrary -- what
+    %% matters is that the post-call sampling distribution is
+    %% restored.
+    Candidates = [1, 2, 3, 4],
+    {ok, _Accepted, _Next} = erllama:verify(
+        Model, Prompt, Candidates, length(Candidates)
+    ),
+    %% Post-call decode_one: T2 must equal T1.
+    {Tag2, T2} = erllama_nif:decode_one(Ctx),
+    ?assert(Tag2 =:= ok orelse Tag2 =:= eog),
+    ?assertEqual(T1, T2),
+    ok.
+
+verify_accepted_count_le_k(Config) ->
+    Model = ?config(model, Config),
+    {ok, Prompt} = erllama:tokenize(Model, ?SHORT_PROMPT),
+    BState = erllama_model:get_backend_state(Model),
+    Ctx = element(3, BState),
+    ok = erllama_nif:prefill(Ctx, Prompt),
+    %% A handful of arbitrary candidate sets; AcceptedCount must
+    %% always be <= K regardless of how many actually match.
+    [
+        begin
+            ok = erllama_nif:kv_seq_rm(Ctx, 0, length(Prompt), -1),
+            ok = erllama_nif:prefill(Ctx, Prompt),
+            {ok, Accepted, _Next} = erllama:verify(Model, Prompt, Cands, K),
+            ?assert(Accepted >= 0 andalso Accepted =< K)
+        end
+     || {Cands, K} <- [
+            {[100], 1},
+            {[100, 200], 2},
+            {[100, 200, 300, 400, 500], 5},
+            {[7, 7, 7], 3}
+        ]
+    ],
+    ok.
 
 %% =============================================================================
 %% Helpers

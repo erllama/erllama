@@ -51,7 +51,9 @@ stubs get replaced; the cache integration is unaffected.
     unload_adapter/2,
     set_adapter_scale/3,
     list_adapters/1,
-    get_backend_state/1
+    get_backend_state/1,
+    cache_key_meta/1,
+    verify/4
 ]).
 
 -export_type([
@@ -66,14 +68,28 @@ stubs get replaced; the cache integration is unaffected.
 -type model() :: erllama_registry:model_id() | pid().
 -type model_info() :: #{
     id := binary(),
+    %% Alias for `id`. Added for cluster registry rows so callers
+    %% match on a name that does not collide with their own
+    %% process-id-typed `id` fields.
+    model_id := binary(),
     pid := pid(),
     status := idle | prefilling | generating,
     backend := module(),
     context_size := non_neg_integer(),
     quant_type := atom(),
     quant_bits := non_neg_integer(),
+    %% String tag like <<"q4_k_m">> / <<"f16">>. Derived from
+    %% quant_type + quant_bits.
+    quant_tag := binary(),
     tier := disk | ram_file,
-    fingerprint := binary()
+    fingerprint := binary(),
+    %% erlang:monotonic_time(nanosecond) at gen_statem init.
+    loaded_at_monotonic := integer(),
+    %% Best-effort estimate of VRAM footprint for the model when
+    %% the gpu offload is configured. 0 if no GPU layers are
+    %% offloaded or if the backend cannot report the underlying
+    %% sizes (stub backend, etc.).
+    vram_estimate_b := non_neg_integer()
 }.
 
 -type cache_hit_kind() :: exact | partial | cold.
@@ -136,6 +152,12 @@ stubs get replaced; the cache integration is unaffected.
     %% Inference backend: erllama_model_stub | erllama_model_llama.
     backend :: module(),
     backend_state :: term(),
+    %% Captured at init for list_models metadata.
+    loaded_at_monotonic :: integer(),
+    %% Best-effort VRAM footprint of the loaded model, in bytes.
+    %% 0 when no GPU layers are offloaded or when the backend does
+    %% not report enough metadata to derive it.
+    vram_estimate_b = 0 :: non_neg_integer(),
     %% Attached LoRA adapters. Each entry holds the backend's opaque
     %% handle, the file sha256 (for cache-key derivation), and the
     %% current scale. effective_fp = sha256(fingerprint || sorted
@@ -200,7 +222,11 @@ Streaming inference. Admits a request and immediately returns a
 unique `reference()`; tokens are delivered to `CallerPid` via
 asynchronous messages:
 
-- `{erllama_token, Ref, binary()}` per generated token (text fragment)
+- `{erllama_token, Ref, binary()}` per generated token (text fragment;
+  suppressed when the detokenized binary is empty)
+- `{erllama_token_id, Ref, integer()}` per generated token (always
+  delivered, including for tokens whose text fragment is empty;
+  used by speculative-decoding collectors)
 - `{erllama_done, Ref, stats()}` on normal completion
 - `{erllama_error, Ref, term()}` on failure
 
@@ -366,36 +392,83 @@ get_backend_state(Model) ->
     {_State, Data} = sys:get_state(via(Model)),
     Data#data.backend_state.
 
+%% Snapshot of the cache key triple a probe needs to hit the
+%% cache for this model's current state. Effective fingerprint
+%% (with attached LoRA composition) so the lookup matches what
+%% runtime requests would hit.
+-spec cache_key_meta(model()) ->
+    #{fingerprint := binary(), quant_type := atom(), ctx_params_hash := binary()}.
+cache_key_meta(Model) ->
+    gen_statem:call(via(Model), cache_key_meta).
+
+%% Speculative-decoding verifier. Synchronous; runs the verifier
+%% pass against the model's context and returns
+%% {ok, AcceptedCount, NextToken}. Only allowed when the model
+%% gen_statem is idle: a concurrent in-flight infer would have its
+%% context state mutated by the verify pass, so we reject from
+%% other states with {error, busy}.
+-spec verify(
+    model(),
+    [erllama_nif:token_id()],
+    [erllama_nif:token_id()],
+    pos_integer()
+) ->
+    {ok, non_neg_integer(), erllama_nif:token_id() | eos} | {error, term()}.
+verify(Model, PrefixTokens, Candidates, K) ->
+    gen_statem:call(via(Model), {verify, PrefixTokens, Candidates, K}).
+
 init([ModelId, Config]) ->
     Backend = maps:get(backend, Config, erllama_model_stub),
     case Backend:init(Config) of
-        {ok, BState} ->
-            Fp = maps:get(fingerprint, Config, default_fingerprint()),
-            Data = #data{
-                model_id = ModelId,
-                tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
-                tier = maps:get(tier, Config, ram),
-                fingerprint = Fp,
-                fingerprint_mode = maps:get(fingerprint_mode, Config, safe),
-                quant_type = maps:get(quant_type, Config, f16),
-                quant_bits = maps:get(quant_bits, Config, 16),
-                ctx_params_hash = maps:get(ctx_params_hash, Config, default_ctx_params_hash()),
-                context_size = maps:get(context_size, Config, 4096),
-                policy = resolve_policy(Config),
-                backend = Backend,
-                backend_state = BState,
-                adapters = [],
-                %% No adapters at boot -> effective fp == base fp.
-                effective_fp = Fp,
-                prompt_tokens = [],
-                context_tokens = [],
-                response_target = 0,
-                generated = [],
-                last_save_at = 0
-            },
-            {ok, idle, Data};
-        {error, Reason} ->
-            {stop, Reason}
+        {ok, BState} -> {ok, idle, build_init_data(ModelId, Config, Backend, BState)};
+        {error, Reason} -> {stop, Reason}
+    end.
+
+build_init_data(ModelId, Config, Backend, BState) ->
+    Fp = maps:get(fingerprint, Config, default_fingerprint()),
+    #data{
+        model_id = ModelId,
+        tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
+        tier = maps:get(tier, Config, ram),
+        fingerprint = Fp,
+        fingerprint_mode = maps:get(fingerprint_mode, Config, safe),
+        quant_type = maps:get(quant_type, Config, f16),
+        quant_bits = maps:get(quant_bits, Config, 16),
+        ctx_params_hash = maps:get(ctx_params_hash, Config, default_ctx_params_hash()),
+        context_size = maps:get(context_size, Config, 4096),
+        policy = resolve_policy(Config),
+        backend = Backend,
+        backend_state = BState,
+        adapters = [],
+        effective_fp = Fp,
+        loaded_at_monotonic = erlang:monotonic_time(nanosecond),
+        vram_estimate_b = compute_vram_estimate(Backend, BState),
+        prompt_tokens = [],
+        context_tokens = [],
+        response_target = 0,
+        generated = [],
+        last_save_at = 0
+    }.
+
+%% Best-effort: ask the backend for the byte size, total layer count,
+%% and n_gpu_layers it captured at load time. Backends without the
+%% optional callback (or that return missing keys) get 0.
+compute_vram_estimate(Backend, BState) ->
+    case erlang:function_exported(Backend, extra_metadata, 1) of
+        false ->
+            0;
+        true ->
+            Meta = Backend:extra_metadata(BState),
+            Size = maps:get(model_size_bytes, Meta, 0),
+            Total = maps:get(total_layers, Meta, 0),
+            NGpu = maps:get(n_gpu_layers, Meta, 0),
+            case {Size, Total, NGpu} of
+                {0, _, _} -> 0;
+                {_, 0, _} -> 0;
+                {_, _, NG} when NG =< 0 -> Size;
+                {_, T, NG} when NG >= T -> Size;
+                {S, T, NG} -> (S * NG) div T
+            end
     end.
 
 %% Per-model policy. Caller can override any subset; missing keys
@@ -449,8 +522,29 @@ idle({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
     start_infer(From, Tokens, Params, CallerPid, Data);
 idle({call, From}, status, Data) ->
     {keep_state, Data, [{reply, From, idle}]};
+idle({call, From}, {verify, PrefixTokens, Candidates, K}, Data) ->
+    Reply = run_verify(PrefixTokens, Candidates, K, Data),
+    case Reply of
+        {ok, _, _, NewBState} ->
+            NewData = Data#data{backend_state = NewBState},
+            {keep_state, NewData, [{reply, From, public_verify_reply(Reply)}]};
+        {error, _} = E ->
+            {keep_state, Data, [{reply, From, E}]}
+    end;
 idle(EventType, EventContent, Data) ->
     handle_common(idle, EventType, EventContent, Data).
+
+run_verify(PrefixTokens, Candidates, K, Data) ->
+    Backend = Data#data.backend,
+    case erlang:function_exported(Backend, verify, 4) of
+        false ->
+            {error, not_supported};
+        true ->
+            Backend:verify(Data#data.backend_state, PrefixTokens, Candidates, K)
+    end.
+
+public_verify_reply({ok, Accepted, NextToken, _NewBState}) ->
+    {ok, Accepted, NextToken}.
 
 start_complete(From, Prompt, Opts, Data) ->
     case configure_sampler_for(Opts, Data) of
@@ -590,6 +684,20 @@ handle_common(_State, {call, From}, list_adapters, Data) ->
      || #{handle := H, scale := Scale} <- Data#data.adapters
     ],
     reply(From, Listing, Data);
+handle_common(_State, {call, From}, {verify, _, _, _}, Data) ->
+    %% verify mutates context state; reject from any non-idle
+    %% state so a concurrent infer's KV view stays consistent.
+    {keep_state, Data, [{reply, From, {error, busy}}]};
+handle_common(_State, {call, From}, cache_key_meta, Data) ->
+    %% Effective fingerprint reflects the model's current LoRA
+    %% composition. Using the base #data.fingerprint here would
+    %% mis-key cache lookups whenever an adapter is attached.
+    Meta = #{
+        fingerprint => Data#data.effective_fp,
+        quant_type => Data#data.quant_type,
+        ctx_params_hash => Data#data.ctx_params_hash
+    },
+    reply(From, Meta, Data);
 handle_common(_State, _EventType, _EventContent, Data) ->
     {keep_state, Data}.
 
@@ -755,14 +863,20 @@ optional_backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
 build_model_info(State, Data) ->
     #{
         id => Data#data.model_id,
+        model_id => Data#data.model_id,
         pid => self(),
         status => State,
         backend => Data#data.backend,
         context_size => Data#data.context_size,
         quant_type => Data#data.quant_type,
         quant_bits => Data#data.quant_bits,
+        quant_tag => erllama_cache_key:quant_tag(
+            Data#data.quant_type, Data#data.quant_bits
+        ),
         tier => Data#data.tier,
-        fingerprint => Data#data.fingerprint
+        fingerprint => Data#data.fingerprint,
+        loaded_at_monotonic => Data#data.loaded_at_monotonic,
+        vram_estimate_b => Data#data.vram_estimate_b
     }.
 
 %% =============================================================================
@@ -850,6 +964,12 @@ stream_emit(
         _ ->
             ok
     end,
+    %% Token-id message always lands, even for tokens whose
+    %% detokenized binary is empty (special tokens, BPE merges
+    %% with no visible bytes). Speculative-decoding collectors
+    %% need every produced id; the existing text-only consumers
+    %% (erllama_server) ignore this tag.
+    Pid ! {erllama_token_id, Ref, Token},
     Data;
 stream_emit(_Token, Data = #data{mode = standard}) ->
     Data.

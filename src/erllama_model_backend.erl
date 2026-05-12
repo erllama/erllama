@@ -99,6 +99,34 @@ inference, etc.) can plug in via this same surface.
 -callback apply_adapters(state(), [{term(), float()}]) ->
     {ok, state()} | {error, term()}.
 
+%% Backend-specific metadata used by erllama_model:list_models/0
+%% beyond what the gen_statem already tracks. The default backend
+%% (erllama_model_llama) returns model byte size, total layer
+%% count, and the n_gpu_layers value the user passed at load
+%% time. erllama_model uses these to compute `vram_estimate_b`.
+-callback extra_metadata(state()) ->
+    #{
+        model_size_bytes => non_neg_integer(),
+        total_layers => non_neg_integer(),
+        n_gpu_layers => integer()
+    }.
+
+%% Speculative-decoding verifier. Runs PrefixTokens ++ Candidates
+%% (truncated to K) through the model with per-position argmax,
+%% returns the longest accepted prefix and the model's own next
+%% token after it. Mutates and restores the context's KV cells +
+%% logits buffer + decode_ready flag so the caller's pre-call view
+%% is preserved.
+-callback verify(
+    state(),
+    PrefixTokens :: [erllama_nif:token_id()],
+    Candidates :: [erllama_nif:token_id()],
+    K :: pos_integer()
+) ->
+    {ok, AcceptedCount :: non_neg_integer(), NextToken :: erllama_nif:token_id() | eos,
+        NewState :: state()}
+    | {error, term()}.
+
 -optional_callbacks([
     seq_rm_last/2,
     apply_chat_template/2,
@@ -108,7 +136,9 @@ inference, etc.) can plug in via this same surface.
     clear_sampler/1,
     load_adapter/2,
     unload_adapter/2,
-    apply_adapters/2
+    apply_adapters/2,
+    extra_metadata/1,
+    verify/4
 ]).
 
 -type sampler_opts() :: #{

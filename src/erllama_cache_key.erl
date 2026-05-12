@@ -22,6 +22,7 @@
     effective_fingerprint/2,
     quant_byte/1,
     quant_atom/1,
+    quant_tag/2,
     encode_tokens/1,
     decode_tokens/1
 ]).
@@ -206,6 +207,17 @@ quant_atom(27) -> {ok, iq4_nl};
 quant_atom(28) -> {ok, iq4_xs};
 quant_atom(29) -> {ok, bf16};
 quant_atom(_) -> {error, unknown_quant}.
+
+%% Human-readable quant tag in llama.cpp's GGUF naming convention.
+%% Used by erllama_model:list_models to emit a cluster-friendly
+%% string like <<"q4_k_m">> alongside the existing quant_type atom
+%% and quant_bits integer. The bits arg is currently informational
+%% (the tag is derived from the type alone) but is included in the
+%% signature so future quants that share an atom but differ in bits
+%% can be disambiguated without a breaking change.
+-spec quant_tag(quant_type() | atom(), non_neg_integer()) -> binary().
+quant_tag(QuantType, _Bits) when is_atom(QuantType) ->
+    atom_to_binary(QuantType, utf8).
 
 -spec encode_tokens([non_neg_integer()]) -> binary().
 encode_tokens(Tokens) ->
