@@ -224,12 +224,9 @@ jobs:
           export LD_PRELOAD=$(gcc -print-file-name=libasan.so)
           rebar3 eunit
       - name: Run Common Test under sanitizers
+        env:
+          LLAMA_TEST_MODEL: ${{ env.MODEL_PATH }}
         run: |
-          # LLAMA_TEST_MODEL deliberately not set here: erllama_real_model_SUITE
-          # has pre-existing test issues (hardcoded expected text from a
-          # different model, plus erlang:whereis/1 misuse) that are out of
-          # scope for the C-safety tooling work. EUnit above already
-          # exercises the NIF surface under ASan+UBSan with the tiny GGUF.
           export LD_PRELOAD=$(gcc -print-file-name=libasan.so)
           rebar3 ct
 

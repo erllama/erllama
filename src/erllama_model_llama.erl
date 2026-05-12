@@ -25,6 +25,7 @@ Config (passed through `erllama_model:start_link/2`):
     decode_one/2,
     kv_pack/2,
     kv_unpack/2,
+    seq_clear/1,
     seq_rm_last/2,
     apply_chat_template/2,
     embed/2,
@@ -109,6 +110,10 @@ kv_unpack(#s{ctx = C}, Bin) ->
 %% (or zero) logits.
 seq_rm_last(#s{ctx = C}, NTokens) when NTokens > 0 ->
     erllama_nif:kv_seq_rm(C, 0, NTokens - 1, -1).
+
+%% Wipe seq 0 entirely. p0=0, p1=-1 means "from position 0 to infinity".
+seq_clear(#s{ctx = C}) ->
+    erllama_nif:kv_seq_rm(C, 0, 0, -1).
 
 apply_chat_template(#s{model = M}, Request) ->
     erllama_nif:apply_chat_template(M, Request).

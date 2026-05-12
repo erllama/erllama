@@ -860,6 +860,20 @@ optional_backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
         false -> {error, not_supported}
     end.
 
+%% Best-effort seq_clear. Backends that don't implement it (the stub
+%% in tests, mostly) are assumed to track no context state worth
+%% clearing.
+maybe_seq_clear(#data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, seq_clear, 1) of
+        true ->
+            case Mod:seq_clear(S) of
+                ok -> ok;
+                Err -> Err
+            end;
+        false ->
+            ok
+    end.
+
 build_model_info(State, Data) ->
     #{
         id => Data#data.model_id,
@@ -884,6 +898,15 @@ build_model_info(State, Data) ->
 %% =============================================================================
 
 enter_prefilling(Data) ->
+    %% Reset seq 0 so the cold prefill starts at position 0.
+    %% llama_batch_get_one auto-positions the new batch starting at
+    %% n_past, so without this guard the second cold request on the
+    %% same model would write its prompt KV at positions
+    %% [previous_n_past..] instead of [0..], producing different
+    %% output for the same prompt + seed across repeated calls.
+    %% Warm restores via kv_unpack overwrite the seq state directly
+    %% and don't need this.
+    ok = maybe_seq_clear(Data),
     Tokens = Data#data.prompt_tokens,
     case erllama_cache_policy:cold_save_split(Tokens, Data#data.policy) of
         {trim, TrimmedPrefix, RemainingTokens} ->
