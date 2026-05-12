@@ -170,9 +170,11 @@ model_config(Path, DiskSrv) ->
 
 load_unload(Config) ->
     %% init_per_testcase already loaded; verify the gen_statem is alive
-    %% and respond to a no-op.
+    %% and respond to a no-op. Model IDs are binaries registered via
+    %% erllama_registry's via callback, so erlang:whereis/1 (atom-only)
+    %% is the wrong lookup.
     Model = ?config(model, Config),
-    ?assert(is_pid(whereis(Model))),
+    ?assert(is_pid(erllama_registry:whereis_name(Model))),
     ok.
 
 tokenize_decode_one(Config) ->

@@ -45,6 +45,13 @@ inference, etc.) can plug in via this same surface.
 %% after a kv_unpack. Backends that don't carry a real KV cache (the
 %% stub) can omit this; `erllama_model` checks `is_exported/3` and
 %% skips the primer when absent.
+%% Clear seq 0 of the context KV cache, resetting `n_past` to 0 so the
+%% next prefill begins at position 0. Without this, a cold prefill on a
+%% context that already served a previous request would auto-position
+%% the new tokens after the residual KV cells from the prior call,
+%% producing different output for the same prompt + seed.
+-callback seq_clear(state()) -> ok | {error, term()}.
+
 -callback seq_rm_last(state(), NTokens :: pos_integer()) ->
     ok | {error, term()}.
 
@@ -128,6 +135,7 @@ inference, etc.) can plug in via this same surface.
     | {error, term()}.
 
 -optional_callbacks([
+    seq_clear/1,
     seq_rm_last/2,
     apply_chat_template/2,
     embed/2,
