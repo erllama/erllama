@@ -6,6 +6,46 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-12
+
+Correctness fix for repeated cold inference requests, plus C-safety
+CI tooling and a llama.cpp vendor bump. No public API changes.
+
+### Fixed
+
+- Cold-path prefill KV-state leak: `erllama_model:enter_prefilling`
+  did not reset the llama_context's KV cache before the new prefill.
+  `llama_batch_get_one` auto-positions the new batch at `n_past`, so
+  the second cold request on the same model wrote its prompt KV at
+  `[previous_n_past..]` instead of `[0..]`, producing different
+  output for the same prompt + seed across calls. A new optional
+  `seq_clear/1` backend callback now wipes seq 0 (the llama backend
+  wires it to `llama_state_seq_rm(0, 0, -1)`) at the top of
+  `enter_prefilling`. Warm restores via `kv_unpack` were already
+  correct and are unchanged (#16).
+
+### Changed
+
+- Vendored `c_src/llama.cpp/` bumped from `b9093` to `b9119`
+  (16 files, mostly Metal/CUDA tweaks and a new
+  `ggml-cuda/allreduce` kernel pair). Public `llama.h` API used by
+  the NIF is unchanged (#15).
+
+### CI
+
+- New `sanitizers` job: builds the NIF with `ENABLE_ASAN=ON`
+  `ENABLE_UBSAN=ON` and runs EUnit + Common Test (against
+  `ggml-org/models/tinyllamas/stories260K.gguf`) under
+  `LD_PRELOAD`'d libasan.
+- New `clang-tidy` job, scoped to `erllama_nif.c`,
+  `erllama_safe.cpp`, and `crc32c.c`; vendored llama.cpp is not
+  linted. Config in `.clang-tidy` at repo root.
+- New `scan-build` job: pre-builds the llama target normally, then
+  runs Clang Static Analyzer with `--status-bugs` over just the
+  three NIF translation units.
+- `ENABLE_ASAN`/`ENABLE_TSAN`/`ENABLE_UBSAN`/`ENABLE_CLANG_TIDY`
+  CMake options on `c_src/CMakeLists.txt`, off by default.
+
 ## [0.1.1] - 2026-05-12
 
 NIF safety and SIGSEGV hardening. No public API additions; new
@@ -256,6 +296,7 @@ Initial public release.
 
 Same idea as [antirez/ds4](https://github.com/antirez/ds4).
 
-[Unreleased]: https://github.com/erllama/erllama/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/erllama/erllama/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/erllama/erllama/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/erllama/erllama/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/erllama/erllama/releases/tag/v0.1.0
