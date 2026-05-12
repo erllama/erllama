@@ -189,8 +189,11 @@ jobs:
       ERLLAMA_OPTS: "-DENABLE_ASAN=ON -DENABLE_UBSAN=ON"
       ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:halt_on_error=1"
       UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
-      MODEL_URL: "https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct-GGUF/resolve/main/smollm2-135m-instruct-q4_k_m.gguf"
-      MODEL_PATH: "${{ github.workspace }}/.cache/erllama/models/smollm2-135m-instruct-q4_k_m.gguf"
+      # tinyllamas/stories260K.gguf is the canonical public tiny GGUF
+      # used by llama.cpp's own CI; small (~1 MB), Llama-architecture,
+      # no HF auth required.
+      MODEL_URL: "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf"
+      MODEL_PATH: "${{ github.workspace }}/.cache/erllama/models/stories260K.gguf"
     steps:
       - uses: actions/checkout@v5
       - uses: erlef/setup-beam@v1
@@ -199,13 +202,13 @@ jobs:
           rebar3-version: '3.25.0'
       - name: Install cmake
         run: sudo apt-get update && sudo apt-get install -y cmake
-      - name: Cache SmolLM2 GGUF
+      - name: Cache tiny GGUF
         id: model-cache
         uses: actions/cache@v5
         with:
           path: ${{ env.MODEL_PATH }}
-          key: gguf-${{ hashFiles('.github/workflows/ci.yml') }}-smollm2-135m-instruct-q4_k_m
-      - name: Download SmolLM2 GGUF
+          key: gguf-${{ hashFiles('.github/workflows/ci.yml') }}-stories260K
+      - name: Download tiny GGUF
         if: steps.model-cache.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$(dirname "$MODEL_PATH")"
