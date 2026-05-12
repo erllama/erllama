@@ -181,6 +181,116 @@ jobs:
       - name: Run Common Test
         run: rebar3 ct
 
+  sanitizers:
+    name: ASan + UBSan
+    needs: [xref, dialyzer, format, lint]
+    runs-on: ubuntu-24.04
+    env:
+      ERLLAMA_OPTS: "-DENABLE_ASAN=ON -DENABLE_UBSAN=ON"
+      ASAN_OPTIONS: "detect_leaks=0:abort_on_error=1:halt_on_error=1"
+      UBSAN_OPTIONS: "print_stacktrace=1:halt_on_error=1"
+      # tinyllamas/stories260K.gguf is the canonical public tiny GGUF
+      # used by llama.cpp's own CI; small (~1 MB), Llama-architecture,
+      # no HF auth required.
+      MODEL_URL: "https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf"
+      MODEL_PATH: "${{ github.workspace }}/.cache/erllama/models/stories260K.gguf"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+      - name: Install cmake
+        run: sudo apt-get update && sudo apt-get install -y cmake
+      - name: Cache tiny GGUF
+        id: model-cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.MODEL_PATH }}
+          key: gguf-${{ hashFiles('.github/workflows/ci.yml') }}-stories260K
+      - name: Download tiny GGUF
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$(dirname "$MODEL_PATH")"
+          curl -L --fail --retry 3 -o "$MODEL_PATH" "$MODEL_URL"
+      - name: Build with ASan + UBSan
+        run: |
+          rm -rf _build
+          rebar3 compile
+      - name: Run EUnit under sanitizers
+        env:
+          LLAMA_TEST_MODEL: ${{ env.MODEL_PATH }}
+        run: |
+          export LD_PRELOAD=$(gcc -print-file-name=libasan.so)
+          rebar3 eunit
+      - name: Run Common Test under sanitizers
+        run: |
+          # LLAMA_TEST_MODEL deliberately not set here: erllama_real_model_SUITE
+          # has pre-existing test issues (hardcoded expected text from a
+          # different model, plus erlang:whereis/1 misuse) that are out of
+          # scope for the C-safety tooling work. EUnit above already
+          # exercises the NIF surface under ASan+UBSan with the tiny GGUF.
+          export LD_PRELOAD=$(gcc -print-file-name=libasan.so)
+          rebar3 ct
+
+  clang-tidy:
+    name: clang-tidy (NIF sources)
+    needs: [xref, dialyzer, format, lint]
+    runs-on: ubuntu-24.04
+    env:
+      ERLLAMA_OPTS: "-DENABLE_CLANG_TIDY=ON"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+      - name: Install clang-tidy + cmake
+        run: sudo apt-get update && sudo apt-get install -y clang-tidy cmake
+      - name: Build with clang-tidy
+        run: |
+          rm -rf _build
+          rebar3 compile
+
+  scan-build:
+    name: scan-build (clang analyzer)
+    needs: [xref, dialyzer, format, lint]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '28'
+          rebar3-version: '3.25.0'
+      - name: Install clang-tools + cmake
+        run: sudo apt-get update && sudo apt-get install -y clang-tools cmake
+      - name: Configure
+        run: |
+          mkdir -p _build/scan
+          cmake -S c_src -B _build/scan -DCMAKE_BUILD_TYPE=Debug
+      - name: Pre-build vendored llama.cpp without scan-build
+        # scan-build's --exclude only filters HTML reports; --status-bugs
+        # still trips on the analyzer warnings emitted while compiling
+        # the vendored tree. Pre-building those targets here makes them
+        # up-to-date so the scan-build step below only re-compiles the
+        # erllama_nif TUs we own.
+        run: |
+          cmake --build _build/scan --target llama -- -j $(nproc)
+      - name: Build erllama_nif under scan-build
+        run: |
+          # Touch our sources so cmake recompiles them under the wrapper
+          # even when an earlier cache hit left .o files in place.
+          touch c_src/erllama_nif.c c_src/erllama_safe.cpp c_src/crc32c.c
+          scan-build --status-bugs -o /tmp/scan-reports \
+              cmake --build _build/scan --target erllama_nif -- -j $(nproc)
+      - name: Upload scan-build reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-build-reports
+          path: /tmp/scan-reports
+          if-no-files-found: ignore
+
   freebsd:
     name: FreeBSD ${{ matrix.release }}
     needs: [xref, dialyzer, format, lint]

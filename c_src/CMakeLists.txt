@@ -13,6 +13,25 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # -----------------------------------------------------------------------------
+# Sanitizer options (developer / CI only).
+#
+# Applied to the erllama_nif target only; the vendored llama.cpp tree
+# is not instrumented because UBSan in particular fires on third-party
+# code we don't own. ASan and TSan are mutually exclusive.
+# -----------------------------------------------------------------------------
+option(ENABLE_ASAN  "Enable AddressSanitizer on erllama_nif"          OFF)
+option(ENABLE_TSAN  "Enable ThreadSanitizer on erllama_nif"           OFF)
+option(ENABLE_UBSAN "Enable UndefinedBehaviorSanitizer on erllama_nif" OFF)
+
+if(ENABLE_ASAN AND ENABLE_TSAN)
+    message(FATAL_ERROR "ASan and TSan cannot be used together")
+endif()
+
+# Static analysis (developer / CI only). Scoped to the erllama_nif
+# target so the vendored llama.cpp tree is not analyzed.
+option(ENABLE_CLANG_TIDY "Run clang-tidy on erllama_nif sources" OFF)
+
+# -----------------------------------------------------------------------------
 # llama.cpp configuration
 # -----------------------------------------------------------------------------
 # Build llama.cpp as static libraries that we link into our NIF .so.
@@ -96,6 +115,39 @@ add_library(erllama_nif SHARED
 target_compile_options(erllama_nif PRIVATE
     -O2 -g -Wall -Wextra -Wpedantic -fPIC
 )
+
+if(ENABLE_ASAN)
+    message(STATUS "AddressSanitizer enabled on erllama_nif")
+    target_compile_options(erllama_nif PRIVATE
+        -fsanitize=address -fno-omit-frame-pointer -g -O1
+    )
+    target_link_options(erllama_nif PRIVATE -fsanitize=address)
+endif()
+
+if(ENABLE_TSAN)
+    message(STATUS "ThreadSanitizer enabled on erllama_nif")
+    target_compile_options(erllama_nif PRIVATE
+        -fsanitize=thread -fno-omit-frame-pointer -g -O1
+    )
+    target_link_options(erllama_nif PRIVATE -fsanitize=thread)
+endif()
+
+if(ENABLE_UBSAN)
+    message(STATUS "UndefinedBehaviorSanitizer enabled on erllama_nif")
+    target_compile_options(erllama_nif PRIVATE
+        -fsanitize=undefined -fno-omit-frame-pointer -g -O1
+    )
+    target_link_options(erllama_nif PRIVATE -fsanitize=undefined)
+endif()
+
+if(ENABLE_CLANG_TIDY)
+    find_program(CLANG_TIDY_EXE NAMES clang-tidy REQUIRED)
+    message(STATUS "clang-tidy enabled on erllama_nif: ${CLANG_TIDY_EXE}")
+    set_target_properties(erllama_nif PROPERTIES
+        C_CLANG_TIDY   "${CLANG_TIDY_EXE};--quiet"
+        CXX_CLANG_TIDY "${CLANG_TIDY_EXE};--quiet"
+    )
+endif()
 
 target_include_directories(erllama_nif PRIVATE
     ${ERTS_INCLUDE_DIR}

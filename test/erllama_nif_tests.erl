@@ -142,10 +142,16 @@ prefill_context_overflow_test_() ->
             {"LLAMA_TEST_MODEL unset; skipping", []};
         Path ->
             {timeout, 60, fun() ->
+                %% llama.cpp clamps n_ctx up to the model's training
+                %% context, so a small requested n_ctx is not honored
+                %% on tiny test models. Sending 200_000 tokens exceeds
+                %% the training ctx of every current model family
+                %% (Llama 3.2 caps at 128k) while staying under the
+                %% NIF's ERLLAMA_MAX_TOKENS = 1M cap.
                 prefill_overflow(
                     list_to_binary(Path),
                     #{n_ctx => 64, n_batch => 64},
-                    100,
+                    200_000,
                     context_overflow
                 )
             end}
@@ -175,7 +181,7 @@ embed_context_overflow_test_() ->
                 embed_overflow(
                     list_to_binary(Path),
                     #{n_ctx => 64, n_batch => 64, embeddings => true},
-                    100,
+                    200_000,
                     context_overflow
                 )
             end}
@@ -208,9 +214,12 @@ prefill_overflow(Path, CtxOpts, NTokens, ExpectedAtom) ->
     {ok, Model} = erllama_nif:load_model(Path, #{n_gpu_layers => 0}),
     {ok, Ctx} = erllama_nif:new_context(Model, CtxOpts),
     try
+        %% Use token id 0 (always within n_vocab) so the helper does
+        %% not accidentally hit the invalid_token path on tiny-vocab
+        %% test models before the overflow check fires.
         ?assertEqual(
             {error, ExpectedAtom},
-            erllama_nif:prefill(Ctx, lists:seq(1, NTokens))
+            erllama_nif:prefill(Ctx, lists:duplicate(NTokens, 0))
         )
     after
         ok = erllama_nif:free_context(Ctx),
@@ -223,7 +232,7 @@ embed_overflow(Path, CtxOpts, NTokens, ExpectedAtom) ->
     try
         ?assertEqual(
             {error, ExpectedAtom},
-            erllama_nif:embed(Ctx, lists:seq(1, NTokens))
+            erllama_nif:embed(Ctx, lists:duplicate(NTokens, 0))
         )
     after
         ok = erllama_nif:free_context(Ctx),

@@ -1,0 +1,36 @@
+---
+# Scoped to c_src/erllama_nif.c, erllama_safe.cpp, crc32c.c via
+# CMake's C_CLANG_TIDY / CXX_CLANG_TIDY target properties; the vendored
+# llama.cpp tree is not linted.
+#
+# Suppressions:
+#   - clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling:
+#     fires on every memcpy/memset call wanting C11 Annex K _s variants
+#     which glibc does not ship. Industry consensus is to disable.
+#   - bugprone-multi-level-implicit-pointer-conversion: NIF resources
+#     use the standard `void **` out-parameter pattern via
+#     enif_alloc_resource / enif_get_resource. Required by erl_nif.h.
+#   - bugprone-sizeof-expression: fires on the `sizeof(*ptr) * n` idiom
+#     which is the correct pattern for typed allocations.
+#   - bugprone-easily-swappable-parameters / bugprone-macro-parentheses:
+#     stylistic, high false-positive rate.
+#   - bugprone-empty-catch: erllama_safe.cpp uses empty catch(...) as a
+#     deliberate barrier so C++ exceptions never unwind into the BEAM
+#     across the C ABI; that's the whole purpose of those wrappers.
+#   - performance-enum-size: stylistic; not a correctness check.
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  performance-*,
+  portability-*,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-empty-catch,
+  -bugprone-macro-parentheses,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-sizeof-expression,
+  -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
+  -performance-enum-size
+WarningsAsErrors: 'bugprone-*,cert-*,clang-analyzer-*'
+HeaderFilterRegex: '^.*/c_src/(erllama_nif|erllama_safe|crc32c)\.(h|hpp)$'
+FormatStyle: none
