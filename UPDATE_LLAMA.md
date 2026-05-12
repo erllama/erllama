@@ -1,7 +1,7 @@
 # Updating the vendored llama.cpp
 
 erllama vendors a pinned copy of llama.cpp under `c_src/llama.cpp/`.
-The current pin is **b9093**.
+The current pin is **b9119**.
 
 This file documents the bump procedure.
 
