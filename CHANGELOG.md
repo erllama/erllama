@@ -6,6 +6,82 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+Cluster-routing primitives and a speculative-decoding verifier
+landed via PR #13. All additions are backwards-compatible.
+
+### Added
+
+#### Cluster routing and load-balancing
+
+- `erllama:queue_depth/0` returns O(1) inflight count via an
+  atomics counter parked in persistent_term, readable cross-node
+  via `erpc`. Used by the upcoming `erllama_cluster` load
+  balancer (least_loaded, power_of_two strategies).
+- `erllama:list_cached_prefixes/2` returns the longest cached
+  prefix length of a token list for a given model on this node,
+  across all cache tiers. Used by the cluster cache-affinity
+  router.
+- `erllama_nif:vram_info/0` walks every loaded ggml backend and
+  sums free + total memory across non-CPU devices; returns
+  `{error, no_gpu}` on a CPU-only build. Used by the cluster
+  scheduler for bin-packing model placement.
+- `erllama:list_models/0` map gains `model_id`, `quant_tag`,
+  `loaded_at_monotonic`, and `vram_estimate_b` keys. Existing
+  keys (`id`, `pid`, `status`, etc.) are unchanged.
+
+#### Speculative decoding
+
+- `erllama:draft_tokens/3` synchronously generates up to `Max`
+  next-token ids for a prefix. Times out at 30 s with a clean
+  cancel + drain so the caller's mailbox stays clean. Empty
+  prefix is rejected as `{error, empty_prefix}`.
+- `erllama:verify/4` runs `PrefixTokens ++ Candidates` through
+  the model in one forward pass and returns the longest accepted
+  prefix length plus the verifier's own next token. Acceptance
+  walks `Argmax[P + i - 1] == c_i` and stops at the first
+  mismatch. End-of-generation tokens map to the atom `eos`.
+  Snapshot + restore protocol leaves the caller's pre-call
+  context view unchanged. Allowed only from the model
+  gen_statem's idle state; non-idle callers receive
+  `{error, busy}`.
+- Token-id streaming: `erllama_model:stream_emit` now also sends
+  `{erllama_token_id, Ref, Id}` on every produced token, in
+  addition to the existing `{erllama_token, Ref, Bin}`.
+  Empty-text tokens (special tokens, BPE merges with no visible
+  bytes) still produce an id message. Existing consumers ignore
+  the new tag.
+
+#### Backend behaviour
+
+- Optional callbacks `extra_metadata/1` (vram-related model
+  metadata) and `verify/4` (speculative verifier) on
+  `erllama_model_backend`. Backends that omit either get a
+  graceful `{error, not_supported}` fallback.
+
+#### NIFs
+
+- `nif_model_size/1`, `nif_model_n_layer/1`,
+  `nif_forward_with_argmax/2`, `nif_vram_info/0`. Previously
+  unreachable from Erlang.
+
+### Changed
+
+- `erllama_inflight:register/2` and `unregister/1` switched to
+  `ets:insert_new` / `ets:take` so the new atomics counter sees
+  only true admissions and true removals; double-register or
+  double-unregister become observable no-ops.
+
+### ROADMAP
+
+- Pipeline parallelism deferred; blocked on upstream llama.cpp
+  adding layer-range execution to `llama_decode`. The cluster
+  degrades gracefully via `function_exported`.
+- Verify context isolation: the current snapshot/restore protocol
+  does not preserve the caller's pre-call `decode_ready` flag;
+  callers are assumed to issue `decode_one` imminently. A v2
+  extension to cover `decode_ready` is documented for the next
+  contributor.
+
 ## [0.1.1] - 2026-05-12
 
 NIF safety and SIGSEGV hardening. No public API additions; new
