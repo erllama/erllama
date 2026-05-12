@@ -6,6 +6,116 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-05-12
+
+Cluster-routing primitives, speculative-decoding verifier, a
+cold-path correctness fix, and C-safety CI tooling. All additions
+are backwards-compatible; existing API call sites unchanged.
+
+### Added
+
+#### Cluster routing and load-balancing (#13)
+
+- `erllama:queue_depth/0` returns O(1) inflight count via an
+  atomics counter parked in persistent_term, readable cross-node
+  via `erpc`. Used by the upcoming `erllama_cluster` load
+  balancer (least_loaded, power_of_two strategies).
+- `erllama:list_cached_prefixes/2` returns the longest cached
+  prefix length of a token list for a given model on this node,
+  across all cache tiers. Used by the cluster cache-affinity
+  router.
+- `erllama_nif:vram_info/0` walks every loaded ggml backend and
+  sums free + total memory across non-CPU devices; returns
+  `{error, no_gpu}` on a CPU-only build. Used by the cluster
+  scheduler for bin-packing model placement.
+- `erllama:list_models/0` map gains `model_id`, `quant_tag`,
+  `loaded_at_monotonic`, and `vram_estimate_b` keys. Existing
+  keys (`id`, `pid`, `status`, etc.) are unchanged.
+
+#### Speculative decoding (#13)
+
+- `erllama:draft_tokens/3` synchronously generates up to `Max`
+  next-token ids for a prefix. Times out at 30 s with a clean
+  cancel + drain so the caller's mailbox stays clean. Empty
+  prefix is rejected as `{error, empty_prefix}`.
+- `erllama:verify/4` runs `PrefixTokens ++ Candidates` through
+  the model in one forward pass and returns the longest accepted
+  prefix length plus the verifier's own next token. Acceptance
+  walks `Argmax[P + i - 1] == c_i` and stops at the first
+  mismatch. End-of-generation tokens map to the atom `eos`.
+  Snapshot + restore protocol leaves the caller's pre-call
+  context view unchanged. Allowed only from the model
+  gen_statem's idle state; non-idle callers receive
+  `{error, busy}`.
+- Token-id streaming: `erllama_model:stream_emit` now also sends
+  `{erllama_token_id, Ref, Id}` on every produced token, in
+  addition to the existing `{erllama_token, Ref, Bin}`.
+  Empty-text tokens (special tokens, BPE merges with no visible
+  bytes) still produce an id message. Existing consumers ignore
+  the new tag.
+
+#### Backend behaviour
+
+- Optional callbacks `extra_metadata/1` (vram-related model
+  metadata) and `verify/4` (speculative verifier) on
+  `erllama_model_backend`. Backends that omit either get a
+  graceful `{error, not_supported}` fallback (#13).
+- Optional callback `seq_clear/1` on `erllama_model_backend`.
+  Llama backend implements it as `llama_state_seq_rm(0, 0, -1)`.
+  Called by the model layer at the top of `enter_prefilling`;
+  see the Fixed section below (#16).
+
+#### NIFs (#13)
+
+- `nif_model_size/1`, `nif_model_n_layer/1`,
+  `nif_forward_with_argmax/2`, `nif_vram_info/0`. Previously
+  unreachable from Erlang.
+
+### Fixed
+
+- Cold-path prefill KV-state leak: `erllama_model:enter_prefilling`
+  did not reset the llama_context's KV cache before the new
+  prefill. `llama_batch_get_one` auto-positions at `n_past`, so a
+  second cold request on the same model wrote its prompt KV at
+  `[previous_n_past..]` instead of `[0..]`, producing different
+  output for the same prompt + seed across calls. The new
+  `seq_clear/1` callback wipes seq 0 before the cold prefill.
+  Warm restores via `kv_unpack` were already correct (#16).
+
+### Changed
+
+- Vendored `c_src/llama.cpp/` bumped from `b9093` to `b9119`
+  (16 files, mostly Metal/CUDA tweaks plus a new
+  `ggml-cuda/allreduce` kernel pair). Public `llama.h` API used
+  by the NIF is unchanged (#15).
+- `erllama_inflight:register/2` and `unregister/1` switched to
+  `ets:insert_new` / `ets:take` so the new atomics counter sees
+  only true admissions and true removals; double-register or
+  double-unregister become observable no-ops (#13).
+
+### Internal
+
+- New CI jobs: `sanitizers` (ASan+UBSan against
+  `tinyllamas/stories260K.gguf` under `LD_PRELOAD`'d libasan),
+  `clang-tidy` (NIF sources only), and `scan-build`
+  (Clang Static Analyzer with `--status-bugs`) (#14).
+- New `c_src/CMakeLists.txt` options:
+  `ENABLE_ASAN`, `ENABLE_TSAN`, `ENABLE_UBSAN`, `ENABLE_CLANG_TIDY`,
+  scoped to the `erllama_nif` target; default OFF.
+- `.clang-tidy` config at repo root. Vendored llama.cpp is not
+  linted.
+
+### ROADMAP
+
+- Pipeline parallelism deferred; blocked on upstream llama.cpp
+  adding layer-range execution to `llama_decode`. The cluster
+  degrades gracefully via `function_exported`.
+- Verify context isolation: the current snapshot/restore protocol
+  does not preserve the caller's pre-call `decode_ready` flag;
+  callers are assumed to issue `decode_one` imminently. A v2
+  extension to cover `decode_ready` is documented for the next
+  contributor.
+
 ## [0.1.1] - 2026-05-12
 
 NIF safety and SIGSEGV hardening. No public API additions; new
@@ -256,6 +366,7 @@ Initial public release.
 
 Same idea as [antirez/ds4](https://github.com/antirez/ds4).
 
-[Unreleased]: https://github.com/erllama/erllama/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/erllama/erllama/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/erllama/erllama/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/erllama/erllama/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/erllama/erllama/releases/tag/v0.1.0
