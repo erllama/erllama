@@ -39,6 +39,18 @@
  * sides must agree. */
 #define ERLLAMA_DECODE_EXC_SENTINEL INT_MIN
 
+/* Local upper bound for `tensor_split` (vendored llama.cpp uses
+ * `llama_max_devices()` at runtime; no compile-time macro is
+ * exposed). Sized to match the vendor's current `LLAMA_MAX_DEVICES`
+ * constant of 16; nif_load_model asserts at runtime that the vendor
+ * has not raised it past our cap and surfaces a clear error if it
+ * has. The fixed-size in-resource array avoids the alloc/free pair
+ * needed by a `tensor_split` pointer whose lifetime must outlive
+ * the NIF call (llama.cpp stores params by value, but the
+ * `tensor_split` pointer inside is not copied — it still aliases
+ * caller memory). */
+#define ERLLAMA_MAX_DEVICES 16
+
 /* Mirror of erllama_load_status_t in erllama_safe.cpp; both sides
  * must agree on the integer values. Used by the _v2 model load
  * wrapper to distinguish a generic NULL return from a captured
@@ -240,6 +252,15 @@ typedef struct {
     int active_contexts;           /* nif_new_context bumps; ctx_dtor decrements */
     int active_adapters;           /* nif_adapter_load bumps; adapter_dtor decrements */
     int release_pending;           /* free_model defers while either counter > 0 */
+    /* `tensor_split` storage owned by the resource. llama_model copies
+     * llama_model_params by value at load time but the
+     * `tensor_split` pointer inside is not copied — it still aliases
+     * caller memory and must outlive the model. Parking the array on
+     * the resource lets `llama_model_free` find a valid pointer for
+     * the model's entire life. `has_tensor_split = 0` means
+     * params.tensor_split was left NULL (llama.cpp default). */
+    float tensor_split[ERLLAMA_MAX_DEVICES];
+    int has_tensor_split;
 } erllama_model_t;
 
 typedef struct {
@@ -592,6 +613,111 @@ static int get_map_bool(
     return 0;
 }
 
+typedef struct {
+    const char *name;
+    int value;
+} erllama_atom_enum_pair_t;
+
+/* Read an atom-valued map entry and translate it to a C int via a
+ * lookup table. Used for `split_mode`, `flash_attn`, `type_k`, and
+ * `type_v` in nif_load_model and nif_new_context.
+ *
+ * Returns:
+ *   1: key present, atom matched the table, *out updated
+ *   0: key absent (caller leaves whatever default already filled
+ *      `params.<field>` in place)
+ *  -1: key present but the value is not an atom in the table; the
+ *      caller is expected to raise badarg
+ */
+static int get_map_atom_enum(
+    ErlNifEnv *env,
+    ERL_NIF_TERM map,
+    const char *key,
+    const erllama_atom_enum_pair_t *table,
+    size_t n,
+    int *out
+) {
+    ERL_NIF_TERM v;
+    ERL_NIF_TERM k = enif_make_atom(env, key);
+    if (!enif_get_map_value(env, map, k, &v)) return 0;
+    char buf[64];
+    if (!enif_get_atom(env, v, buf, sizeof(buf), ERL_NIF_LATIN1)) {
+        return -1;
+    }
+    for (size_t i = 0; i < n; i++) {
+        if (strcmp(buf, table[i].name) == 0) {
+            *out = table[i].value;
+            return 1;
+        }
+    }
+    return -1;
+}
+
+/* Read a list of floats (or ints promotable to float) from a map and
+ * copy them into `out` up to `cap` entries. Returns the count
+ * written, 0 if the key is absent, or -1 on a type mismatch or
+ * over-cap.
+ *
+ * Used for `tensor_split` on model load. The destination buffer
+ * lives on `erllama_model_t` so its lifetime spans the loaded
+ * model; see the struct comment for why we cannot use a
+ * stack-local. */
+static int get_map_float_list(
+    ErlNifEnv *env,
+    ERL_NIF_TERM map,
+    const char *key,
+    float *out,
+    size_t cap
+) {
+    ERL_NIF_TERM v;
+    ERL_NIF_TERM k = enif_make_atom(env, key);
+    if (!enif_get_map_value(env, map, k, &v)) return 0;
+    if (!enif_is_list(env, v)) return -1;
+    size_t n = 0;
+    ERL_NIF_TERM head;
+    ERL_NIF_TERM tail = v;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        if (n >= cap) return -1;
+        double d;
+        long ll;
+        if (enif_get_double(env, head, &d)) {
+            out[n++] = (float) d;
+        } else if (enif_get_long(env, head, &ll)) {
+            out[n++] = (float) ll;
+        } else {
+            return -1;
+        }
+    }
+    return (int) n;
+}
+
+/* Atom -> enum tables for llama.cpp option passthrough. Sized at
+ * the call site via the const-array length idiom (sizeof / element
+ * size) so the helper sees the count directly. */
+static const erllama_atom_enum_pair_t SPLIT_MODE_TABLE[] = {
+    {"none",  LLAMA_SPLIT_MODE_NONE},
+    {"layer", LLAMA_SPLIT_MODE_LAYER},
+    {"row",   LLAMA_SPLIT_MODE_ROW},
+};
+
+static const erllama_atom_enum_pair_t FLASH_ATTN_TABLE[] = {
+    /* booleans-as-atoms map to the matching enum tristate. `auto`
+     * lets llama.cpp pick based on the build / model. */
+    {"true",  LLAMA_FLASH_ATTN_TYPE_ENABLED},
+    {"false", LLAMA_FLASH_ATTN_TYPE_DISABLED},
+    {"auto",  LLAMA_FLASH_ATTN_TYPE_AUTO},
+};
+
+static const erllama_atom_enum_pair_t GGML_TYPE_TABLE[] = {
+    {"f16",  GGML_TYPE_F16},
+    {"f32",  GGML_TYPE_F32},
+    {"bf16", GGML_TYPE_BF16},
+    {"q4_0", GGML_TYPE_Q4_0},
+    {"q5_0", GGML_TYPE_Q5_0},
+    {"q5_1", GGML_TYPE_Q5_1},
+    {"q8_0", GGML_TYPE_Q8_0},
+};
+
 /* =========================================================================
  * crc32c
  * ========================================================================= */
@@ -711,39 +837,79 @@ static ERL_NIF_TERM nif_load_model(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
         return enif_make_tuple2(env, atom_error, atom_load_failed);
     }
 
+    /* Allocate the resource BEFORE the model load so `params.tensor_split`
+     * can point at the resource-owned buffer (the model copies params by
+     * value but the tensor_split pointer inside is not copied — it must
+     * outlive the model). Zero-init so the destructor on the
+     * alloc-but-not-fully-set-up path sees model=NULL and mu_inited=0 and
+     * skips the dangerous frees. */
+    erllama_model_t *res = enif_alloc_resource(MODEL_RT, sizeof(*res));
+    if (!res) {
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+    memset(res, 0, sizeof(*res));
+
     struct llama_model_params params = llama_model_default_params();
 
     int32_t i32;
     if (get_map_int31(env, argv[1], "n_gpu_layers", &i32)) {
         params.n_gpu_layers = i32;
     }
+    if (get_map_int31(env, argv[1], "main_gpu", &i32)) {
+        params.main_gpu = i32;
+    }
     int b;
     if (get_map_bool(env, argv[1], "use_mmap", &b)) params.use_mmap = b ? true : false;
     if (get_map_bool(env, argv[1], "use_mlock", &b)) params.use_mlock = b ? true : false;
     if (get_map_bool(env, argv[1], "vocab_only", &b)) params.vocab_only = b ? true : false;
 
+    int enum_v;
+    int sm_rc = get_map_atom_enum(
+        env, argv[1], "split_mode",
+        SPLIT_MODE_TABLE, sizeof(SPLIT_MODE_TABLE) / sizeof(SPLIT_MODE_TABLE[0]),
+        &enum_v
+    );
+    if (sm_rc < 0) {
+        enif_release_resource(res);
+        return enif_make_badarg(env);
+    }
+    if (sm_rc > 0) params.split_mode = (enum llama_split_mode) enum_v;
+
+    /* Defensive: if a future vendored llama.cpp raises its max-device
+     * cap past our local constant, surface a clear error rather than
+     * silently truncating the user's per-device proportions. The bump
+     * is one line at the top of this file. */
+    if (llama_max_devices() > (size_t) ERLLAMA_MAX_DEVICES) {
+        enif_release_resource(res);
+        return enif_make_tuple2(env, atom_error, atom_load_failed);
+    }
+    int ts_n = get_map_float_list(
+        env, argv[1], "tensor_split",
+        res->tensor_split, ERLLAMA_MAX_DEVICES
+    );
+    if (ts_n < 0) {
+        enif_release_resource(res);
+        return enif_make_badarg(env);
+    }
+    if (ts_n > 0) {
+        res->has_tensor_split = 1;
+        params.tensor_split = res->tensor_split;
+    }
+
     erllama_load_status_t status = ERLLAMA_LOAD_FAILED;
     struct llama_model *model =
         erllama_safe_model_load_from_file_v2(path, params, &status);
     if (!model) {
+        enif_release_resource(res);
         ERL_NIF_TERM why = (status == ERLLAMA_LOAD_MALFORMED)
                                ? atom_malformed_gguf
                                : atom_load_failed;
         return enif_make_tuple2(env, atom_error, why);
     }
 
-    erllama_model_t *res = enif_alloc_resource(MODEL_RT, sizeof(*res));
-    if (!res) {
-        (void) erllama_safe_model_free(model);
-        return enif_make_tuple2(env, atom_error, atom_oom);
-    }
-    /* Zero-init so the destructor on the alloc-but-not-fully-set-up
-     * path sees model=NULL and mu_inited=0 and skips the dangerous
-     * frees. */
-    memset(res, 0, sizeof(*res));
     if (pthread_mutex_init(&res->mu, NULL) != 0) {
-        enif_release_resource(res);
         (void) erllama_safe_model_free(model);
+        enif_release_resource(res);
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
     res->mu_inited = 1;
@@ -828,6 +994,31 @@ static ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     int b;
     if (get_map_bool(env, argv[1], "embeddings", &b)) params.embeddings = b ? true : false;
     if (get_map_bool(env, argv[1], "offload_kqv", &b)) params.offload_kqv = b ? true : false;
+
+    int enum_v;
+    int fa_rc = get_map_atom_enum(
+        env, argv[1], "flash_attn",
+        FLASH_ATTN_TABLE, sizeof(FLASH_ATTN_TABLE) / sizeof(FLASH_ATTN_TABLE[0]),
+        &enum_v
+    );
+    if (fa_rc < 0) return enif_make_badarg(env);
+    if (fa_rc > 0) params.flash_attn_type = (enum llama_flash_attn_type) enum_v;
+
+    int tk_rc = get_map_atom_enum(
+        env, argv[1], "type_k",
+        GGML_TYPE_TABLE, sizeof(GGML_TYPE_TABLE) / sizeof(GGML_TYPE_TABLE[0]),
+        &enum_v
+    );
+    if (tk_rc < 0) return enif_make_badarg(env);
+    if (tk_rc > 0) params.type_k = (enum ggml_type) enum_v;
+
+    int tv_rc = get_map_atom_enum(
+        env, argv[1], "type_v",
+        GGML_TYPE_TABLE, sizeof(GGML_TYPE_TABLE) / sizeof(GGML_TYPE_TABLE[0]),
+        &enum_v
+    );
+    if (tv_rc < 0) return enif_make_badarg(env);
+    if (tv_rc > 0) params.type_v = (enum ggml_type) enum_v;
 
     pthread_mutex_lock(&m->mu);
     if (!m->model) {

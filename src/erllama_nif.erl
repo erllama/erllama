@@ -89,12 +89,50 @@ crc32c(Data) -> nif_crc32c(Data).
 -spec fsync_dir(iodata()) -> ok | {error, atom()}.
 fsync_dir(Path) -> nif_fsync_dir(Path).
 
+-doc """
+Load a GGUF model.
+
+Recognised keys in `Opts` (all optional; defaults come from
+`llama_model_default_params()`):
+
+- `n_gpu_layers :: integer()` — number of layers offloaded to GPU.
+- `main_gpu :: non_neg_integer()` — GPU index when `split_mode = none`.
+- `split_mode :: none | layer | row` — how to split a model across
+  multiple GPUs. Atom mapping: `none -> LLAMA_SPLIT_MODE_NONE`,
+  `layer -> LLAMA_SPLIT_MODE_LAYER`, `row -> LLAMA_SPLIT_MODE_ROW`.
+- `tensor_split :: [float()]` — per-device proportions when splitting.
+  Up to `llama_max_devices()` entries (16 in the vendored llama.cpp);
+  shorter lists zero-fill the tail.
+- `use_mmap, use_mlock, vocab_only :: boolean()`.
+
+A bad atom for `split_mode`, or a non-numeric entry in
+`tensor_split`, raises `badarg`.
+""".
 -spec load_model(iodata(), map()) -> {ok, model_ref()} | {error, atom()}.
 load_model(Path, Opts) when is_map(Opts) -> nif_load_model(Path, Opts).
 
 -spec free_model(model_ref()) -> ok.
 free_model(Model) -> nif_free_model(Model).
 
+-doc """
+Build a new inference context against a loaded model.
+
+Recognised keys in `Opts` (all optional; defaults come from
+`llama_context_default_params()`):
+
+- `n_ctx, n_batch, n_ubatch, n_seq_max :: pos_integer()`.
+- `n_threads, n_threads_batch :: pos_integer()`.
+- `embeddings, offload_kqv :: boolean()`.
+- `flash_attn :: boolean() | auto` — `true` enables, `false`
+  disables, `auto` lets llama.cpp decide based on the build and
+  model. Maps to `enum llama_flash_attn_type`.
+- `type_k, type_v :: f16 | f32 | bf16 | q4_0 | q5_0 | q5_1 | q8_0`
+  — KV cache element type for keys and values. Maps to
+  `GGML_TYPE_*`.
+
+A bad atom for any of `flash_attn`, `type_k`, or `type_v` raises
+`badarg`.
+""".
 -spec new_context(model_ref(), map()) -> {ok, context_ref()} | {error, atom()}.
 new_context(Model, Opts) when is_map(Opts) -> nif_new_context(Model, Opts).
 
