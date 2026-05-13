@@ -105,14 +105,14 @@ cold_then_warm_counters(Config) ->
     Model = ?config(model, Config),
     Prompt = long_prompt(),
     Before = erllama_cache:get_counters(),
-    {ok, _, _} = erllama_model:complete(Model, Prompt, #{response_tokens => 4}),
+    {ok, _} = erllama_model:complete(Model, Prompt, #{response_tokens => 4}),
     %% Allow async saves to publish.
     timer:sleep(100),
     Mid = erllama_cache:get_counters(),
     ?assert(maps:get(misses, Mid) - maps:get(misses, Before) >= 1),
     ?assert(maps:get(saves_cold, Mid) - maps:get(saves_cold, Before) >= 1),
     %% Repeat: same prompt should hit the cold/finish row, not miss.
-    {ok, _, _} = erllama_model:complete(Model, Prompt, #{response_tokens => 4}),
+    {ok, _} = erllama_model:complete(Model, Prompt, #{response_tokens => 4}),
     timer:sleep(50),
     After = erllama_cache:get_counters(),
     ?assert(maps:get(hits_exact, After) - maps:get(hits_exact, Mid) >= 1),
@@ -159,7 +159,7 @@ multi_turn_session_resume(Config) ->
     ),
     Before = erllama_cache:get_counters(),
     Prompt2 = <<"alpha beta gamma extra">>,
-    {ok, _, _} = erllama_model:complete(Model, Prompt2, #{
+    {ok, _} = erllama_model:complete(Model, Prompt2, #{
         parent_key => ParentKey,
         response_tokens => 2
     }),
@@ -180,10 +180,10 @@ longest_prefix_resume_without_parent_key(Config) ->
     %% Stub tokenizer splits on spaces, so appending a new word
     %% extends the token list cleanly without retokenization noise.
     Prompt2 = <<Prompt1/binary, " extra-suffix-token">>,
-    {ok, _, _} = erllama_model:complete(Model, Prompt1, #{response_tokens => 2}),
+    {ok, _} = erllama_model:complete(Model, Prompt1, #{response_tokens => 2}),
     timer:sleep(150),
     Before = erllama_cache:get_counters(),
-    {ok, _, _} = erllama_model:complete(Model, Prompt2, #{response_tokens => 2}),
+    {ok, _} = erllama_model:complete(Model, Prompt2, #{response_tokens => 2}),
     After = erllama_cache:get_counters(),
     Resumed = maps:get(hits_longest_prefix, After) - maps:get(hits_longest_prefix, Before),
     ?assert(Resumed >= 1),
@@ -196,10 +196,10 @@ longest_prefix_resume_without_parent_key(Config) ->
 warm_read_pins_via_checkout(Config) ->
     Model = ?config(model, Config),
     Prompt = long_prompt(),
-    {ok, _, _} = erllama_model:complete(Model, Prompt, #{response_tokens => 2}),
+    {ok, _} = erllama_model:complete(Model, Prompt, #{response_tokens => 2}),
     timer:sleep(100),
     Before = erllama_cache:get_counters(),
-    {ok, _, _} = erllama_model:complete(Model, Prompt, #{response_tokens => 2}),
+    {ok, _} = erllama_model:complete(Model, Prompt, #{response_tokens => 2}),
     After = erllama_cache:get_counters(),
     ?assertEqual(
         1,
@@ -213,7 +213,7 @@ warm_read_pins_via_checkout(Config) ->
 eviction_drops_files_and_meta(Config) ->
     Model = ?config(model, Config),
     Dir = ?config(dir, Config),
-    {ok, _, _} =
+    {ok, _} =
         erllama_model:complete(Model, long_prompt(), #{response_tokens => 4}),
     %% Wait for the async save to publish before checking the
     %% directory; counters lag stub completes by a writer-pool hop.
@@ -250,7 +250,7 @@ concurrent_complete_under_writer_cap(Config) ->
             Cfg = Cfg0#{fingerprint => FP},
             {ok, _} = erllama_model:start_link(ModelN, Cfg),
             try
-                {ok, _, _} = erllama_model:complete(
+                {ok, _} = erllama_model:complete(
                     ModelN, long_prompt(), #{response_tokens => 4}
                 ),
                 Parent ! {done, I}
@@ -275,7 +275,7 @@ concurrent_complete_under_writer_cap(Config) ->
 
 counters_visible_via_facade(Config) ->
     Model = ?config(model, Config),
-    {ok, _, _} = erllama_model:complete(Model, long_prompt()),
+    {ok, _} = erllama_model:complete(Model, long_prompt()),
     timer:sleep(100),
     Snap = erllama_cache:get_counters(),
     ?assert(is_map(Snap)),

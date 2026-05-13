@@ -161,8 +161,12 @@ via_unknown_model_crashes_test() ->
 
 complete_returns_response_test() ->
     with_model(#{}, fun(_) ->
-        {ok, _Reply, Generated} = erllama_model:complete(<<"test_model">>, short_prompt()),
+        {ok, Result} = erllama_model:complete(<<"test_model">>, short_prompt()),
+        ?assert(is_map(Result)),
+        ?assert(is_binary(maps:get(reply, Result))),
+        Generated = maps:get(generated, Result),
         ?assert(length(Generated) > 0),
+        ?assertEqual(length(Generated), maps:get(completion_tokens, maps:get(stats, Result))),
         ?assertEqual(idle, erllama_model:status(<<"test_model">>))
     end).
 
@@ -174,7 +178,7 @@ short_prompt_does_not_cold_save_test() ->
     with_model(
         #{min_tokens => 4, cold_min_tokens => 4, cold_max_tokens => 1000},
         fun(Cfg) ->
-            {ok, _, _} = erllama_model:complete(<<"test_model">>, short_prompt()),
+            {ok, _} = erllama_model:complete(<<"test_model">>, short_prompt()),
             %% Short prompt has 1 token; min is 4 -> no cold save.
             Tokens = prompt_tokens(short_prompt()),
             ColdKey = key_for_tokens(Tokens, Cfg),
@@ -184,7 +188,7 @@ short_prompt_does_not_cold_save_test() ->
 
 long_prompt_fires_cold_save_test() ->
     with_model(#{}, fun(Cfg) ->
-        {ok, _, _} = erllama_model:complete(<<"test_model">>, long_prompt()),
+        {ok, _} = erllama_model:complete(<<"test_model">>, long_prompt()),
         Tokens = prompt_tokens(long_prompt()),
         ColdKey = key_for_tokens(Tokens, Cfg),
         ?assertMatch({ok, _Row}, wait_for_key(ColdKey, 1000))
@@ -196,10 +200,11 @@ long_prompt_fires_cold_save_test() ->
 
 finish_save_fires_for_long_prompt_test() ->
     with_model(#{}, fun(Cfg) ->
-        {ok, _, Generated} =
+        {ok, #{generated := Generated, finish_key := ReportedKey}} =
             erllama_model:complete(<<"test_model">>, long_prompt(), #{response_tokens => 6}),
         FullTokens = prompt_tokens(long_prompt()) ++ Generated,
         FinishKey = key_for_tokens(FullTokens, Cfg),
+        ?assertEqual(FinishKey, ReportedKey),
         ?assertMatch({ok, _Row}, wait_for_key(FinishKey, 1000))
     end).
 
@@ -209,7 +214,7 @@ finish_save_fires_for_long_prompt_test() ->
 
 repeat_prompt_hits_finish_save_path_test() ->
     with_model(#{}, fun(Cfg) ->
-        {ok, _, Gen1} =
+        {ok, #{generated := Gen1}} =
             erllama_model:complete(<<"test_model">>, long_prompt(), #{response_tokens => 4}),
         FullKey1 = key_for_tokens(prompt_tokens(long_prompt()) ++ Gen1, Cfg),
         {ok, _} = wait_for_key(FullKey1, 1000),
@@ -227,10 +232,11 @@ repeat_prompt_hits_finish_save_path_test() ->
 parent_key_session_resume_test() ->
     with_model(#{}, fun(Cfg) ->
         %% Turn 1: prompt + response.
-        {ok, _, Gen1} =
+        {ok, #{generated := Gen1, finish_key := ReportedKey1}} =
             erllama_model:complete(<<"test_model">>, long_prompt(), #{response_tokens => 4}),
         FullTokens1 = prompt_tokens(long_prompt()) ++ Gen1,
         FullKey1 = key_for_tokens(FullTokens1, Cfg),
+        ?assertEqual(FullKey1, ReportedKey1),
         {ok, _} = wait_for_key(FullKey1, 1000),
         %% Turn 2: a longer prompt that strictly prefix-extends turn 1's
         %% live tokens. Use parent_key = FullKey1 to take the session
@@ -238,7 +244,7 @@ parent_key_session_resume_test() ->
         Extension = list_to_binary(
             stub_detokenize_decimal(FullTokens1) ++ " more tokens for turn two"
         ),
-        {ok, _, _} =
+        {ok, _} =
             erllama_model:complete(<<"test_model">>, Extension, #{
                 parent_key => FullKey1,
                 response_tokens => 2
@@ -257,7 +263,7 @@ continued_save_fires_during_long_generation_test() ->
         #{continued_interval => 4, response_target => 8},
         fun(Cfg) ->
             PromptTokens = prompt_tokens(long_prompt()),
-            {ok, _, Generated} = erllama_model:complete(
+            {ok, #{generated := Generated}} = erllama_model:complete(
                 <<"test_model">>, long_prompt(), #{response_tokens => 8}
             ),
             %% A continued save fires when LiveTokens - LastSavedAt
@@ -297,6 +303,9 @@ evict_during_generation_persists_live_state_test() ->
                         <<"test_model">>, long_prompt(), #{response_tokens => 200}
                     )}
         end),
+        %% The reply binding (above) is now a map; downstream just
+        %% receives the whole {ok, Map} tuple as `_` since this test
+        %% only cares about save side-effects.
         %% Give the gen_statem a beat to enter generating.
         timer:sleep(0),
         ok = erllama_model:evict(<<"test_model">>),
@@ -328,7 +337,7 @@ shutdown_idle_with_no_context_is_noop_test() ->
 counters_track_misses_and_saves_test() ->
     with_model(#{}, fun(_Cfg) ->
         Before = erllama_cache:get_counters(),
-        {ok, _, _} =
+        {ok, _} =
             erllama_model:complete(<<"test_model">>, long_prompt(), #{response_tokens => 4}),
         timer:sleep(50),
         After = erllama_cache:get_counters(),
@@ -359,10 +368,70 @@ concurrent_complete_rejects_with_busy_test() ->
         end,
         case Result of
             %% raced and got there first/after
-            {ok, _, _} -> ok;
+            {ok, _} -> ok;
             %% busy as expected
             {error, busy} -> ok
         end
+    end).
+
+%% =============================================================================
+%% PR1: completion_result map shape
+%% =============================================================================
+
+complete_returns_finish_key_matching_full_tokens_test() ->
+    with_model(#{}, fun(Cfg) ->
+        {ok, #{
+            generated := Generated,
+            context_tokens := ContextTokens,
+            finish_key := FinishKey,
+            cache_hit_kind := HitKind
+        }} =
+            erllama_model:complete(<<"test_model">>, long_prompt(), #{response_tokens => 4}),
+        ExpectedTokens = prompt_tokens(long_prompt()) ++ Generated,
+        ?assertEqual(ExpectedTokens, ContextTokens),
+        ?assertEqual(key_for_tokens(ContextTokens, Cfg), FinishKey),
+        ?assertEqual(cold, HitKind)
+    end).
+
+complete_finish_key_undefined_when_below_min_tokens_test() ->
+    %% min_tokens default 4; the short prompt produces 1 + a small
+    %% generation. Force a higher threshold so the finish save is
+    %% suppressed and finish_key comes back as undefined.
+    with_model(#{min_tokens => 10_000}, fun(_Cfg) ->
+        {ok, #{finish_key := FinishKey}} =
+            erllama_model:complete(<<"test_model">>, short_prompt(), #{response_tokens => 2}),
+        ?assertEqual(undefined, FinishKey)
+    end).
+
+complete_committed_tokens_equals_context_tokens_length_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        {ok, #{context_tokens := Ctx, committed_tokens := N}} =
+            erllama_model:complete(<<"test_model">>, long_prompt(), #{response_tokens => 4}),
+        ?assertEqual(length(Ctx), N)
+    end).
+
+prefill_only_returns_finish_key_and_warm_resumes_test() ->
+    with_model(#{}, fun(Cfg) ->
+        Tokens = prompt_tokens(long_prompt()),
+        {ok, #{
+            context_tokens := Ctx,
+            committed_tokens := N,
+            finish_key := FinishKey,
+            cache_hit_kind := HitKind
+        }} = erllama_model:prefill_only(<<"test_model">>, Tokens),
+        ?assertEqual(Tokens, Ctx),
+        ?assertEqual(length(Tokens), N),
+        ?assertEqual(cold, HitKind),
+        ?assertEqual(key_for_tokens(Tokens, Cfg), FinishKey),
+        ?assertMatch({ok, _Row}, wait_for_key(FinishKey, 1000)),
+        %% Now resume from FinishKey; the cache should report exact hit.
+        {ok, #{cache_hit_kind := exact}} =
+            erllama_model:complete(
+                <<"test_model">>, long_prompt(), #{
+                    parent_key => FinishKey,
+                    response_tokens => 2
+                }
+            )
     end).
 
 %% =============================================================================

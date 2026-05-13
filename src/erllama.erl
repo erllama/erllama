@@ -18,7 +18,12 @@ Typical usage:
       model_path => "/srv/models/tinyllama-1.1b-q4_k_m.gguf",
       fingerprint => crypto:hash(sha256, Bin)
   }).
-  {ok, Reply, _Tokens} = erllama:complete(Model, <<"hello">>).
+  {ok, #{reply := Reply, finish_key := FK}} =
+      erllama:complete(Model, <<"hello">>).
+  %% On the next turn, pass FK as parent_key for token-exact warm
+  %% restore:
+  {ok, #{reply := Reply2}} =
+      erllama:complete(Model, <<"hello world">>, #{parent_key => FK}).
   ok = erllama:unload(Model).
 ```
 
@@ -40,6 +45,7 @@ an explicit `model_id` in the config map.
     unload_model/1,
     complete/2,
     complete/3,
+    prefill_only/2,
     infer/4,
     cancel/1,
     status/1,
@@ -101,9 +107,16 @@ and the OpenAI/Ollama-style naming used by downstream HTTP servers.
 unload_model(Model) ->
     unload(Model).
 
--doc "Run a completion against a loaded model.".
+-doc """
+Run a completion against a loaded model.
+
+Returns `{ok, Result}` where `Result` is an `erllama_model:completion_result()`
+map carrying the detokenised reply, the generated token list, the
+full context tokens, the cache `finish_key` to use as
+`parent_key` on the next turn, and per-request stats.
+""".
 -spec complete(model(), binary()) ->
-    {ok, binary(), [erllama_nif:token_id()]} | {error, term()}.
+    {ok, erllama_model:completion_result()} | {error, term()}.
 complete(Model, Prompt) ->
     erllama_model:complete(Model, Prompt).
 
@@ -116,15 +129,44 @@ Recognised keys in `Opts`:
   tokens generated. Defaults to the model's `n_ctx` minus prompt
   length.
 - `parent_key` (`erllama_cache:cache_key()`) — the previous turn's
-  finish-save key. Skips the longest-prefix walk and resumes
-  directly from that row.
+  `finish_key`. Skips the longest-prefix walk and resumes directly
+  from that row.
 
-Returns `{ok, ReplyText, FullTokenList}` on success.
+Returns `{ok, Result}` where `Result` is a `completion_result()` map
+carrying:
+
+- `reply` — detokenised reply text
+- `generated` — tokens produced by this request
+- `context_tokens` — full token list (prompt ++ generated)
+- `committed_tokens` — `length(context_tokens)`
+- `finish_key` — cache key for the full context, or `undefined` if
+  the finish save was suppressed
+- `cache_hit_kind` — `exact | partial | cold`
+- `finish_reason` — `stop | length | cancelled`
+- `stats` — per-request timing and cache stats
 """.
 -spec complete(model(), binary(), map()) ->
-    {ok, binary(), [erllama_nif:token_id()]} | {error, term()}.
+    {ok, erllama_model:completion_result()} | {error, term()}.
 complete(Model, Prompt, Opts) ->
     erllama_model:complete(Model, Prompt, Opts).
+
+-doc """
+Decode a prompt into KV state and fire a finish save without
+sampling any output tokens. Returns the `finish_key` so the caller
+can hand it as `parent_key` on a subsequent `complete/3` or
+`infer/4` for token-exact warm restore.
+
+`PromptTokens` is the prompt as a list of token ids. Tokenisation
+is the caller's responsibility (use `tokenize/2` or apply a chat
+template first).
+
+`finish_key` is `undefined` if the finish save was suppressed
+because the token count is below the configured `min_tokens`.
+""".
+-spec prefill_only(model(), [erllama_nif:token_id()]) ->
+    {ok, erllama_model:prefill_result()} | {error, term()}.
+prefill_only(Model, PromptTokens) ->
+    erllama_model:prefill_only(Model, PromptTokens).
 
 -doc """
 Streaming inference. Returns immediately with a `reference()` that

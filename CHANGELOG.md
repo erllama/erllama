@@ -6,6 +6,58 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.2.0] - unreleased
+
+API reshape: `complete/2,3` now returns a map, and `prefill_only/2`
+is added so sessions can warm KV without sampling a reply.
+
+### Changed (breaking)
+
+- `erllama:complete/2,3` and `erllama_model:complete/2,3` now return
+  `{ok, completion_result()}` instead of the legacy
+  `{ok, ReplyBinary, GeneratedTokens}` tuple. The map carries:
+  - `reply :: binary()`
+  - `generated :: [token_id()]`
+  - `context_tokens :: [token_id()]` — full token list (prompt ++ generated)
+  - `committed_tokens :: non_neg_integer()` — `length(context_tokens)`
+  - `finish_key :: cache_key() | undefined` — token-exact key for the
+    full context, suitable as `parent_key` on the next turn;
+    `undefined` if the finish save was suppressed
+  - `cache_hit_kind :: exact | partial | cold`
+  - `finish_reason :: stop | length | cancelled`
+  - `stats :: stats()`
+- Streaming `{erllama_done, Ref, Stats}` (`infer/4`) `Stats` map
+  gains two additive keys: `finish_key` and `committed_tokens`.
+  No shape break — existing keys (`prompt_tokens`,
+  `completion_tokens`, `prefill_ms`, `generation_ms`,
+  `cache_hit_kind`, `finish_reason`, `cancelled`) remain.
+
+### Added
+
+- `erllama:prefill_only/2` and `erllama_model:prefill_only/2` —
+  decode a prompt into KV state and fire a finish save without
+  sampling any output tokens. Returns a `prefill_result()` map with
+  `context_tokens`, `committed_tokens`, `finish_key`, and
+  `cache_hit_kind`. Useful for priming the cache or holding a warm
+  session across long pauses without consuming generation budget.
+- New `completion_result()` and `prefill_result()` exported types in
+  `erllama_model`.
+
+### Migration
+
+Callers matching the old 3-tuple need the map shape. Mechanical:
+
+```erlang
+%% before:
+{ok, Reply, _Tokens} = erllama:complete(Model, Prompt).
+
+%% after:
+{ok, #{reply := Reply}} = erllama:complete(Model, Prompt).
+```
+
+Streaming consumers need no code change unless they want the new
+`finish_key` / `committed_tokens` keys.
+
 ## [0.1.2] - 2026-05-12
 
 Cluster-routing primitives, speculative-decoding verifier, a
