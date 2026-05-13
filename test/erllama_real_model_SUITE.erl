@@ -179,7 +179,7 @@ load_unload(Config) ->
 
 tokenize_decode_one(Config) ->
     Model = ?config(model, Config),
-    {ok, Reply, _Toks} = erllama_model:complete(
+    {ok, #{reply := Reply}} = erllama_model:complete(
         Model, ?SHORT_PROMPT, #{response_tokens => 4}
     ),
     ?assert(is_binary(Reply)),
@@ -202,12 +202,12 @@ pack_unpack_round_trip(Config) ->
     %% is out of scope for v1. A strong shared prefix is enough to
     %% prove the unpack put the context in roughly the right place.
     Model = ?config(model, Config),
-    {ok, Reply1, _} = erllama_model:complete(
+    {ok, #{reply := Reply1}} = erllama_model:complete(
         Model, ?LONG_PROMPT, #{response_tokens => 8, seed => 42}
     ),
     timer:sleep(300),
     Before = erllama_cache:get_counters(),
-    {ok, Reply2, _} = erllama_model:complete(
+    {ok, #{reply := Reply2}} = erllama_model:complete(
         Model, ?LONG_PROMPT, #{response_tokens => 8, seed => 42}
     ),
     After = erllama_cache:get_counters(),
@@ -228,14 +228,14 @@ pack_unpack_round_trip(Config) ->
 cold_then_warm_complete(Config) ->
     Model = ?config(model, Config),
     Before = erllama_cache:get_counters(),
-    {ok, _, _} = erllama_model:complete(
+    {ok, _} = erllama_model:complete(
         Model, ?LONG_PROMPT, #{response_tokens => 4}
     ),
     timer:sleep(300),
     Mid = erllama_cache:get_counters(),
     ?assert(maps:get(misses, Mid) - maps:get(misses, Before) >= 1),
     ?assert(maps:get(saves_cold, Mid) - maps:get(saves_cold, Before) >= 1),
-    {ok, _, _} = erllama_model:complete(
+    {ok, _} = erllama_model:complete(
         Model, ?LONG_PROMPT, #{response_tokens => 4}
     ),
     After = erllama_cache:get_counters(),
@@ -276,10 +276,10 @@ longest_prefix_resume_without_parent_key(Config) ->
     Model = ?config(model, Config),
     Prompt1 = ?LONG_PROMPT,
     Prompt2 = <<Prompt1/binary, " The next morning brought a quiet rain.">>,
-    {ok, _, _} = erllama_model:complete(Model, Prompt1, #{response_tokens => 4}),
+    {ok, _} = erllama_model:complete(Model, Prompt1, #{response_tokens => 4}),
     timer:sleep(400),
     Before = erllama_cache:get_counters(),
-    {ok, _, _} = erllama_model:complete(Model, Prompt2, #{response_tokens => 2}),
+    {ok, _} = erllama_model:complete(Model, Prompt2, #{response_tokens => 2}),
     After = erllama_cache:get_counters(),
     Resumed = maps:get(hits_longest_prefix, After) - maps:get(hits_longest_prefix, Before),
     Probes = maps:get(longest_prefix_probes, After) - maps:get(longest_prefix_probes, Before),

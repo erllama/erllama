@@ -27,15 +27,20 @@ sharing the same system prompt skip it.
    }).
 {ok, <<"erllama_model_2375">>}
 
-5> {ok, Reply, _} = erllama:complete(M, <<"Once upon a time">>).
+5> {ok, #{reply := Reply, finish_key := FK}} =
+       erllama:complete(M, <<"Once upon a time">>).
 %% ~3 s on a CPU box. Prompt prefill, async cold save fired.
 
-6> {ok, Reply2, _} = erllama:complete(M, <<"Once upon a time">>).
+6> {ok, #{reply := Reply2}} = erllama:complete(M, <<"Once upon a time">>).
 %% ~10 ms. Cache hit; KV state restored, one decode for fresh logits.
 
-7> {ok, _, _} = erllama:complete(M, <<"Once upon a time, in a quiet village">>).
+7> {ok, _} = erllama:complete(M, <<"Once upon a time, in a quiet village">>).
 %% ~50 ms. Longest-prefix walk found the cached row even though
 %% the new prompt is longer.
+
+8> {ok, _} = erllama:complete(M, <<"and they lived happily ever after">>,
+                               #{parent_key => FK}).
+%% Exact session resume from the saved row in step 5.
 ```
 
 `load_model/1` returns a binary `model_id` that is also the registered
@@ -140,8 +145,8 @@ budget.
 {ok, _} = erllama:load_model(<<"tiny">>, TinyConfig).
 {ok, _} = erllama:load_model(<<"big">>,  BigConfig).
 
-{ok, R1, _} = erllama:complete(<<"tiny">>, <<"summarise: ...">>).
-{ok, R2, _} = erllama:complete(<<"big">>,  <<"deep analysis of: ...">>).
+{ok, #{reply := R1}} = erllama:complete(<<"tiny">>, <<"summarise: ...">>).
+{ok, #{reply := R2}} = erllama:complete(<<"big">>,  <<"deep analysis of: ...">>).
 
 ok = erllama:unload(<<"tiny">>).
 ```
@@ -198,7 +203,7 @@ Stateless OpenAI/Anthropic-shaped server:
 
 ```erlang
 handle_completion(ModelId, Prompt) ->
-    {ok, Reply, _Tokens} = erllama:complete(ModelId, Prompt),
+    {ok, #{reply := Reply}} = erllama:complete(ModelId, Prompt),
     Reply.
 ```
 
@@ -208,23 +213,19 @@ prompt is yesterday's conversation plus one fresh turn, the walk
 hits.
 
 Stateful Erlang-native multi-turn: the session layer threads
-`parent_key` between turns. The previous turn's finish-save key is
-the parent of the next call. It is held by the calling session
-process, not retrieved from the cache.
+`parent_key` between turns. `complete/2,3` already returns the
+`finish_key` for the full context; pass it as `parent_key` on the
+next turn.
 
 ```erlang
 %% First turn: cold prefill. The model fires an async finish save
-%% whose key is sha256(fingerprint || quant || ctx_params || tokens).
-{ok, R1, Tokens1} = erllama:complete(M, Prompt1),
-ParentKey = erllama_cache_key:make(#{
-    fingerprint => Fp,
-    quant_type  => q4_k_m,
-    ctx_params_hash => CtxHash,
-    tokens      => Tokens1
-}),
+%% and returns its key.
+{ok, #{reply := R1, finish_key := ParentKey}} =
+    erllama:complete(M, Prompt1),
 
 %% Second turn: pass ParentKey to skip the longest-prefix walk.
-{ok, R2, _} = erllama:complete(M, Prompt2, #{parent_key => ParentKey}).
+{ok, #{reply := R2}} =
+    erllama:complete(M, Prompt2, #{parent_key => ParentKey}).
 ```
 
 Inspect cache state from a shell:

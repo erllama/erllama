@@ -51,7 +51,7 @@ Fp = crypto:hash(sha256, Bin),
     tier             => disk
 }),
 
-{ok, Reply, _Tokens} =
+{ok, #{reply := Reply}} =
     erllama:complete(M, <<"Once upon a time, in a quiet village">>),
 
 io:format("~s~n", [Reply]),
@@ -68,7 +68,7 @@ rows. Repeating the same call hits the cache via the exact-key path.
 %% tokens backward by `boundary_align_tokens` and resumes from the
 %% longest published prefix automatically — no parent_key needed.
 handle_chat(ModelId, Prompt) ->
-    {ok, Reply, _Tokens} =
+    {ok, #{reply := Reply}} =
         erllama:complete(ModelId, Prompt, #{response_tokens => 256}),
     {200, [{"Content-Type", "text/plain"}], Reply}.
 ```
@@ -77,37 +77,23 @@ Hits show up as `hits_longest_prefix` in `erllama_cache:get_counters/0`.
 
 ## 3. Multi-turn Erlang-native session (tracks parent_key)
 
-The session layer is responsible for threading `parent_key` between
-turns. The cache does not expose a "last finish key" lookup; you
-compute the key from the tokens `complete/3` returns.
+The session layer threads `parent_key` between turns. `complete/2,3`
+returns the `finish_key` for the full context — pass it as
+`parent_key` on the next turn.
 
 ```erlang
-%% Helper: build the finish-save key from the tokens of the previous turn.
-finish_key(Fp, QT, CtxHash, Tokens) ->
-    erllama_cache_key:make(#{
-        fingerprint     => Fp,
-        quant_type      => QT,
-        ctx_params_hash => CtxHash,
-        tokens          => Tokens
-    }).
-
-chat(Model, KeyMeta, Prompt, undefined) ->
-    {ok, Reply, Tokens} = erllama:complete(Model, Prompt, #{}),
-    K = finish_key(maps:get(fingerprint, KeyMeta),
-                   maps:get(quant_type, KeyMeta),
-                   maps:get(ctx_params_hash, KeyMeta), Tokens),
+chat(Model, Prompt, undefined) ->
+    {ok, #{reply := Reply, finish_key := K}} =
+        erllama:complete(Model, Prompt, #{}),
     {Reply, K};
-chat(Model, KeyMeta, Prompt, ParentKey) ->
-    {ok, Reply, Tokens} =
+chat(Model, Prompt, ParentKey) ->
+    {ok, #{reply := Reply, finish_key := K}} =
         erllama:complete(Model, Prompt, #{parent_key => ParentKey}),
-    K = finish_key(maps:get(fingerprint, KeyMeta),
-                   maps:get(quant_type, KeyMeta),
-                   maps:get(ctx_params_hash, KeyMeta), Tokens),
     {Reply, K}.
 
-%% Driver: `KeyMeta` is whatever you passed to `load_model/2`.
-{R1, K1} = chat(M, KeyMeta, <<"User: hello\nAssistant:">>, undefined),
-{R2, K2} = chat(M, KeyMeta,
+%% Driver.
+{R1, K1} = chat(M, <<"User: hello\nAssistant:">>, undefined),
+{R2, _K2} = chat(M,
     <<"User: hello\nAssistant: ", R1/binary,
       "\nUser: tell me a joke\nAssistant:">>,
     K1),
@@ -115,7 +101,10 @@ ok.
 ```
 
 Passing `parent_key` skips the longest-prefix walk and resumes
-directly from the previous turn's finish save.
+directly from the previous turn's finish save. `finish_key` is
+`undefined` if the finish save was suppressed (token count below
+`min_tokens`); guard with a pattern match if your sessions can be
+that short.
 
 ## 4. Multiple loaded models
 
@@ -125,8 +114,8 @@ Model ids are `binary()` (the registered name).
 {ok, _} = erllama:load_model(<<"tiny">>, TinyConfig),
 {ok, _} = erllama:load_model(<<"big">>,  BigConfig),
 
-{ok, R1, _} = erllama:complete(<<"tiny">>, <<"summarise: ...">>),
-{ok, R2, _} = erllama:complete(<<"big">>,  <<"deep analysis of: ...">>),
+{ok, #{reply := R1}} = erllama:complete(<<"tiny">>, <<"summarise: ...">>),
+{ok, #{reply := R2}} = erllama:complete(<<"big">>,  <<"deep analysis of: ...">>),
 
 ok = erllama:unload(<<"tiny">>),
 ok = erllama:unload(<<"big">>).
@@ -150,7 +139,7 @@ Workers = [
     spawn(fun() ->
         Q = list_to_binary(io_lib:format("Worker ~p question.", [N])),
         Prompt = <<SharedPrefix/binary, Q/binary>>,
-        {ok, Reply, _} = erllama:complete(ModelId, Prompt),
+        {ok, #{reply := Reply}} = erllama:complete(ModelId, Prompt),
         Parent ! {N, Reply}
     end) || N <- lists:seq(1, 8)
 ],

@@ -37,6 +37,7 @@ stubs get replaced; the cache integration is unaffected.
     stop/1,
     complete/2,
     complete/3,
+    prefill_only/2,
     infer/4,
     cancel/1,
     status/1,
@@ -60,6 +61,8 @@ stubs get replaced; the cache integration is unaffected.
     model/0,
     model_info/0,
     stats/0,
+    completion_result/0,
+    prefill_result/0,
     cache_hit_kind/0,
     finish_reason/0,
     infer_params/0
@@ -96,6 +99,7 @@ stubs get replaced; the cache integration is unaffected.
 
 -type pending_request() ::
     {complete, gen_statem:from(), binary(), map()}
+    | {prefill_only, gen_statem:from(), [non_neg_integer()]}
     | {infer, gen_statem:from(), [non_neg_integer()], map(), pid()}.
 -type finish_reason() :: stop | length | cancelled.
 -type stats() :: #{
@@ -105,7 +109,43 @@ stubs get replaced; the cache integration is unaffected.
     generation_ms := non_neg_integer(),
     cache_hit_kind := cache_hit_kind(),
     finish_reason := finish_reason(),
-    cancelled := boolean()
+    cancelled := boolean(),
+    %% Token-exact cache key for the full context (prompt ++ generated).
+    %% `undefined` when the finish save was suppressed (e.g. live token
+    %% count below `min_tokens`).
+    finish_key := binary() | undefined,
+    %% Length of `context_tokens` at finish (prompt + generated). Equal
+    %% to `prompt_tokens + completion_tokens` unless the cache pruned
+    %% the live context (not currently possible).
+    committed_tokens := non_neg_integer()
+}.
+
+%% Reply shape for `complete/2,3`.
+-type completion_result() :: #{
+    %% Detokenised reply text.
+    reply := binary(),
+    %% Tokens produced by this request (not including the prompt).
+    generated := [non_neg_integer()],
+    %% Full context as a token list (prompt ++ generated).
+    context_tokens := [non_neg_integer()],
+    %% Convenience: length(context_tokens).
+    committed_tokens := non_neg_integer(),
+    %% Token-exact cache key for the full context. Pass as
+    %% `parent_key` on the next request to resume from the warm row.
+    %% `undefined` if the finish save was suppressed.
+    finish_key := binary() | undefined,
+    %% How this request resolved against the cache on admission.
+    cache_hit_kind := cache_hit_kind(),
+    finish_reason := finish_reason(),
+    stats := stats()
+}.
+
+%% Reply shape for `prefill_only/2`.
+-type prefill_result() :: #{
+    context_tokens := [non_neg_integer()],
+    committed_tokens := non_neg_integer(),
+    finish_key := binary() | undefined,
+    cache_hit_kind := cache_hit_kind()
 }.
 
 %% Optional fields the caller may set on `infer/4`. The same fields
@@ -184,7 +224,9 @@ stubs get replaced; the cache integration is unaffected.
     %%   {infer,    From, Tokens, Params, CallerPid}
     pending = [] :: [pending_request()],
     %% Streaming-mode fields (set by infer/4, unset by complete/2,3).
-    mode = standard :: standard | streaming,
+    %% `prefill_only` short-circuits the generating state and replies
+    %% with the warm-restore key as soon as the prompt is in KV.
+    mode = standard :: standard | streaming | prefill_only,
     caller_pid :: pid() | undefined,
     request_ref :: reference() | undefined,
     cancel_pending = false :: boolean(),
@@ -208,14 +250,34 @@ stop(Model) ->
     gen_statem:stop(via(Model)).
 
 -spec complete(model(), binary()) ->
-    {ok, binary(), [non_neg_integer()]} | {error, term()}.
+    {ok, completion_result()} | {error, term()}.
 complete(Model, Prompt) ->
     complete(Model, Prompt, #{}).
 
 -spec complete(model(), binary(), map()) ->
-    {ok, binary(), [non_neg_integer()]} | {error, term()}.
+    {ok, completion_result()} | {error, term()}.
 complete(Model, Prompt, Opts) ->
     gen_statem:call(via(Model), {complete, Prompt, Opts}, infinity).
+
+-doc """
+Decode a prompt into KV state and fire a finish save, without
+sampling any output tokens. Returns the `finish_key` so the caller
+can hand it as `parent_key` to a subsequent `complete/3` or
+`infer/4` for token-exact warm restore.
+
+`PromptTokens` is the prompt as a list of token ids. Tokenisation
+is the caller's responsibility (use `tokenize/2` or apply a chat
+template first). The cache behaviour mirrors `complete/3`: an exact
+or longest-prefix warm restore is taken when available, otherwise
+the prompt is prefilled cold.
+
+`finish_key` is `undefined` if the finish save was suppressed
+because the token count is below the configured `min_tokens`.
+""".
+-spec prefill_only(model(), [non_neg_integer()]) ->
+    {ok, prefill_result()} | {error, term()}.
+prefill_only(Model, PromptTokens) when is_list(PromptTokens) ->
+    gen_statem:call(via(Model), {prefill_only, PromptTokens}, infinity).
 
 -doc """
 Streaming inference. Admits a request and immediately returns a
@@ -518,6 +580,8 @@ default_ctx_params_hash() ->
 
 idle({call, From}, {complete, Prompt, Opts}, Data) ->
     start_complete(From, Prompt, Opts, Data);
+idle({call, From}, {prefill_only, PromptTokens}, Data) ->
+    start_prefill_only(From, PromptTokens, Data);
 idle({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
     start_infer(From, Tokens, Params, CallerPid, Data);
 idle({call, From}, status, Data) ->
@@ -571,6 +635,30 @@ start_complete(From, Prompt, Opts, Data) ->
             {keep_state, Data, [{reply, From, {error, Reason}}]}
     end.
 
+start_prefill_only(From, PromptTokens, Data) ->
+    %% Reset any leftover sampler state from a previous request so the
+    %% prefill-only path stays deterministic regardless of what ran
+    %% before. The sampler chain is not used here, but backends that
+    %% lazily allocate state may rely on the reset.
+    case configure_sampler_for(#{}, Data) of
+        {ok, Data0} ->
+            Data1 = Data0#data{
+                mode = prefill_only,
+                caller = From,
+                caller_pid = undefined,
+                request_ref = undefined,
+                cancel_pending = false,
+                prompt_tokens = PromptTokens,
+                response_target = 0,
+                generated = [],
+                prefill_started_at = erlang:monotonic_time(millisecond),
+                request_fp = Data0#data.effective_fp
+            },
+            enter_after_lookup(undefined, Data1);
+        {error, Reason} ->
+            {keep_state, Data, [{reply, From, {error, Reason}}]}
+    end.
+
 start_infer(From, Tokens, Params, CallerPid, Data) ->
     Ref = make_ref(),
     case configure_sampler_for(Params, Data) of
@@ -604,7 +692,9 @@ add_reply_action(From, Reply, {next_state, NextState, NewData}) ->
     {next_state, NextState, NewData, [{reply, From, Reply}]}.
 
 %% Branches the lookup result into the correct gen_statem transition.
-%% Used by both complete/2,3 and infer/4 paths.
+%% Used by complete/2,3, infer/4, and prefill_only/2 paths. The
+%% `prefill_only` mode short-circuits at the end of prefill, skipping
+%% enter_generating entirely.
 enter_after_lookup(ParentKey, Data) ->
     case lookup_or_resume(Data#data.prompt_tokens, ParentKey, Data) of
         {warm, ContextTokens, RemainingTokens, HitKind} ->
@@ -613,11 +703,19 @@ enter_after_lookup(ParentKey, Data) ->
                 context_tokens = ContextTokens ++ RemainingTokens,
                 cache_hit_kind = HitKind
             },
-            enter_generating(Data1);
+            after_prefill(Data1);
         cold ->
             Data1 = Data#data{cache_hit_kind = cold},
             enter_prefilling(Data1)
     end.
+
+%% Branch point shared by warm and cold paths once prefill is done.
+%% In `prefill_only` mode the request finishes here without entering
+%% `generating`; otherwise the model proceeds to decode tokens.
+after_prefill(Data = #data{mode = prefill_only}) ->
+    finish_prefill_only(Data);
+after_prefill(Data) ->
+    enter_generating(Data).
 
 %% =============================================================================
 %% State: prefilling
@@ -651,6 +749,8 @@ handle_common(_State, {call, From}, {complete, Prompt, Opts}, Data) ->
     %% load against its own request_fp snapshot before the queued
     %% request even starts.
     {keep_state, enqueue({complete, From, Prompt, Opts}, Data)};
+handle_common(_State, {call, From}, {prefill_only, PromptTokens}, Data) ->
+    {keep_state, enqueue({prefill_only, From, PromptTokens}, Data)};
 handle_common(_State, {call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
     {keep_state, enqueue({infer, From, Tokens, Params, CallerPid}, Data)};
 handle_common(_State, cast, {cancel, Ref}, Data = #data{request_ref = Ref}) ->
@@ -917,7 +1017,7 @@ enter_prefilling(Data) ->
             ok = backend_call(Data, prefill, [Tokens])
     end,
     Data1 = Data#data{context_tokens = Tokens},
-    enter_generating(Data1).
+    after_prefill(Data1).
 
 enter_generating(Data) ->
     %% Decode token-by-token via cast-to-self events so continued
@@ -1037,16 +1137,26 @@ maybe_fire_continued(Data) ->
     end.
 
 finish_request(Data, FinishReason) ->
-    ok = fire_finish_save(Data#data.context_tokens, Data),
+    FinishKey = finish_key_or_undefined(fire_finish_save(Data#data.context_tokens, Data)),
     {ok, Data1} = clear_grammar(Data),
     case Data1#data.mode of
         standard ->
             Reply = backend_call(Data1, detokenize, [Data1#data.generated]),
             From = Data1#data.caller,
-            Generated = Data1#data.generated,
-            return_to_idle(reset(Data1), [{reply, From, {ok, Reply, Generated}}]);
+            Stats = build_stats(FinishReason, false, FinishKey, Data1),
+            Result = #{
+                reply => Reply,
+                generated => Data1#data.generated,
+                context_tokens => Data1#data.context_tokens,
+                committed_tokens => length(Data1#data.context_tokens),
+                finish_key => FinishKey,
+                cache_hit_kind => Data1#data.cache_hit_kind,
+                finish_reason => FinishReason,
+                stats => Stats
+            },
+            return_to_idle(reset(Data1), [{reply, From, {ok, Result}}]);
         streaming ->
-            Stats = build_stats(FinishReason, false, Data1),
+            Stats = build_stats(FinishReason, false, FinishKey, Data1),
             send_done(Data1, Stats),
             return_to_idle(reset(Data1), [])
     end.
@@ -1054,11 +1164,28 @@ finish_request(Data, FinishReason) ->
 finish_request_cancelled(Data) ->
     %% Cancelled requests still fire a finish save: whatever live
     %% context exists is worth keeping for resume.
-    ok = fire_finish_save(Data#data.context_tokens, Data),
+    FinishKey = finish_key_or_undefined(fire_finish_save(Data#data.context_tokens, Data)),
     {ok, Data1} = clear_grammar(Data),
-    Stats = build_stats(cancelled, true, Data1),
+    Stats = build_stats(cancelled, true, FinishKey, Data1),
     send_done(Data1, Stats),
     return_to_idle(reset(Data1), []).
+
+%% Prefill-only finish path: no detokenize, no generated tokens, no
+%% sampler chain to clear. Fire the finish save and reply with the
+%% warm-restore key plus the committed token list.
+finish_prefill_only(Data) ->
+    FinishKey = finish_key_or_undefined(fire_finish_save(Data#data.context_tokens, Data)),
+    From = Data#data.caller,
+    Result = #{
+        context_tokens => Data#data.context_tokens,
+        committed_tokens => length(Data#data.context_tokens),
+        finish_key => FinishKey,
+        cache_hit_kind => Data#data.cache_hit_kind
+    },
+    return_to_idle(reset(Data), [{reply, From, {ok, Result}}]).
+
+finish_key_or_undefined({ok, Key}) -> Key;
+finish_key_or_undefined(skipped) -> undefined.
 
 %% Drop back to idle. If a queued request exists, dispatch its head
 %% inline before yielding the scheduler. The reply action for the
@@ -1072,6 +1199,8 @@ return_to_idle(Data, Actions) ->
 
 dispatch_pending({complete, From, Prompt, Opts}, Data, Actions) ->
     merge_dispatch(start_complete(From, Prompt, Opts, Data), Actions);
+dispatch_pending({prefill_only, From, PromptTokens}, Data, Actions) ->
+    merge_dispatch(start_prefill_only(From, PromptTokens, Data), Actions);
 dispatch_pending({infer, From, Tokens, Params, CallerPid}, Data, Actions) ->
     merge_dispatch(start_infer(From, Tokens, Params, CallerPid, Data), Actions).
 
@@ -1175,7 +1304,7 @@ clear_grammar(Data = #data{backend = Mod, backend_state = S}) ->
             {ok, Data}
     end.
 
-build_stats(FinishReason, Cancelled, Data) ->
+build_stats(FinishReason, Cancelled, FinishKey, Data) ->
     Now = erlang:monotonic_time(millisecond),
     PrefillStart = Data#data.prefill_started_at,
     GenStart = Data#data.generation_started_at,
@@ -1197,7 +1326,9 @@ build_stats(FinishReason, Cancelled, Data) ->
         generation_ms => GenMs,
         cache_hit_kind => Data#data.cache_hit_kind,
         finish_reason => FinishReason,
-        cancelled => Cancelled
+        cancelled => Cancelled,
+        finish_key => FinishKey,
+        committed_tokens => length(Data#data.context_tokens)
     }.
 
 %% =============================================================================
@@ -1346,11 +1477,21 @@ fire_cold_save(TrimmedPrefix, Data) ->
     Min = maps:get(min_tokens, Data#data.policy),
     fire_save_if(length(TrimmedPrefix) >= Min, cold, TrimmedPrefix, Data).
 
+%% Returns `{ok, Key}` if a finish save fired (regardless of whether
+%% the writer actually persisted; back-pressure drops are still
+%% counted as a fire because the key is the canonical handle for the
+%% live token list). Returns `skipped` if the policy suppressed the
+%% save (live token count below `min_tokens`).
 fire_finish_save(LiveTokens, Data) ->
     Should = erllama_cache_policy:should_finish_save(
         length(LiveTokens), Data#data.policy
     ),
-    fire_save_if(Should, finish, LiveTokens, Data).
+    case fire_save_if(Should, finish, LiveTokens, Data) of
+        ok when Should ->
+            {ok, make_key(LiveTokens, Data)};
+        ok ->
+            skipped
+    end.
 
 fire_save_if(false, _Reason, _Tokens, _Data) ->
     ok;

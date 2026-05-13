@@ -77,7 +77,7 @@ empty_opts_no_sampler_cfg_test() ->
         Id = <<"sampler_a">>,
         {ok, _} = erllama:load_model(Id, minimal_config()),
         try
-            {ok, _, _} = erllama:complete(Id, <<"hello world">>),
+            {ok, _} = erllama:complete(Id, <<"hello world">>),
             ?assertEqual(#{}, get_stub_cfg(Id))
         after
             erllama:unload(Id)
@@ -99,7 +99,7 @@ full_sampler_set_lands_on_backend_test() ->
             seed => 42
         },
         try
-            {ok, _, _} = erllama:complete(Id, <<"hello">>, Opts),
+            {ok, _} = erllama:complete(Id, <<"hello">>, Opts),
             Cfg = get_stub_cfg(Id),
             ?assertEqual(0.7, maps:get(temperature, Cfg)),
             ?assertEqual(40, maps:get(top_k, Cfg)),
@@ -120,7 +120,7 @@ grammar_opt_lands_on_backend_test() ->
         Id = <<"sampler_c">>,
         {ok, _} = erllama:load_model(Id, minimal_config()),
         try
-            {ok, _, _} = erllama:complete(
+            {ok, _} = erllama:complete(
                 Id, <<"hi">>, #{grammar => <<"root ::= [01]+">>}
             ),
             Cfg = get_stub_cfg(Id),

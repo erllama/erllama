@@ -147,6 +147,24 @@ stats_carry_token_counts_test() ->
         ?assertEqual(length(Out), maps:get(completion_tokens, Stats))
     end).
 
+stats_carry_finish_key_and_committed_tokens_test() ->
+    with_model(fun(Id) ->
+        {ok, PromptTokens} = erllama:tokenize(Id, <<"hello big world">>),
+        {ok, Ref} = erllama:infer(Id, PromptTokens, #{response_tokens => 6}, self()),
+        {_Out, Stats} = collect_stream(Ref, 5000),
+        ?assert(maps:is_key(finish_key, Stats)),
+        ?assert(maps:is_key(committed_tokens, Stats)),
+        Committed = maps:get(committed_tokens, Stats),
+        Prompt = maps:get(prompt_tokens, Stats),
+        Completion = maps:get(completion_tokens, Stats),
+        ?assertEqual(Prompt + Completion, Committed),
+        FinishKey = maps:get(finish_key, Stats),
+        %% Stub backend has min_tokens=4 in the fixture; with prompt
+        %% of 3 + response of 6 the committed count is well above the
+        %% threshold so the finish save must have fired.
+        ?assert(is_binary(FinishKey))
+    end).
+
 %% =============================================================================
 %% Concurrency / busy
 %% =============================================================================
@@ -209,7 +227,7 @@ complete_while_streaming_is_queued_test() ->
         end,
         %% The queued complete now drains; expect a successful reply.
         receive
-            {complete_result, {ok, _Reply, _Toks}} -> ok
+            {complete_result, {ok, _Reply}} -> ok
         after 5000 -> ?assert(false)
         end
     end).
