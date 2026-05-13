@@ -13,6 +13,12 @@ Config (passed through `erllama_model:start_link/2`):
   model_path :: file:name() | binary()  (required)
   model_opts :: map()  (forwarded to erllama_nif:load_model/2)
   context_opts :: map()  (forwarded to erllama_nif:new_context/2)
+
+`model_opts` and `context_opts` flow through to the NIF unchanged.
+See `erllama_nif:load_model/2` and `erllama_nif:new_context/2` for
+the full set of recognised keys, including the llama.cpp option
+passthroughs `split_mode`, `main_gpu`, `tensor_split`,
+`flash_attn`, `type_k`, and `type_v`.
 """.
 -behaviour(erllama_model_backend).
 

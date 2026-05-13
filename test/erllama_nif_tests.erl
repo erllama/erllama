@@ -82,6 +82,157 @@ load_model_rejects_non_existent_path_test_() ->
     end}.
 
 %% =============================================================================
+%% PR3: llama.cpp option passthrough (atom enums + tensor_split)
+%% =============================================================================
+
+%% A bad split_mode atom must raise `badarg` before the load even
+%% runs — caught entirely in the option parser. Uses a fake path so
+%% the test does not need LLAMA_TEST_MODEL; the 60 s timeout covers
+%% the first-call Metal-backend lazy init on macOS.
+load_model_rejects_bad_split_mode_test_() ->
+    {timeout, 60, fun() ->
+        ?assertError(
+            badarg,
+            erllama_nif:load_model(
+                <<"/no/such/file.gguf">>, #{split_mode => bogus}
+            )
+        )
+    end}.
+
+%% Same for flash_attn / type_k / type_v on new_context — but those
+%% need a loaded model to exercise. Gate on LLAMA_TEST_MODEL.
+new_context_rejects_bad_flash_attn_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                {ok, Model} =
+                    erllama_nif:load_model(list_to_binary(Path), #{n_gpu_layers => 0}),
+                try
+                    ?assertError(
+                        badarg,
+                        erllama_nif:new_context(Model, #{flash_attn => bogus})
+                    )
+                after
+                    ok = erllama_nif:free_model(Model)
+                end
+            end}
+    end.
+
+new_context_rejects_bad_type_k_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                {ok, Model} =
+                    erllama_nif:load_model(list_to_binary(Path), #{n_gpu_layers => 0}),
+                try
+                    ?assertError(
+                        badarg,
+                        erllama_nif:new_context(Model, #{type_k => zz})
+                    )
+                after
+                    ok = erllama_nif:free_model(Model)
+                end
+            end}
+    end.
+
+%% Bad tensor_split (non-numeric entry) is rejected before the load.
+load_model_rejects_bad_tensor_split_test_() ->
+    {timeout, 60, fun() ->
+        ?assertError(
+            badarg,
+            erllama_nif:load_model(
+                <<"/no/such/file.gguf">>, #{tensor_split => [hello, world]}
+            )
+        )
+    end}.
+
+%% Successful passthrough tests need a real GGUF.
+load_model_with_split_mode_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                {ok, Model} =
+                    erllama_nif:load_model(
+                        list_to_binary(Path),
+                        #{n_gpu_layers => 0, split_mode => layer}
+                    ),
+                ok = erllama_nif:free_model(Model)
+            end}
+    end.
+
+load_model_with_main_gpu_and_tensor_split_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                %% On a CPU-only build these knobs are no-ops; load
+                %% must still succeed without errors.
+                {ok, Model} =
+                    erllama_nif:load_model(
+                        list_to_binary(Path),
+                        #{
+                            n_gpu_layers => 0,
+                            main_gpu => 0,
+                            tensor_split => [1.0]
+                        }
+                    ),
+                ok = erllama_nif:free_model(Model)
+            end}
+    end.
+
+new_context_with_flash_attn_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                {ok, Model} =
+                    erllama_nif:load_model(list_to_binary(Path), #{n_gpu_layers => 0}),
+                try
+                    {ok, Ctx1} =
+                        erllama_nif:new_context(Model, #{
+                            n_ctx => 256, flash_attn => auto
+                        }),
+                    ok = erllama_nif:free_context(Ctx1),
+                    {ok, Ctx2} =
+                        erllama_nif:new_context(Model, #{
+                            n_ctx => 256, flash_attn => false
+                        }),
+                    ok = erllama_nif:free_context(Ctx2)
+                after
+                    ok = erllama_nif:free_model(Model)
+                end
+            end}
+    end.
+
+new_context_with_type_kv_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                {ok, Model} =
+                    erllama_nif:load_model(list_to_binary(Path), #{n_gpu_layers => 0}),
+                try
+                    {ok, Ctx} =
+                        erllama_nif:new_context(Model, #{
+                            n_ctx => 256, type_k => f16, type_v => f16
+                        }),
+                    ok = erllama_nif:free_context(Ctx)
+                after
+                    ok = erllama_nif:free_model(Model)
+                end
+            end}
+    end.
+
+%% =============================================================================
 %% VRAM probe
 %% =============================================================================
 
