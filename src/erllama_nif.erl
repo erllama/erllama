@@ -34,6 +34,7 @@
     detokenize/2,
     prefill/2,
     decode_one/1,
+    step/2,
     kv_pack/3,
     kv_pack/4,
     kv_unpack/3,
@@ -151,6 +152,44 @@ prefill(Ctx, Tokens) -> nif_prefill(Ctx, Tokens).
 -spec decode_one(context_ref()) ->
     {ok, token_id()} | {eog, token_id()} | {error, term()}.
 decode_one(Ctx) -> nif_decode_one(Ctx).
+
+-doc """
+Multi-sequence batched decode.
+
+Each tick is exactly one `llama_decode` call that mixes prefill and
+decode rows freely (SARATHI-style co-batching). The order matters:
+prefill rows decode their slice without sampling and leave logits
+on the last slice token for the NEXT tick to sample from. Decode
+rows sample from the previous tick's logits BEFORE the new batch
+is built, so the token returned to the caller is the same token
+that lands in KV by the time the call returns.
+
+Each `SeqId` must be `0 <= SeqId < 256` (compile-time cap on the
+context's `per_seq[]` array; lift in the NIF if it becomes binding).
+Each `SamplerRef` must have been built via `sampler_new/2` against
+this same `CtxRef`.
+
+Errors:
+- `{error, no_logits}` — a decode row's seq has `last_logits_idx =
+  -1`, i.e. no prefill has run for that seq since the context was
+  built or since the last `kv_unpack` / `kv_seq_rm`. The caller
+  must issue a prefill row for that seq first.
+- `{error, batch_overflow}` — the total slice length exceeds the
+  context's `n_batch`. A budget-aware scheduler should shrink the
+  prefill slices and retry.
+- `{error, released}` — the context or one of the samplers has
+  been explicitly freed.
+- `{error, exception}` — `llama_decode` or `llama_sampler_sample`
+  threw across the C ABI; the context's `decode_ready` flag is
+  cleared and the gen_statem owning it is expected to stop.
+""".
+-spec step(
+    context_ref(),
+    [{non_neg_integer(), {prefill, [token_id()]} | {decode, sampler_ref()}}]
+) ->
+    {ok, [{non_neg_integer(), prefilled | {token, token_id(), 0 | 1}}]}
+    | {error, atom()}.
+step(Ctx, Ops) when is_list(Ops) -> nif_step(Ctx, Ops).
 
 -spec kv_pack(context_ref(), [token_id()], non_neg_integer()) ->
     binary() | {error, atom()}.
@@ -323,6 +362,7 @@ nif_tokenize(_Model, _Text, _Opts) -> erlang:nif_error(nif_not_loaded).
 nif_detokenize(_Model, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_prefill(_Ctx, _Tokens) -> erlang:nif_error(nif_not_loaded).
 nif_decode_one(_Ctx) -> erlang:nif_error(nif_not_loaded).
+nif_step(_Ctx, _Ops) -> erlang:nif_error(nif_not_loaded).
 nif_kv_pack(_Ctx, _Tokens, _NTokens) -> erlang:nif_error(nif_not_loaded).
 nif_kv_pack(_Ctx, _Tokens, _NTokens, _SeqId) -> erlang:nif_error(nif_not_loaded).
 nif_kv_unpack(_Ctx, _Bin, _SeqId) -> erlang:nif_error(nif_not_loaded).

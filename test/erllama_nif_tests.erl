@@ -82,6 +82,151 @@ load_model_rejects_non_existent_path_test_() ->
     end}.
 
 %% =============================================================================
+%% PR4a: nif_step (multi-sequence batched decode)
+%% =============================================================================
+
+%% Decoding a freshly-built seq without a prefill behind it must
+%% return {error, no_logits} cleanly — the sentinel
+%% per_seq[seq_id].last_logits_idx == -1 catches this before reaching
+%% llama_sampler_sample, which would GGML_ASSERT and abort the BEAM.
+nif_step_decode_without_prefill_rejects_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                {ok, Model} =
+                    erllama_nif:load_model(list_to_binary(Path), #{n_gpu_layers => 0}),
+                {ok, Ctx} =
+                    erllama_nif:new_context(Model, #{n_ctx => 256, n_seq_max => 2}),
+                {ok, Sampler} = erllama_nif:sampler_new(Ctx, #{}),
+                try
+                    ?assertEqual(
+                        {error, no_logits},
+                        erllama_nif:step(Ctx, [{0, {decode, Sampler}}])
+                    )
+                after
+                    ok = erllama_nif:sampler_free(Sampler),
+                    ok = erllama_nif:free_context(Ctx),
+                    ok = erllama_nif:free_model(Model)
+                end
+            end}
+    end.
+
+%% Prefill one seq then decode one token from it. The minimum
+%% viable use of nif_step — single-seq, single decode tick.
+nif_step_single_seq_prefill_then_decode_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                {ok, Model} =
+                    erllama_nif:load_model(list_to_binary(Path), #{n_gpu_layers => 0}),
+                {ok, Ctx} =
+                    erllama_nif:new_context(Model, #{n_ctx => 256, n_seq_max => 2}),
+                {ok, Sampler} = erllama_nif:sampler_new(Ctx, #{}),
+                try
+                    Tokens = erllama_nif:tokenize(
+                        Model,
+                        <<"Hello world">>,
+                        #{add_special => true, parse_special => false}
+                    ),
+                    {ok, [{0, prefilled}]} =
+                        erllama_nif:step(Ctx, [{0, {prefill, Tokens}}]),
+                    {ok, [{0, {token, T, _Eog}}]} =
+                        erllama_nif:step(Ctx, [{0, {decode, Sampler}}]),
+                    ?assert(is_integer(T)),
+                    ?assert(T >= 0)
+                after
+                    ok = erllama_nif:sampler_free(Sampler),
+                    ok = erllama_nif:free_context(Ctx),
+                    ok = erllama_nif:free_model(Model)
+                end
+            end}
+    end.
+
+%% Co-batch: prefill seq 0 in tick 1, then issue decode-on-0 plus
+%% prefill-on-1 in tick 2. Result must carry both rows.
+nif_step_co_batched_prefill_with_decode_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                {ok, Model} =
+                    erllama_nif:load_model(list_to_binary(Path), #{n_gpu_layers => 0}),
+                {ok, Ctx} =
+                    erllama_nif:new_context(Model, #{n_ctx => 256, n_seq_max => 2}),
+                {ok, Sampler0} = erllama_nif:sampler_new(Ctx, #{}),
+                try
+                    Tokens = erllama_nif:tokenize(
+                        Model,
+                        <<"Hello world">>,
+                        #{add_special => true, parse_special => false}
+                    ),
+                    {ok, [{0, prefilled}]} =
+                        erllama_nif:step(Ctx, [{0, {prefill, Tokens}}]),
+                    {ok, Results} = erllama_nif:step(Ctx, [
+                        {0, {decode, Sampler0}},
+                        {1, {prefill, Tokens}}
+                    ]),
+                    ?assertEqual(2, length(Results)),
+                    %% Order: results follow input op order.
+                    [{0, {token, T0, _}}, {1, prefilled}] = Results,
+                    ?assert(is_integer(T0))
+                after
+                    ok = erllama_nif:sampler_free(Sampler0),
+                    ok = erllama_nif:free_context(Ctx),
+                    ok = erllama_nif:free_model(Model)
+                end
+            end}
+    end.
+
+%% A bogus seq_id (out of n_seq_max cap) raises badarg.
+nif_step_rejects_bad_seq_id_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                {ok, Model} =
+                    erllama_nif:load_model(list_to_binary(Path), #{n_gpu_layers => 0}),
+                {ok, Ctx} =
+                    erllama_nif:new_context(Model, #{n_ctx => 64, n_seq_max => 2}),
+                try
+                    ?assertError(
+                        badarg,
+                        erllama_nif:step(Ctx, [{99999, {prefill, [1, 2, 3]}}])
+                    )
+                after
+                    ok = erllama_nif:free_context(Ctx),
+                    ok = erllama_nif:free_model(Model)
+                end
+            end}
+    end.
+
+%% n_seq_max past the compile-time cap is rejected at new_context.
+new_context_rejects_n_seq_max_over_cap_test_() ->
+    case os:getenv("LLAMA_TEST_MODEL") of
+        false ->
+            {"LLAMA_TEST_MODEL unset; skipping", []};
+        Path ->
+            {timeout, 60, fun() ->
+                {ok, Model} =
+                    erllama_nif:load_model(list_to_binary(Path), #{n_gpu_layers => 0}),
+                try
+                    ?assertError(
+                        badarg,
+                        erllama_nif:new_context(Model, #{n_seq_max => 1000000})
+                    )
+                after
+                    ok = erllama_nif:free_model(Model)
+                end
+            end}
+    end.
+
+%% =============================================================================
 %% PR3: llama.cpp option passthrough (atom enums + tensor_split)
 %% =============================================================================
 

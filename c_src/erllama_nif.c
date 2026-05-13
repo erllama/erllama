@@ -51,6 +51,14 @@
  * caller memory). */
 #define ERLLAMA_MAX_DEVICES 16
 
+/* Hard upper bound on `n_seq_max`. Caps the per-context `per_seq[]`
+ * array on `erllama_context_t`. Sized well above realistic loads
+ * (typical multi-tenant inference servers run 1-32 concurrent
+ * sequences per context); nif_new_context rejects with `badarg`
+ * if a caller asks for more. Lift here, no other code change, if
+ * the cap becomes binding. */
+#define ERLLAMA_N_SEQ_MAX_CAP 256
+
 /* Mirror of erllama_load_status_t in erllama_safe.cpp; both sides
  * must agree on the integer values. Used by the _v2 model load
  * wrapper to distinguish a generic NULL return from a captured
@@ -263,6 +271,26 @@ typedef struct {
     int has_tensor_split;
 } erllama_model_t;
 
+/* Per-seq state tracked across nif_step ticks so the next tick
+ * knows where each seq's logits live (for sampling) and where its
+ * next token's position is (for batch construction).
+ *
+ *   last_logits_idx: row index into the previous llama_decode batch
+ *                    at which this seq's logits were emitted, or -1
+ *                    if no logits are live for this seq (fresh
+ *                    seq_id, post kv_seq_rm, or post kv_unpack —
+ *                    the unpacked state has KV but no live logits).
+ *
+ *   next_pos:        position to assign to the next token decoded
+ *                    for this seq. Bumped by the slice length per
+ *                    tick. Initialised to 0 for a fresh seq_id and
+ *                    to `llama_memory_seq_pos_max(ctx, seq_id) + 1`
+ *                    after a kv_unpack. */
+typedef struct {
+    int32_t last_logits_idx;
+    int32_t next_pos;
+} erllama_per_seq_t;
+
 typedef struct {
     pthread_mutex_t mu;
     int mu_inited;
@@ -274,6 +302,11 @@ typedef struct {
      * a future sampler-config NIF would free + rebuild this under
      * the resource lock. */
     struct llama_sampler *smpl;
+    /* Per-seq state. Only used by nif_step / kv_pack / kv_unpack
+     * / kv_seq_rm; the single-seq fast paths (decode_one, prefill)
+     * leave this untouched and continue using seq_id=0 semantics
+     * implicit in their callers. */
+    erllama_per_seq_t per_seq[ERLLAMA_N_SEQ_MAX_CAP];
 } erllama_context_t;
 
 /* LoRA adapter resource. The adapter is bound to a model and stays
@@ -985,7 +1018,12 @@ static ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     if (get_map_uint(env, argv[1], "n_ctx", &u)) params.n_ctx = (uint32_t) u;
     if (get_map_uint(env, argv[1], "n_batch", &u)) params.n_batch = (uint32_t) u;
     if (get_map_uint(env, argv[1], "n_ubatch", &u)) params.n_ubatch = (uint32_t) u;
-    if (get_map_uint(env, argv[1], "n_seq_max", &u)) params.n_seq_max = (uint32_t) u;
+    if (get_map_uint(env, argv[1], "n_seq_max", &u)) {
+        if (u > ERLLAMA_N_SEQ_MAX_CAP) {
+            return enif_make_badarg(env);
+        }
+        params.n_seq_max = (uint32_t) u;
+    }
     int32_t i32;
     if (get_map_int31(env, argv[1], "n_threads", &i32)) params.n_threads = i32;
     if (get_map_int31(env, argv[1], "n_threads_batch", &i32)) {
@@ -1045,6 +1083,14 @@ static ERL_NIF_TERM nif_new_context(ErlNifEnv *env, int argc, const ERL_NIF_TERM
         return enif_make_tuple2(env, atom_error, atom_oom);
     }
     memset(res, 0, sizeof(*res));
+    /* per_seq[].last_logits_idx must start at -1 so the first
+     * nif_step decode tick refuses to sample a seq that has no
+     * prefill behind it (memset of int32_t -> 0 would be a valid
+     * row index, which would silently read garbage logits). */
+    for (size_t i = 0; i < (size_t) ERLLAMA_N_SEQ_MAX_CAP; i++) {
+        res->per_seq[i].last_logits_idx = -1;
+        res->per_seq[i].next_pos = 0;
+    }
     if (pthread_mutex_init(&res->mu, NULL) != 0) {
         enif_release_resource(res);
         (void) erllama_safe_free(ctx);
@@ -1288,6 +1334,18 @@ static ERL_NIF_TERM nif_kv_unpack(ErlNifEnv *env, int argc, const ERL_NIF_TERM a
      * it before the next sample. Mark the context as not ready until
      * that primer runs. */
     c->decode_ready = 0;
+    /* Refresh per-seq tracking from the just-restored KV: next_pos is
+     * the position immediately past the highest cell now in `seq_id`.
+     * last_logits_idx stays at -1 because state_seq_set_data does not
+     * carry logits with it. nif_step refuses to sample a seq with
+     * last_logits_idx == -1 — the model layer's primer-prefill flow
+     * is the only legal next operation for this seq. */
+    if (seq_id < ERLLAMA_N_SEQ_MAX_CAP) {
+        long pos_max = erllama_safe_memory_seq_pos_max(c->ctx, seq_id);
+        c->per_seq[seq_id].next_pos =
+            pos_max < 0 ? 0 : (int32_t) (pos_max + 1);
+        c->per_seq[seq_id].last_logits_idx = -1;
+    }
     pthread_mutex_unlock(&c->mu);
     if (consumed == 0 || consumed != in.size) {
         return enif_make_tuple2(env, atom_error, atom_unpack_failed);
@@ -1323,11 +1381,312 @@ static ERL_NIF_TERM nif_kv_seq_rm(ErlNifEnv *env, int argc,
     /* Removing cells invalidates last-decode logits; force a fresh
      * prefill before the next sample. */
     c->decode_ready = 0;
+    /* Refresh per-seq tracking: query the remaining max position
+     * for this seq and recompute next_pos. last_logits_idx is
+     * cleared because the prior batch's logits no longer correspond
+     * to the seq's tail. */
+    if (rc == 0 && seq_id < ERLLAMA_N_SEQ_MAX_CAP) {
+        long pos_max = erllama_safe_memory_seq_pos_max(c->ctx, seq_id);
+        c->per_seq[seq_id].next_pos =
+            pos_max < 0 ? 0 : (int32_t) (pos_max + 1);
+        c->per_seq[seq_id].last_logits_idx = -1;
+    }
     pthread_mutex_unlock(&c->mu);
     if (rc != 0) {
         return enif_make_tuple2(env, atom_error, atom_unpack_failed);
     }
     return atom_ok;
+}
+
+/* =========================================================================
+ * nif_step: multi-sequence batched decode
+ *
+ *   nif_step(CtxRef, [{SeqId, {prefill, [Token]} | {decode, SamplerRef}}])
+ *     -> {ok, [{SeqId, prefilled | {token, Token, Eog :: 0 | 1}}]}
+ *      | {error, atom()}
+ *
+ * Each tick is exactly one llama_decode call that mixes prefill and
+ * decode rows freely (SARATHI-style co-batching). Sample-then-decode
+ * order matches nif_decode_one: each decode row samples from the
+ * PRIOR tick's logits at `per_seq[seq_id].last_logits_idx` BEFORE
+ * the new batch is built, so the token Erlang receives is the same
+ * token that lands in KV by the time the call returns. That
+ * preserves the cache invariant (every committed token is in KV).
+ *
+ * Prefill rows do not sample: their last token gets logits=true in
+ * the batch so the NEXT tick can sample for that seq. The first
+ * output token for a freshly admitted seq is produced one tick
+ * after its prefill — hidden in production by co-batching with
+ * in-flight decoders.
+ * ========================================================================= */
+
+/* Forward declaration: read_token_list lives further down with the
+ * single-seq prefill/decode_one helpers. nif_step calls it from
+ * above to parse the prefill rows of each tick. */
+static int read_token_list(ErlNifEnv *env, ERL_NIF_TERM list,
+                           llama_token **out, int32_t *out_len);
+
+typedef struct {
+    int seq_id;
+    int is_prefill;                /* 1 prefill, 0 decode */
+    llama_token *prefill_tokens;   /* prefill only; enif_alloc'd */
+    int32_t prefill_n;             /* prefill only */
+    erllama_sampler_t *sampler;    /* decode only */
+    llama_token sampled;           /* decode only, set during pre-sample */
+    int eog;                       /* decode only */
+} erllama_step_op_t;
+
+static void free_step_ops(erllama_step_op_t *ops, unsigned int n) {
+    if (!ops) return;
+    for (unsigned int i = 0; i < n; i++) {
+        if (ops[i].prefill_tokens) enif_free(ops[i].prefill_tokens);
+    }
+    enif_free(ops);
+}
+
+static ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc;
+    erllama_context_t *c;
+    if (!enif_get_resource(env, argv[0], CTX_RT, (void **) &c)) {
+        return enif_make_badarg(env);
+    }
+    unsigned int n_ops;
+    if (!enif_get_list_length(env, argv[1], &n_ops)) {
+        return enif_make_badarg(env);
+    }
+    if (n_ops == 0) {
+        return enif_make_tuple2(env, atom_ok, enif_make_list(env, 0));
+    }
+
+    erllama_step_op_t *ops = enif_alloc(sizeof(erllama_step_op_t) * n_ops);
+    if (!ops) {
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+    memset(ops, 0, sizeof(erllama_step_op_t) * n_ops);
+
+    /* Parse `[{SeqId, {Tag, Arg}}, ...]` into the working array. Any
+     * malformed entry rejects the whole call with badarg. */
+    ERL_NIF_TERM head;
+    ERL_NIF_TERM tail = argv[1];
+    unsigned int parsed = 0;
+    while (enif_get_list_cell(env, tail, &head, &tail)) {
+        const ERL_NIF_TERM *outer;
+        int outer_arity;
+        if (!enif_get_tuple(env, head, &outer_arity, &outer) || outer_arity != 2) {
+            free_step_ops(ops, parsed);
+            return enif_make_badarg(env);
+        }
+        int seq_id;
+        if (!enif_get_int(env, outer[0], &seq_id) ||
+            seq_id < 0 || seq_id >= ERLLAMA_N_SEQ_MAX_CAP) {
+            free_step_ops(ops, parsed);
+            return enif_make_badarg(env);
+        }
+        ops[parsed].seq_id = seq_id;
+
+        const ERL_NIF_TERM *inner;
+        int inner_arity;
+        if (!enif_get_tuple(env, outer[1], &inner_arity, &inner) || inner_arity != 2) {
+            free_step_ops(ops, parsed);
+            return enif_make_badarg(env);
+        }
+        char tag[16];
+        if (!enif_get_atom(env, inner[0], tag, sizeof(tag), ERL_NIF_LATIN1)) {
+            free_step_ops(ops, parsed);
+            return enif_make_badarg(env);
+        }
+        if (strcmp(tag, "prefill") == 0) {
+            ops[parsed].is_prefill = 1;
+            int rc = read_token_list(
+                env, inner[1], &ops[parsed].prefill_tokens, &ops[parsed].prefill_n
+            );
+            if (rc != 1 || ops[parsed].prefill_n <= 0) {
+                free_step_ops(ops, parsed + 1);
+                return enif_make_badarg(env);
+            }
+        } else if (strcmp(tag, "decode") == 0) {
+            ops[parsed].is_prefill = 0;
+            erllama_sampler_t *samp;
+            if (!enif_get_resource(env, inner[1], SAMPLER_RT, (void **) &samp)) {
+                free_step_ops(ops, parsed);
+                return enif_make_badarg(env);
+            }
+            /* Sampler must be bound to this context — its internal
+             * chain was built against `c->ctx` at sampler_new time. */
+            if (samp->ctx_res != c) {
+                free_step_ops(ops, parsed);
+                return enif_make_badarg(env);
+            }
+            ops[parsed].sampler = samp;
+        } else {
+            free_step_ops(ops, parsed);
+            return enif_make_badarg(env);
+        }
+        parsed++;
+    }
+
+    pthread_mutex_lock(&c->mu);
+    if (!c->ctx) {
+        pthread_mutex_unlock(&c->mu);
+        free_step_ops(ops, n_ops);
+        return enif_make_tuple2(env, atom_error, atom_released);
+    }
+
+    const struct llama_model *model = erllama_safe_get_model(c->ctx);
+    const struct llama_vocab *vocab = model ? erllama_safe_model_get_vocab(model) : NULL;
+
+    /* Pre-sample: read each decode row's next token from the PRIOR
+     * tick's logits (still in ctx because we haven't called
+     * llama_decode yet in this tick). */
+    for (unsigned int i = 0; i < n_ops; i++) {
+        if (ops[i].is_prefill) continue;
+        int seq_id = ops[i].seq_id;
+        int32_t li = c->per_seq[seq_id].last_logits_idx;
+        if (li < 0) {
+            pthread_mutex_unlock(&c->mu);
+            free_step_ops(ops, n_ops);
+            return enif_make_tuple2(env, atom_error, atom_no_logits);
+        }
+        pthread_mutex_lock(&ops[i].sampler->mu);
+        if (!ops[i].sampler->chain) {
+            pthread_mutex_unlock(&ops[i].sampler->mu);
+            pthread_mutex_unlock(&c->mu);
+            free_step_ops(ops, n_ops);
+            return enif_make_tuple2(env, atom_error, atom_released);
+        }
+        llama_token tok = erllama_safe_sampler_sample(
+            ops[i].sampler->chain, c->ctx, li
+        );
+        pthread_mutex_unlock(&ops[i].sampler->mu);
+        if (tok < 0) {
+            pthread_mutex_unlock(&c->mu);
+            free_step_ops(ops, n_ops);
+            return enif_make_tuple2(env, atom_error, atom_exception);
+        }
+        ops[i].sampled = tok;
+        ops[i].eog = vocab ? erllama_safe_vocab_is_eog(vocab, tok) : 0;
+    }
+
+    /* Compute the total batch token count: each decode row contributes
+     * 1, each prefill row contributes its slice length. */
+    int64_t total64 = 0;
+    for (unsigned int i = 0; i < n_ops; i++) {
+        total64 += ops[i].is_prefill ? (int64_t) ops[i].prefill_n : 1;
+    }
+    if (total64 <= 0 || total64 > INT32_MAX) {
+        pthread_mutex_unlock(&c->mu);
+        free_step_ops(ops, n_ops);
+        return enif_make_tuple2(env, atom_error, atom_batch_overflow);
+    }
+    /* Also bound by the live ctx's n_batch — overflowing this is what
+     * causes the safe_decode error in production today; surface a
+     * clean error tuple so callers (a budget-aware scheduler) can
+     * shrink and retry. */
+    uint32_t n_batch_cap = erllama_safe_n_batch(c->ctx);
+    if ((uint32_t) total64 > n_batch_cap) {
+        pthread_mutex_unlock(&c->mu);
+        free_step_ops(ops, n_ops);
+        return enif_make_tuple2(env, atom_error, atom_batch_overflow);
+    }
+    int32_t total = (int32_t) total64;
+
+    /* Build the batch. The vendored llama_batch API exposes
+     * llama_batch_init + llama_batch_free but no llama_batch_add
+     * helper — fields are public POD and we fill them manually.
+     * llama_batch_init allocates the arrays with size = total and
+     * each seq_id[i] pointing to an array of length 1 (n_seq_max=1
+     * argument). */
+    struct llama_batch batch = llama_batch_init(total, 0, 1);
+    if (!batch.token || !batch.pos || !batch.n_seq_id ||
+        !batch.seq_id || !batch.logits) {
+        llama_batch_free(batch);
+        pthread_mutex_unlock(&c->mu);
+        free_step_ops(ops, n_ops);
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+    batch.n_tokens = 0;
+
+    int32_t *last_logits_idx_new = enif_alloc(sizeof(int32_t) * n_ops);
+    if (!last_logits_idx_new) {
+        llama_batch_free(batch);
+        pthread_mutex_unlock(&c->mu);
+        free_step_ops(ops, n_ops);
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+
+    for (unsigned int i = 0; i < n_ops; i++) {
+        int seq_id = ops[i].seq_id;
+        int32_t start_pos = c->per_seq[seq_id].next_pos;
+        int slice_n = ops[i].is_prefill ? ops[i].prefill_n : 1;
+        for (int j = 0; j < slice_n; j++) {
+            int32_t row = batch.n_tokens;
+            llama_token tok =
+                ops[i].is_prefill ? ops[i].prefill_tokens[j] : ops[i].sampled;
+            batch.token[row]    = tok;
+            batch.pos[row]      = start_pos + (llama_pos) j;
+            batch.n_seq_id[row] = 1;
+            batch.seq_id[row][0] = (llama_seq_id) seq_id;
+            batch.logits[row]   = (j == slice_n - 1) ? (int8_t) 1 : (int8_t) 0;
+            if (j == slice_n - 1) {
+                last_logits_idx_new[i] = row;
+            }
+            batch.n_tokens++;
+        }
+    }
+
+    int dr = erllama_safe_decode(c->ctx, batch);
+    if (dr != 0) {
+        llama_batch_free(batch);
+        enif_free(last_logits_idx_new);
+        c->decode_ready = 0;
+        pthread_mutex_unlock(&c->mu);
+        free_step_ops(ops, n_ops);
+        ERL_NIF_TERM why =
+            (dr == ERLLAMA_DECODE_EXC_SENTINEL) ? atom_exception
+                                                : atom_decode_failed;
+        return enif_make_tuple2(env, atom_error, why);
+    }
+
+    /* Update per-seq state from the just-decoded batch. */
+    for (unsigned int i = 0; i < n_ops; i++) {
+        int seq_id = ops[i].seq_id;
+        int slice_n = ops[i].is_prefill ? ops[i].prefill_n : 1;
+        c->per_seq[seq_id].next_pos += slice_n;
+        c->per_seq[seq_id].last_logits_idx = last_logits_idx_new[i];
+    }
+    c->decode_ready = 1;
+
+    llama_batch_free(batch);
+    enif_free(last_logits_idx_new);
+    pthread_mutex_unlock(&c->mu);
+
+    /* Build result list. Prefill rows -> `{seq_id, prefilled}`;
+     * decode rows -> `{seq_id, {token, Token, EogFlag}}`. */
+    ERL_NIF_TERM atom_prefilled = enif_make_atom(env, "prefilled");
+    ERL_NIF_TERM atom_token     = enif_make_atom(env, "token");
+    ERL_NIF_TERM *results = enif_alloc(sizeof(ERL_NIF_TERM) * n_ops);
+    if (!results) {
+        free_step_ops(ops, n_ops);
+        return enif_make_tuple2(env, atom_error, atom_oom);
+    }
+    for (unsigned int i = 0; i < n_ops; i++) {
+        ERL_NIF_TERM payload;
+        if (ops[i].is_prefill) {
+            payload = atom_prefilled;
+        } else {
+            payload = enif_make_tuple3(env,
+                atom_token,
+                enif_make_int(env, ops[i].sampled),
+                enif_make_int(env, ops[i].eog ? 1 : 0));
+        }
+        results[i] = enif_make_tuple2(env,
+            enif_make_int(env, ops[i].seq_id),
+            payload);
+    }
+    ERL_NIF_TERM result_list = enif_make_list_from_array(env, results, n_ops);
+    enif_free(results);
+    free_step_ops(ops, n_ops);
+    return enif_make_tuple2(env, atom_ok, result_list);
 }
 
 /* =========================================================================
@@ -2909,6 +3268,7 @@ static ErlNifFunc nif_funcs[] = {
     {"nif_kv_pack",      4, nif_kv_pack,      ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_unpack",    3, nif_kv_unpack,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_kv_seq_rm",    4, nif_kv_seq_rm,    ERL_NIF_DIRTY_JOB_CPU_BOUND},
+    {"nif_step",         2, nif_step,         ERL_NIF_DIRTY_JOB_CPU_BOUND},
     {"nif_fsync_dir",    1, nif_fsync_dir,    ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_load_model",   2, nif_load_model,   ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_free_model",   1, nif_free_model,   ERL_NIF_DIRTY_JOB_CPU_BOUND},
