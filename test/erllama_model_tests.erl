@@ -526,7 +526,8 @@ wait_for_pending_len_loop(ModelId, Expected, Deadline) ->
             ok;
         _ ->
             case erlang:monotonic_time(millisecond) > Deadline of
-                true -> erlang:error({pending_len_timeout, ModelId, Expected});
+                true ->
+                    erlang:error({pending_len_timeout, ModelId, Expected});
                 false ->
                     timer:sleep(10),
                     wait_for_pending_len_loop(ModelId, Expected, Deadline)
