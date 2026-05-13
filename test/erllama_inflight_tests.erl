@@ -73,3 +73,61 @@ queue_depth_decrements_on_owner_crash_test() ->
         sys:get_state(erllama_inflight),
         ?assertEqual(0, erllama_inflight:queue_depth())
     end).
+
+%% =============================================================================
+%% PR2: per-model queue_depth/1
+%% =============================================================================
+
+queue_depth_per_model_returns_zero_when_idle_test() ->
+    with_inflight(fun() ->
+        ?assertEqual(0, erllama_inflight:queue_depth(self()))
+    end).
+
+queue_depth_per_model_counts_only_matching_pid_test() ->
+    with_inflight(fun() ->
+        FakeModel1 = spawn(fun() ->
+            receive
+                stop -> ok
+            end
+        end),
+        FakeModel2 = spawn(fun() ->
+            receive
+                stop -> ok
+            end
+        end),
+        try
+            ok = erllama_inflight:register(make_ref(), FakeModel1),
+            ok = erllama_inflight:register(make_ref(), FakeModel1),
+            ok = erllama_inflight:register(make_ref(), FakeModel2),
+            ?assertEqual(2, erllama_inflight:queue_depth(FakeModel1)),
+            ?assertEqual(1, erllama_inflight:queue_depth(FakeModel2)),
+            ?assertEqual(0, erllama_inflight:queue_depth(self())),
+            ?assertEqual(3, erllama_inflight:queue_depth())
+        after
+            FakeModel1 ! stop,
+            FakeModel2 ! stop
+        end
+    end).
+
+%% =============================================================================
+%% PR2: obs_put / obs_get / obs_delete round-trip
+%% =============================================================================
+
+obs_put_then_get_round_trip_test() ->
+    with_inflight(fun() ->
+        Row = {<<"m1">>, generating, 3, exact, 42},
+        true = erllama_inflight:obs_put(<<"m1">>, Row),
+        ?assertEqual(Row, erllama_inflight:obs_get(<<"m1">>))
+    end).
+
+obs_get_missing_returns_undefined_test() ->
+    with_inflight(fun() ->
+        ?assertEqual(undefined, erllama_inflight:obs_get(<<"never_put">>))
+    end).
+
+obs_delete_removes_row_test() ->
+    with_inflight(fun() ->
+        true = erllama_inflight:obs_put(<<"m2">>, {<<"m2">>, idle, 0, undefined, 0}),
+        true = erllama_inflight:obs_delete(<<"m2">>),
+        ?assertEqual(undefined, erllama_inflight:obs_get(<<"m2">>))
+    end).

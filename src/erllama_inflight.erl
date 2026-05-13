@@ -24,12 +24,17 @@ model dies unexpectedly.
     unregister/1,
     lookup/1,
     all/0,
-    queue_depth/0
+    queue_depth/0,
+    queue_depth/1,
+    obs_put/2,
+    obs_get/1,
+    obs_delete/1
 ]).
 
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -define(TABLE, ?MODULE).
+-define(OBS_TABLE, erllama_model_obs).
 -define(COUNTER_KEY, {?MODULE, counter}).
 
 %% =============================================================================
@@ -94,10 +99,71 @@ queue_depth() ->
         Ref -> counters:get(Ref, 1)
     end.
 
+-doc """
+Per-model inflight count. Walks the inflight table filtering on
+the model's pid; O(N) in the table size but accurate for a single
+model. The global `queue_depth/0` is still O(1) via the atomics
+counter; use that for cross-model totals.
+""".
+-spec queue_depth(pid()) -> non_neg_integer().
+queue_depth(Pid) when is_pid(Pid) ->
+    case ets:whereis(?TABLE) of
+        undefined ->
+            0;
+        _ ->
+            ets:select_count(?TABLE, [{{'_', Pid}, [], [true]}])
+    end.
+
 counter_add(N) ->
     case persistent_term:get(?COUNTER_KEY, undefined) of
         undefined -> ok;
         Ref -> counters:add(Ref, 1, N)
+    end.
+
+%% =============================================================================
+%% Per-model observability snapshot
+%% =============================================================================
+%%
+%% A second named public ETS table keyed by `model_id()` carrying the
+%% per-model phase, pending FIFO depth, and last cache-hit summary.
+%% Each model gen_statem is the sole writer for its own row; reads
+%% are lock-free from any process (including remote nodes via erpc).
+%%
+%% Row shape: `{ModelId, Phase, PendingLen, LastCacheHitKind, LastCacheHitPrefixLen}`
+%% where Phase is `idle | prefilling | generating`, LastCacheHitKind
+%% is `exact | partial | cold | undefined`, and LastCacheHitPrefixLen
+%% is the warm prefix token count (0 for cold or undefined).
+
+-spec obs_put(binary(), tuple()) -> true.
+obs_put(ModelId, Row) when is_binary(ModelId), is_tuple(Row) ->
+    %% Tolerant of a missing table: when `erllama_inflight` has not
+    %% been started (some unit-test fixtures bring up the model
+    %% gen_statem directly without the cache supervisor), writes
+    %% are silently dropped rather than crashing the writer. The
+    %% model still functions; the observability snapshot just
+    %% isn't available.
+    case ets:whereis(?OBS_TABLE) of
+        undefined -> true;
+        _ -> ets:insert(?OBS_TABLE, Row)
+    end.
+
+-spec obs_get(binary()) -> tuple() | undefined.
+obs_get(ModelId) when is_binary(ModelId) ->
+    case ets:whereis(?OBS_TABLE) of
+        undefined ->
+            undefined;
+        _ ->
+            case ets:lookup(?OBS_TABLE, ModelId) of
+                [Row] -> Row;
+                [] -> undefined
+            end
+    end.
+
+-spec obs_delete(binary()) -> true.
+obs_delete(ModelId) when is_binary(ModelId) ->
+    case ets:whereis(?OBS_TABLE) of
+        undefined -> true;
+        _ -> ets:delete(?OBS_TABLE, ModelId)
     end.
 
 %% =============================================================================
@@ -108,13 +174,18 @@ start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
 init([]) ->
-    _ = ets:new(?TABLE, [
+    Opts = [
         named_table,
         public,
         set,
         {read_concurrency, true},
         {write_concurrency, true}
-    ]),
+    ],
+    _ = ets:new(?TABLE, Opts),
+    %% Per-model observability snapshot. Same public-ETS pattern as
+    %% the inflight table above; the model gen_statem is the sole
+    %% writer for its own row.
+    _ = ets:new(?OBS_TABLE, Opts),
     %% Park a fresh counter ref in persistent_term so any process
     %% (including remote nodes via erpc, used by erllama_cluster)
     %% can read queue_depth/0 without crossing this gen_server.

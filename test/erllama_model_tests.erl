@@ -13,6 +13,7 @@ with_model(PolicyOverrides, Body) ->
     ok = erllama_cache_counters:init(),
     erllama_cache_counters:reset(),
     {ok, _} = erllama_registry:start_link(),
+    {ok, _} = erllama_inflight:start_link(),
     {ok, _} = erllama_cache_meta_srv:start_link(),
     {ok, _} = erllama_cache_ram:start_link(),
     {ok, _} = erllama_cache_writer:start_link(2),
@@ -39,6 +40,7 @@ with_model(PolicyOverrides, Body) ->
         catch gen_server:stop(erllama_cache_writer),
         catch gen_server:stop(erllama_cache_ram),
         catch gen_server:stop(erllama_cache_meta_srv),
+        catch gen_server:stop(erllama_inflight),
         catch gen_server:stop(erllama_registry),
         rm_rf(Dir)
     end.
@@ -432,6 +434,154 @@ prefill_only_returns_finish_key_and_warm_resumes_test() ->
                     response_tokens => 2
                 }
             )
+    end).
+
+%% =============================================================================
+%% PR2: per-model observability snapshot (phase / pending_len /
+%% last_cache_hit) readable lock-free from outside the gen_statem
+%% =============================================================================
+
+phase_starts_idle_and_reflects_state_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        ?assertEqual(idle, erllama:phase(<<"test_model">>)),
+        {ok, _} = erllama_model:complete(<<"test_model">>, short_prompt()),
+        %% Back to idle after the synchronous complete returns.
+        ?assertEqual(idle, erllama:phase(<<"test_model">>))
+    end).
+
+phase_unknown_model_returns_idle_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        ?assertEqual(idle, erllama:phase(<<"never_loaded">>))
+    end).
+
+pending_len_zero_when_idle_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        ?assertEqual(0, erllama:pending_len(<<"test_model">>))
+    end).
+
+pending_len_increments_when_queued_test() ->
+    %% Streaming infer with a huge response_tokens keeps the
+    %% gen_statem in `generating` long enough to admit a queued
+    %% second request. The pending_len read must come back
+    %% instantly without serialising behind the in-flight decode —
+    %% that's the whole point of the obs ETS table.
+    with_model(#{}, fun(_Cfg) ->
+        {ok, PromptTokens} = erllama_model:tokenize(<<"test_model">>, <<"hi">>),
+        {ok, Ref1} = erllama_model:infer(
+            <<"test_model">>, PromptTokens, #{response_tokens => 10000}, self()
+        ),
+        %% Wait for the first token so we know the model is past
+        %% prefill and actively decoding.
+        receive
+            {erllama_token, Ref1, _} -> ok;
+            {erllama_token_id, Ref1, _} -> ok
+        after 2000 -> erlang:error(no_first_token)
+        end,
+        %% Issue a second infer from a separate process — the
+        %% gen_statem:call for a queued request blocks until that
+        %% request is dispatched, which only happens after Ref1
+        %% finishes. From a worker we can fire the call and read
+        %% pending_len on the test process while the worker waits.
+        Parent = self(),
+        spawn_link(fun() ->
+            R2 =
+                erllama_model:infer(
+                    <<"test_model">>, PromptTokens, #{response_tokens => 1}, Parent
+                ),
+            Parent ! {worker_returned, R2}
+        end),
+        %% Give the second call a beat to enter the gen_statem
+        %% mailbox and land in `handle_common -> enqueue`.
+        ok = wait_for_pending_len(<<"test_model">>, 1, 2000),
+        %% Drain: cancel Ref1, then expect Ref2 to dispatch.
+        ok = erllama_model:cancel(Ref1),
+        receive
+            {erllama_done, Ref1, _} -> ok
+        after 5000 -> erlang:error(timeout_first)
+        end,
+        Ref2 =
+            receive
+                {worker_returned, {ok, R}} -> R
+            after 5000 -> erlang:error(worker_timeout)
+            end,
+        receive
+            {erllama_done, Ref2, _} -> ok
+        after 5000 -> erlang:error(timeout_second)
+        end,
+        ?assertEqual(0, erllama:pending_len(<<"test_model">>))
+    end).
+
+%% Poll pending_len until it reaches Expected or Timeout expires.
+%% Returns ok on success, raises on timeout. Used by the queue
+%% observability test where the second infer call blocks until the
+%% first finishes, so we cannot assert pending_len synchronously
+%% after a `{ok, Ref}` return.
+wait_for_pending_len(ModelId, Expected, TimeoutMs) ->
+    Deadline = erlang:monotonic_time(millisecond) + TimeoutMs,
+    wait_for_pending_len_loop(ModelId, Expected, Deadline).
+
+wait_for_pending_len_loop(ModelId, Expected, Deadline) ->
+    case erllama:pending_len(ModelId) of
+        Expected ->
+            ok;
+        _ ->
+            case erlang:monotonic_time(millisecond) > Deadline of
+                true ->
+                    erlang:error({pending_len_timeout, ModelId, Expected});
+                false ->
+                    timer:sleep(10),
+                    wait_for_pending_len_loop(ModelId, Expected, Deadline)
+            end
+    end.
+
+last_cache_hit_undefined_before_any_request_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        ?assertEqual(undefined, erllama:last_cache_hit(<<"test_model">>))
+    end).
+
+last_cache_hit_after_cold_admission_reports_cold_test() ->
+    %% Cold admission populates the obs row with kind=cold and
+    %% prefix_len=0. Distinct from `undefined` (model never
+    %% admitted anything) so external routers can tell them apart.
+    with_model(#{}, fun(_Cfg) ->
+        {ok, _} = erllama_model:complete(<<"test_model">>, long_prompt(), #{
+            response_tokens => 2
+        }),
+        ?assertEqual(
+            #{kind => cold, prefix_len => 0},
+            erllama:last_cache_hit(<<"test_model">>)
+        )
+    end).
+
+last_cache_hit_after_warm_resume_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        Tokens = prompt_tokens(long_prompt()),
+        {ok, #{finish_key := FinishKey}} =
+            erllama_model:prefill_only(<<"test_model">>, Tokens),
+        ?assertMatch({ok, _Row}, wait_for_key(FinishKey, 1000)),
+        %% Resume from FinishKey: the exact key for `Tokens` is now
+        %% in the cache, so lookup_or_resume hits the exact path
+        %% before consulting parent_key.
+        {ok, _} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{
+                parent_key => FinishKey,
+                response_tokens => 2
+            }
+        ),
+        Hit = erllama:last_cache_hit(<<"test_model">>),
+        ?assertMatch(#{kind := exact, prefix_len := _}, Hit),
+        #{prefix_len := PrefixLen} = Hit,
+        ?assertEqual(length(Tokens), PrefixLen)
+    end).
+
+model_info_carries_phase_and_pending_len_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        Info = erllama_model:model_info(<<"test_model">>),
+        ?assertEqual(idle, maps:get(phase, Info)),
+        ?assertEqual(0, maps:get(pending_len, Info)),
+        ?assertEqual(undefined, maps:get(last_cache_hit, Info)),
+        %% Existing keys preserved.
+        ?assertEqual(idle, maps:get(status, Info))
     end).
 
 %% =============================================================================

@@ -232,7 +232,12 @@ stubs get replaced; the cache integration is unaffected.
     cancel_pending = false :: boolean(),
     prefill_started_at :: integer() | undefined,
     generation_started_at :: integer() | undefined,
-    cache_hit_kind = cold :: cache_hit_kind()
+    cache_hit_kind = cold :: cache_hit_kind(),
+    %% Length of the warm prefix matched on admission. Captured at
+    %% lookup_or_resume time so the observability snapshot can carry
+    %% a richer routing signal than the kind alone. 0 for cold or
+    %% before any request has been admitted.
+    cache_hit_prefix_len = 0 :: non_neg_integer()
 }).
 
 %% =============================================================================
@@ -482,8 +487,12 @@ verify(Model, PrefixTokens, Candidates, K) ->
 init([ModelId, Config]) ->
     Backend = maps:get(backend, Config, erllama_model_stub),
     case Backend:init(Config) of
-        {ok, BState} -> {ok, idle, build_init_data(ModelId, Config, Backend, BState)};
-        {error, Reason} -> {stop, Reason}
+        {ok, BState} ->
+            Data = build_init_data(ModelId, Config, Backend, BState),
+            ok = obs_install_initial(Data),
+            {ok, idle, Data};
+        {error, Reason} ->
+            {stop, Reason}
     end.
 
 build_init_data(ModelId, Config, Backend, BState) ->
@@ -547,7 +556,8 @@ resolve_policy(Config) ->
     },
     maps:merge(Defaults, maps:get(policy, Config, #{})).
 
-terminate(_Reason, _State, #data{backend = B, backend_state = S}) ->
+terminate(_Reason, _State, #data{model_id = ModelId, backend = B, backend_state = S}) ->
+    _ = erllama_inflight:obs_delete(ModelId),
     B:terminate(S),
     ok;
 terminate(_Reason, _State, _Data) ->
@@ -701,11 +711,12 @@ enter_after_lookup(ParentKey, Data) ->
             ok = prime_logits(ContextTokens, RemainingTokens, Data),
             Data1 = Data#data{
                 context_tokens = ContextTokens ++ RemainingTokens,
-                cache_hit_kind = HitKind
+                cache_hit_kind = HitKind,
+                cache_hit_prefix_len = length(ContextTokens)
             },
             after_prefill(Data1);
         cold ->
-            Data1 = Data#data{cache_hit_kind = cold},
+            Data1 = Data#data{cache_hit_kind = cold, cache_hit_prefix_len = 0},
             enter_prefilling(Data1)
     end.
 
@@ -741,18 +752,24 @@ generating(EventType, EventContent, Data) ->
 %% Common event handler
 %% =============================================================================
 
-handle_common(_State, {call, From}, {complete, Prompt, Opts}, Data) ->
+handle_common(State, {call, From}, {complete, Prompt, Opts}, Data) ->
     %% Concurrent calls are queued, not rejected. The head of the
     %% queue is dispatched whenever the state machine returns to
     %% idle. This preserves all cache integration semantics: the
     %% in-flight request finishes its lookups, saves, and pin-and-
     %% load against its own request_fp snapshot before the queued
     %% request even starts.
-    {keep_state, enqueue({complete, From, Prompt, Opts}, Data)};
-handle_common(_State, {call, From}, {prefill_only, PromptTokens}, Data) ->
-    {keep_state, enqueue({prefill_only, From, PromptTokens}, Data)};
-handle_common(_State, {call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
-    {keep_state, enqueue({infer, From, Tokens, Params, CallerPid}, Data)};
+    NewData = enqueue({complete, From, Prompt, Opts}, Data),
+    ok = obs_refresh(State, NewData),
+    {keep_state, NewData};
+handle_common(State, {call, From}, {prefill_only, PromptTokens}, Data) ->
+    NewData = enqueue({prefill_only, From, PromptTokens}, Data),
+    ok = obs_refresh(State, NewData),
+    {keep_state, NewData};
+handle_common(State, {call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
+    NewData = enqueue({infer, From, Tokens, Params, CallerPid}, Data),
+    ok = obs_refresh(State, NewData),
+    {keep_state, NewData};
 handle_common(_State, cast, {cancel, Ref}, Data = #data{request_ref = Ref}) ->
     {keep_state, Data#data{cancel_pending = true}};
 handle_common(_State, cast, {cancel, _OtherRef}, Data) ->
@@ -975,11 +992,27 @@ maybe_seq_clear(#data{backend = Mod, backend_state = S}) ->
     end.
 
 build_model_info(State, Data) ->
+    %% Mirror the obs-row semantics so `model_info/1` and the
+    %% lock-free accessors (`erllama:last_cache_hit/1`, etc.) agree
+    %% on what counts as "no admission yet". The obs row starts with
+    %% `undefined` kind at init and is only mutated by
+    %% lookup_or_resume on a real admission.
+    LastHit =
+        case erllama_inflight:obs_get(Data#data.model_id) of
+            {_Id, _Phase, _Pending, undefined, _PrefixLen} -> undefined;
+            {_Id, _Phase, _Pending, Kind, PrefixLen} -> #{kind => Kind, prefix_len => PrefixLen};
+            undefined -> undefined
+        end,
     #{
         id => Data#data.model_id,
         model_id => Data#data.model_id,
         pid => self(),
         status => State,
+        %% Alias for `status`; matches the obs table vocabulary used
+        %% by `erllama:phase/1` and the cluster router.
+        phase => State,
+        pending_len => length(Data#data.pending),
+        last_cache_hit => LastHit,
         backend => Data#data.backend,
         context_size => Data#data.context_size,
         quant_type => Data#data.quant_type,
@@ -994,10 +1027,37 @@ build_model_info(State, Data) ->
     }.
 
 %% =============================================================================
+%% Internal: observability snapshot (per-model ETS row)
+%% =============================================================================
+
+%% Row shape: {ModelId, Phase, PendingLen, LastCacheHitKind, LastCacheHitPrefixLen}.
+%% The initial row carries `undefined` for the last-hit kind so external
+%% routers can distinguish "model has never admitted a request" from
+%% "model's last admission was cold" — both are valid signals.
+obs_install_initial(Data) ->
+    Row = {Data#data.model_id, idle, 0, undefined, 0},
+    _ = erllama_inflight:obs_put(Data#data.model_id, Row),
+    ok.
+
+obs_refresh(Phase, Data) ->
+    _ = erllama_inflight:obs_put(Data#data.model_id, obs_row(Phase, Data)),
+    ok.
+
+obs_row(Phase, Data) ->
+    {
+        Data#data.model_id,
+        Phase,
+        length(Data#data.pending),
+        Data#data.cache_hit_kind,
+        Data#data.cache_hit_prefix_len
+    }.
+
+%% =============================================================================
 %% Internal: state transitions
 %% =============================================================================
 
 enter_prefilling(Data) ->
+    ok = obs_refresh(prefilling, Data),
     %% Reset seq 0 so the cold prefill starts at position 0.
     %% llama_batch_get_one auto-positions the new batch starting at
     %% n_past, so without this guard the second cold request on the
@@ -1030,6 +1090,7 @@ enter_generating(Data) ->
         last_save_at = length(Data#data.context_tokens),
         generation_started_at = erlang:monotonic_time(millisecond)
     },
+    ok = obs_refresh(generating, Data1),
     gen_statem:cast(self(), decode_step),
     {next_state, generating, Data1}.
 
@@ -1112,7 +1173,10 @@ reset(Data) ->
         cancel_pending = false,
         prefill_started_at = undefined,
         generation_started_at = undefined,
-        cache_hit_kind = cold,
+        %% Keep the last cache_hit_* values around so the obs row
+        %% (which is read by external routers between requests)
+        %% still reflects the most recent admission rather than
+        %% reverting to "cold" every time we return to idle.
         context_tokens = [],
         prompt_tokens = [],
         generated = [],
@@ -1193,8 +1257,11 @@ finish_key_or_undefined(skipped) -> undefined.
 %% the state machine started.
 return_to_idle(Data, Actions) ->
     case Data#data.pending of
-        [] -> {next_state, idle, Data, Actions};
-        [Head | Rest] -> dispatch_pending(Head, Data#data{pending = Rest}, Actions)
+        [] ->
+            ok = obs_refresh(idle, Data),
+            {next_state, idle, Data, Actions};
+        [Head | Rest] ->
+            dispatch_pending(Head, Data#data{pending = Rest}, Actions)
     end.
 
 dispatch_pending({complete, From, Prompt, Opts}, Data, Actions) ->
