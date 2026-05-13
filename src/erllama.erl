@@ -65,6 +65,10 @@ an explicit `model_id` in the config map.
     counters/0,
     vram_info/0,
     queue_depth/0,
+    queue_depth/1,
+    pending_len/1,
+    phase/1,
+    last_cache_hit/1,
     list_cached_prefixes/2,
     draft_tokens/3,
     verify/4
@@ -368,6 +372,83 @@ client-side outgoing-request counters.
 -spec queue_depth() -> non_neg_integer().
 queue_depth() ->
     erllama_inflight:queue_depth().
+
+-doc """
+Per-model inflight count. Counts only admitted streaming requests
+(`infer/4`); for pending FIFO depth (calls queued inside the model
+gen_statem behind an in-flight request) use `pending_len/1`.
+
+Returns 0 if the model is not loaded.
+""".
+-spec queue_depth(model_id()) -> non_neg_integer().
+queue_depth(ModelId) when is_binary(ModelId) ->
+    case erllama_registry:whereis_name(ModelId) of
+        undefined -> 0;
+        Pid -> erllama_inflight:queue_depth(Pid)
+    end.
+
+-doc """
+Lock-free per-model snapshot of the gen_statem's pending FIFO
+length — i.e. how many `complete/2,3`, `prefill_only/2`, and
+`infer/4` calls are queued behind whatever the model is currently
+running. Returns 0 if the model is idle or not loaded.
+
+Reads a named public ETS row written by the model on every queue
+mutation; the call does not cross the model gen_statem, so it
+returns instantly even while a decode step is in flight. That
+matters: the whole point of asking "is this model busy?" is to
+answer without serialising behind the work you are probing.
+
+Used by `erllama_cluster` routers to bin-pack requests onto the
+least-loaded node.
+""".
+-spec pending_len(model_id()) -> non_neg_integer().
+pending_len(ModelId) when is_binary(ModelId) ->
+    case erllama_inflight:obs_get(ModelId) of
+        {_Id, _Phase, PendingLen, _Kind, _PrefixLen} -> PendingLen;
+        undefined -> 0
+    end.
+
+-doc """
+Lock-free per-model phase snapshot. Returns `idle`, `prefilling`,
+or `generating`; falls back to `idle` if the model is not loaded.
+
+Like `pending_len/1`, this reads a public ETS row without crossing
+the model gen_statem.
+""".
+-spec phase(model_id()) -> idle | prefilling | generating.
+phase(ModelId) when is_binary(ModelId) ->
+    case erllama_inflight:obs_get(ModelId) of
+        {_Id, Phase, _, _, _} -> Phase;
+        undefined -> idle
+    end.
+
+-doc """
+Lock-free snapshot of the model's most recent cache-hit summary:
+the kind (`exact | partial | cold`) and the warm prefix token count.
+Returns `undefined` if the model has not admitted any request yet
+or is not loaded.
+
+A `cold` kind with `prefix_len = 0` means the previous admission
+took the full cold path; an `exact` kind means token-exact warm
+restore; `partial` means a longest-prefix walk hit at `prefix_len`
+tokens.
+
+Used by cache-affinity routers to bias new requests toward the node
+whose last admission for this model produced the longest warm
+prefix.
+""".
+-spec last_cache_hit(model_id()) ->
+    #{kind := exact | partial | cold, prefix_len := non_neg_integer()} | undefined.
+last_cache_hit(ModelId) when is_binary(ModelId) ->
+    case erllama_inflight:obs_get(ModelId) of
+        {_Id, _Phase, _Pending, undefined, _PrefixLen} ->
+            undefined;
+        {_Id, _Phase, _Pending, Kind, PrefixLen} ->
+            #{kind => Kind, prefix_len => PrefixLen};
+        undefined ->
+            undefined
+    end.
 
 -doc """
 Probe how much of `PromptTokens` is already cached for `ModelId`
