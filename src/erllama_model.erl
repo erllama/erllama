@@ -912,58 +912,58 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Data) ->
 setup_lookup(Req, ParentKey, Data) ->
     case lookup_or_resume(Req#req.prompt_tokens, ParentKey, Req, Data) of
         {warm, ContextTokens, RemainingTokens, HitKind} ->
-            ok = warm_restore_primer(Req#req.seq_id, ContextTokens, Data),
-            N = length(ContextTokens),
-            case ContextTokens of
-                [] ->
-                    %% Empty warm prefix shouldn't happen but handle it
-                    %% as cold for safety.
-                    Req#req{
-                        prefill_cursor = RemainingTokens,
-                        context_tokens = [],
-                        cache_hit_kind = HitKind,
-                        cache_hit_prefix_len = 0
-                    };
-                _ ->
-                    Last = lists:last(ContextTokens),
-                    Kept = lists:sublist(ContextTokens, N - 1),
-                    Req#req{
-                        prefill_cursor = [Last | RemainingTokens],
-                        context_tokens = Kept,
-                        cache_hit_kind = HitKind,
-                        cache_hit_prefix_len = N
-                    }
-            end;
+            setup_warm(Req, ContextTokens, RemainingTokens, HitKind, Data);
         cold ->
-            %% Reset the seq's KV before a cold prefill — its
-            %% per_seq.next_pos must start at 0. The NIF's
-            %% kv_seq_rm refreshes the per-seq tracking.
-            ok = backend_seq_clear(Req#req.seq_id, Data),
-            %% Cold path splits into trimmed-prefix (the cold save
-            %% target) + remainder. The trim prefills first so the
-            %% kv_pack at save time captures exactly the trim's KV
-            %% state; only after that fires do we prefill the
-            %% remainder. With no_save the whole prompt prefills in
-            %% one tick and no cold save runs.
-            Tokens = Req#req.prompt_tokens,
-            case erllama_cache_policy:cold_save_split(Tokens, Data#data.policy) of
-                {trim, TrimmedPrefix, RemainingTokens} ->
-                    Req#req{
-                        prefill_cursor = TrimmedPrefix,
-                        cold_save_remaining = RemainingTokens,
-                        context_tokens = [],
-                        cache_hit_kind = cold,
-                        cache_hit_prefix_len = 0
-                    };
-                no_save ->
-                    Req#req{
-                        prefill_cursor = Tokens,
-                        cold_save_remaining = undefined,
-                        context_tokens = [],
-                        cache_hit_kind = cold,
-                        cache_hit_prefix_len = 0
-                    }
-            end
+            setup_cold(Req, Data)
+    end.
+
+setup_warm(Req, ContextTokens, RemainingTokens, HitKind, Data) ->
+    ok = warm_restore_primer(Req#req.seq_id, ContextTokens, Data),
+    N = length(ContextTokens),
+    case ContextTokens of
+        [] ->
+            Req#req{
+                prefill_cursor = RemainingTokens,
+                context_tokens = [],
+                cache_hit_kind = HitKind,
+                cache_hit_prefix_len = 0
+            };
+        _ ->
+            Last = lists:last(ContextTokens),
+            Kept = lists:sublist(ContextTokens, N - 1),
+            Req#req{
+                prefill_cursor = [Last | RemainingTokens],
+                context_tokens = Kept,
+                cache_hit_kind = HitKind,
+                cache_hit_prefix_len = N
+            }
+    end.
+
+%% Reset the seq's KV before a cold prefill so per_seq.next_pos
+%% starts at 0, then split the prompt per the cold-save policy.
+%% The trim slice goes into prefill_cursor; the remainder is held
+%% in cold_save_remaining and rotated in by maybe_fire_cold_save
+%% after the trim's prefill tick has fired the save.
+setup_cold(Req, Data) ->
+    ok = backend_seq_clear(Req#req.seq_id, Data),
+    Tokens = Req#req.prompt_tokens,
+    case erllama_cache_policy:cold_save_split(Tokens, Data#data.policy) of
+        {trim, TrimmedPrefix, RemainingTokens} ->
+            Req#req{
+                prefill_cursor = TrimmedPrefix,
+                cold_save_remaining = RemainingTokens,
+                context_tokens = [],
+                cache_hit_kind = cold,
+                cache_hit_prefix_len = 0
+            };
+        no_save ->
+            Req#req{
+                prefill_cursor = Tokens,
+                cold_save_remaining = undefined,
+                context_tokens = [],
+                cache_hit_kind = cold,
+                cache_hit_prefix_len = 0
+            }
     end.
 
 %% Wipe seq's KV state so prefill starts at position 0. Used on the
