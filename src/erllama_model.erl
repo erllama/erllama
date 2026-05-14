@@ -6,27 +6,112 @@
 Per-model gen_statem that drives the request flow and wires the
 cache subsystem into the model lifecycle.
 
-State machine (v0.1):
+## State machine
 
 ```
-  idle ──complete──▶ prefilling ──prefill_done──▶ generating ──finish──▶ idle
+  ┌──── admit (idle_seq_ids non-empty)
+  │     ┌──── admit (queues in pending when idle_seq_ids empty)
+  │     │     ┌──── cast tick (self)
+  ▼     ▼     │
+ idle ──────▶ running ─────┐
+  ▲                        │
+  └────── all reqs finished (req_table = #{} AND pending = [])
 ```
 
-On the `prefilling → generating` transition the model fires a
-**cold** save (boundary-trimmed prefix, async). Inside `generating`
-it fires a **finish** save (full live token list, async) just
-before returning to `idle`.
+Two states only:
 
-The `continued` save reason (every N tokens of new generation),
-the `evict` save reason (driven by an external scheduler), and the
-`shutdown` save reason (driven by `application:prep_stop`) are
-defined in `erllama_cache_policy` but not yet wired here; they
-land in follow-up steps.
+- `idle/3` — `req_table` is empty AND `pending` is empty. Accepts
+  admit events (complete, prefill_only, infer) and transitions to
+  `running`. Verifies and other read-only ops are allowed.
+- `running/3` — one or more `#req{}` are in flight. Accepts further
+  admit events (allocate seq_id from `idle_seq_ids` or enqueue in
+  `pending`), cancel casts, and the internal `tick` cast. Verify
+  is refused with `{error, busy}` because it mutates the context.
 
-Model operations (tokenize, prefill, decode, kv_pack, kv_unpack)
-are stubbed — the gen_statem's `tokens` field IS the "context".
-When step 2b lands the real `erllama_nif` for llama.cpp, those
-stubs get replaced; the cache integration is unaffected.
+## Per-request lifecycle
+
+```
+  admit                  step_tick                step_tick               finish_req
+  ─────▶ req_table       ──────▶ prefilling       ──────▶ decoding        ────────▶
+         (new #req,              (prefill_cursor          (prefill_cursor
+          seq_id popped           non-empty,              undefined,
+          from                    backend:step             backend:step
+          idle_seq_ids,           pushes slice             samples one
+          sampler built,          to KV)                   token + decodes)
+          warm/cold path
+          chosen)
+```
+
+Each `#req` records its own `seq_id`, sampler_ref, prompt_tokens,
+context_tokens, prefill_cursor, generated, response_target,
+cache_hit_kind, and finishing flag. The `req_table` map is keyed
+by seq_id.
+
+## step_tick driver
+
+Every tick (one llama_decode call) builds a co-batched op list:
+
+  - For each `#req` with `prefill_cursor =/= undefined`, append
+    `{seq_id, {prefill, Slice}}`.
+  - For each `#req` with `prefill_cursor =:= undefined` and a
+    sampler_ref, append `{seq_id, {decode, sampler_ref}}`.
+
+The op list is bounded by `total_batch_budget` (`context_opts.n_batch`):
+decode rows are kept whole, prefill rows are sliced head-first
+until the sum fits. The NIF returns `{seq_id, prefilled}` or
+`{seq_id, {token, T, EogFlag}}` per row; results land back in the
+respective `#req`. Reqs that reach `response_target` tokens, an
+eog flag, or a cancel get `finishing = true` and finalise in the
+post-step finisher walk (`finish_marked_reqs/2`).
+
+## Per-tick batch budget
+
+`step_tick/1` enforces total tokens ≤ `total_batch_budget` (mirrors
+`context_opts.n_batch`, default 512). If `total_batch_budget` is
+smaller than the number of in-flight decoders, the gen_statem
+crashes deliberately so the supervisor restarts and the operator
+fixes `n_batch` / `n_seq_max`. Otherwise prefill rows are sliced
+head-first to fit; truncated tails resume next tick.
+
+## Cache save reasons
+
+- **cold**: fired right after a fresh prompt's prefill completes,
+  before any decoding. Saves the trimmed prefix the policy
+  produces from `cold_save_split/2`. Per-#req — each new admit
+  fires its own cold save at most once.
+- **continued**: fired every `continued_interval` tokens during
+  decode. Per-#req, gated on the request's `last_save_at`.
+- **finish**: fired when the request finishes (success, length
+  limit, eog, or cancel). Saves the full context_tokens.
+- **evict** / **shutdown**: fired by external triggers and walks
+  every in-flight #req, firing one save per non-empty
+  context_tokens.
+
+All saves go through `fire_save_if/5` which calls
+`backend:kv_pack/3` against the request's seq_id and hands the
+binary off to `erllama_cache_writer`.
+
+## Concurrency contract
+
+The gen_statem is the sole writer of the context's KV cells: every
+`backend:step/2` and `kv_pack` / `kv_unpack` / `seq_rm` call runs
+inside a state callback, so the AGENTS.md paused-context invariant
+holds — `kv_pack` only runs between ticks when no `llama_decode`
+is in flight. Default `n_seq_max => 1` collapses this to the v0.2
+single-tenant flow bit-identically; opting in via
+`context_opts.n_seq_max > 1` lets up to N requests run
+concurrently through one decode call per tick.
+
+## Backwards compatibility
+
+- Public API (`complete/2,3`, `prefill_only/2`, `infer/4`,
+  `cancel/1`, `status/1`, `model_info/1`, `verify/4`, etc.) is
+  unchanged.
+- Default `n_seq_max => 1` keeps single-tenant behaviour
+  bit-identical to v0.2; multi-tenancy is opt-in.
+- `phase` on the obs row and in `model_info/1` is still
+  `idle | prefilling | generating`, computed from the dominant
+  phase across in-flight reqs (`dominant_phase/1`).
 """.
 -behaviour(gen_statem).
 
@@ -177,7 +262,57 @@ stubs get replaced; the cache integration is unaffected.
 ]).
 
 %% State callbacks
--export([idle/3, prefilling/3, generating/3]).
+-export([idle/3, running/3]).
+
+%% Per-request state. The scheduler holds one #req per in-flight
+%% request, indexed by seq_id in #data.req_table. With the default
+%% `n_seq_max => 1` exactly one request runs at a time; with
+%% n_seq_max > 1 the scheduler co-batches multiple in-flight reqs
+%% into one llama_decode tick.
+-record(req, {
+    seq_id :: non_neg_integer(),
+    mode :: standard | streaming | prefill_only,
+    caller :: gen_statem:from() | undefined,
+    caller_pid :: pid() | undefined,
+    request_ref :: reference() | undefined,
+    cancel_pending = false :: boolean(),
+    prompt_tokens :: [non_neg_integer()],
+    %% Tokens already pushed into KV for this request (warm prefix
+    %% from cache + every prefill slice + every decoded token).
+    context_tokens :: [non_neg_integer()],
+    response_target :: non_neg_integer(),
+    generated :: [non_neg_integer()],
+    last_save_at :: non_neg_integer(),
+    %% Tokens still to push through prefill. `undefined` means the
+    %% request is decode-ready. A non-empty list means step_tick
+    %% will continue prefilling these on the next tick.
+    prefill_cursor = undefined :: [non_neg_integer()] | undefined,
+    %% effective_fp snapshot captured at admission so a mid-request
+    %% adapter mutation cannot shift the cache identity for this
+    %% in-flight request.
+    request_fp :: <<_:256>> | undefined,
+    cache_hit_kind = cold :: cache_hit_kind(),
+    cache_hit_prefix_len = 0 :: non_neg_integer(),
+    prefill_started_at :: integer() | undefined,
+    generation_started_at :: integer() | undefined,
+    %% Per-request sampler chain handle. `undefined` for prefill_only.
+    sampler_ref :: term() | undefined,
+    last_sampler_cfg = undefined :: map() | undefined,
+    %% Tokens to prefill AFTER the next cold save fires. Cold-save
+    %% policy splits the prompt into a trimmed prefix (which lands
+    %% as the cold save) and a remainder. The trimmed prefix goes
+    %% into prefill_cursor; this field holds the remainder. After
+    %% the trim's prefill tick fires the cold save, this gets
+    %% rotated into prefill_cursor on the next tick. `undefined`
+    %% when no cold save is pending (no_save policy, prefill_only
+    %% mode, or warm-restore path).
+    cold_save_remaining = undefined :: undefined | [non_neg_integer()],
+    %% Set when this request has emitted its final result. The next
+    %% step_tick iteration drops it from req_table; deferring the
+    %% removal lets the tick walk results without mid-iteration
+    %% mutation of req_table.
+    finishing = false :: boolean()
+}).
 
 -record(data, {
     model_id :: binary(),
@@ -206,50 +341,39 @@ stubs get replaced; the cache integration is unaffected.
     %% pairs of sha+scale). Recomputed on every attachment change.
     adapters = [] :: [#{handle := term(), sha := <<_:256>>, scale := float()}],
     effective_fp :: <<_:256>>,
-    %% Per-request fields
-    caller :: gen_statem:from() | undefined,
-    prompt_tokens :: [non_neg_integer()],
-    %% Tokens currently in the "context".
-    context_tokens :: [non_neg_integer()],
-    response_target :: non_neg_integer(),
-    generated :: [non_neg_integer()],
-    last_save_at :: non_neg_integer(),
-    %% effective_fp captured at request admission. Cache lookups and
-    %% saves run against this snapshot so a mid-request adapter
-    %% mutation can't corrupt the cache identity for the in-flight
-    %% request.
-    request_fp :: <<_:256>> | undefined,
-    %% FIFO queue of pending complete/infer calls that arrived while
-    %% the model was already busy. The head is dispatched on every
-    %% transition back to `idle`. Each entry is one of:
+    %% In-flight requests indexed by seq_id. Empty when the model
+    %% is idle.
+    req_table = #{} :: #{non_neg_integer() => #req{}},
+    %% Free list of seq_ids available for admission. Initialised to
+    %% [0, 1, ..., n_seq_max - 1] at init/1; head-pop on admit,
+    %% head-push on finish.
+    idle_seq_ids = [0] :: [non_neg_integer()],
+    %% Total seq_ids available; mirrors `context_opts.n_seq_max`.
+    %% Default 1 keeps single-tenant behaviour bit-identical.
+    n_seq_max = 1 :: pos_integer(),
+    %% Maximum total tokens per step tick. Bounds the co-batched
+    %% llama_decode so the NIF never exceeds the context's n_batch.
+    %% Mirrors `context_opts.n_batch`; step_tick slices prefill rows
+    %% if needed to fit.
+    total_batch_budget = 512 :: pos_integer(),
+    %% Snapshot of the last cache hit for the obs row. Updated on
+    %% admission; survives across requests so external routers can
+    %% read it between admissions.
+    last_cache_hit_kind = undefined :: cache_hit_kind() | undefined,
+    last_cache_hit_prefix_len = 0 :: non_neg_integer(),
+    %% Snapshot of the sampler-config map fed to backend:sampler_new
+    %% on the most recent admission. Test-visible via
+    %% `get_last_sampler_cfg/1`.
+    last_sampler_cfg = undefined :: map() | undefined,
+    %% Test-visible holdover so erllama_sampler_tests can inspect
+    %% the current sampler_ref after a complete returns.
+    last_sampler_ref = undefined :: term() | undefined,
+    %% FIFO queue of admits that arrived while idle_seq_ids was
+    %% empty. Each entry is one of:
     %%   {complete, From, Prompt, Opts}
-    %%   {infer,    From, Tokens, Params, CallerPid}
-    pending = [] :: [pending_request()],
-    %% Streaming-mode fields (set by infer/4, unset by complete/2,3).
-    %% `prefill_only` short-circuits the generating state and replies
-    %% with the warm-restore key as soon as the prompt is in KV.
-    mode = standard :: standard | streaming | prefill_only,
-    caller_pid :: pid() | undefined,
-    request_ref :: reference() | undefined,
-    cancel_pending = false :: boolean(),
-    prefill_started_at :: integer() | undefined,
-    generation_started_at :: integer() | undefined,
-    cache_hit_kind = cold :: cache_hit_kind(),
-    %% Length of the warm prefix matched on admission. Captured at
-    %% lookup_or_resume time so the observability snapshot can carry
-    %% a richer routing signal than the kind alone. 0 for cold or
-    %% before any request has been admitted.
-    cache_hit_prefix_len = 0 :: non_neg_integer(),
-    %% Per-request sampler chain handle built at admit time and
-    %% freed at finish. `undefined` for prefill_only mode (no
-    %% sampling needed) and between requests. Held opaquely; the
-    %% backend defines the underlying type.
-    sampler_ref :: term() | undefined,
-    %% Snapshot of the sampler-config map fed to backend:sampler_new.
-    %% Test-only; exposed via `get_last_sampler_cfg/1` so the
-    %% sampler-plumbing tests can assert what landed on the backend
-    %% without poking at the (opaque) sampler_ref.
-    last_sampler_cfg = undefined :: map() | undefined
+    %%   {prefill_only, From, PromptTokens}
+    %%   {infer, From, Tokens, Params, CallerPid}
+    pending = [] :: [pending_request()]
 }).
 
 %% =============================================================================
@@ -486,7 +610,7 @@ get_last_sampler_cfg(Model) ->
 -doc false.
 get_request_sampler_ref(Model) ->
     {_State, Data} = sys:get_state(via(Model)),
-    Data#data.sampler_ref.
+    Data#data.last_sampler_ref.
 
 %% Snapshot of the cache key triple a probe needs to hit the
 %% cache for this model's current state. Effective fingerprint
@@ -526,6 +650,9 @@ init([ModelId, Config]) ->
 
 build_init_data(ModelId, Config, Backend, BState) ->
     Fp = maps:get(fingerprint, Config, default_fingerprint()),
+    CtxOpts = maps:get(context_opts, Config, #{}),
+    NSeqMax = maps:get(n_seq_max, CtxOpts, 1),
+    NBatch = maps:get(n_batch, CtxOpts, 512),
     #data{
         model_id = ModelId,
         tier_srv = maps:get(tier_srv, Config, erllama_cache_ram),
@@ -543,11 +670,10 @@ build_init_data(ModelId, Config, Backend, BState) ->
         effective_fp = Fp,
         loaded_at_monotonic = erlang:monotonic_time(nanosecond),
         vram_estimate_b = compute_vram_estimate(Backend, BState),
-        prompt_tokens = [],
-        context_tokens = [],
-        response_target = 0,
-        generated = [],
-        last_save_at = 0
+        req_table = #{},
+        idle_seq_ids = lists:seq(0, NSeqMax - 1),
+        n_seq_max = NSeqMax,
+        total_batch_budget = max(1, NBatch)
     }.
 
 %% Best-effort: ask the backend for the byte size, total layer count,
@@ -618,11 +744,11 @@ default_ctx_params_hash() ->
 %% =============================================================================
 
 idle({call, From}, {complete, Prompt, Opts}, Data) ->
-    start_complete(From, Prompt, Opts, Data);
+    admit({complete, From, Prompt, Opts}, Data);
 idle({call, From}, {prefill_only, PromptTokens}, Data) ->
-    start_prefill_only(From, PromptTokens, Data);
+    admit({prefill_only, From, PromptTokens}, Data);
 idle({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
-    start_infer(From, Tokens, Params, CallerPid, Data);
+    admit({infer, From, Tokens, Params, CallerPid}, Data);
 idle({call, From}, status, Data) ->
     {keep_state, Data, [{reply, From, idle}]};
 idle({call, From}, {verify, PrefixTokens, Candidates, K}, Data) ->
@@ -637,6 +763,31 @@ idle({call, From}, {verify, PrefixTokens, Candidates, K}, Data) ->
 idle(EventType, EventContent, Data) ->
     handle_common(idle, EventType, EventContent, Data).
 
+%% =============================================================================
+%% State: running (one or more in-flight requests)
+%% =============================================================================
+
+running({call, From}, {complete, Prompt, Opts}, Data) ->
+    admit({complete, From, Prompt, Opts}, Data);
+running({call, From}, {prefill_only, PromptTokens}, Data) ->
+    admit({prefill_only, From, PromptTokens}, Data);
+running({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
+    admit({infer, From, Tokens, Params, CallerPid}, Data);
+running({call, From}, status, Data) ->
+    %% Phase reported is the dominant phase across in-flight reqs:
+    %% if any seq is still prefilling, report `prefilling`; else
+    %% `generating`. Empty req_table only happens between ticks.
+    Phase = dominant_phase(Data),
+    {keep_state, Data, [{reply, From, Phase}]};
+running({call, From}, {verify, _, _, _}, Data) ->
+    %% Verify mutates the live context; refuse while any seq is in
+    %% flight to keep the snapshot/restore invariant intact.
+    {keep_state, Data, [{reply, From, {error, busy}}]};
+running(cast, tick, Data) ->
+    step_tick(Data);
+running(EventType, EventContent, Data) ->
+    handle_common(running, EventType, EventContent, Data).
+
 run_verify(PrefixTokens, Candidates, K, Data) ->
     Backend = Data#data.backend,
     case erlang:function_exported(Backend, verify, 4) of
@@ -649,157 +800,275 @@ run_verify(PrefixTokens, Candidates, K, Data) ->
 public_verify_reply({ok, Accepted, NextToken, _NewBState}) ->
     {ok, Accepted, NextToken}.
 
-start_complete(From, Prompt, Opts, Data) ->
+%% Admit one pending_request(). Pops a seq_id from idle_seq_ids and
+%% kicks the request off; if no seq_ids are free, queues in
+%% `pending` (the caller's gen_statem:call still blocks since we do
+%% not reply until the queued request is eventually started).
+admit(Item, Data = #data{idle_seq_ids = []}) ->
+    %% No seq_ids available — queue. The caller stays blocked on
+    %% gen_statem:call until step_tick frees a slot and the
+    %% dispatch path runs this admit. For streaming infer/4 the
+    %% caller still doesn't get its Ref until then.
+    NewData = enqueue(Item, Data),
+    case Data#data.req_table of
+        Empty when map_size(Empty) =:= 0 -> {next_state, idle, NewData};
+        _ -> {keep_state, NewData}
+    end;
+admit(Item, Data = #data{idle_seq_ids = [SeqId | Rest]}) ->
+    case start_request(Item, SeqId, Data#data{idle_seq_ids = Rest}) of
+        {ok, NewData, Actions} ->
+            schedule_tick(),
+            {next_state, running, NewData, Actions};
+        {error, Reason, From} ->
+            %% Sampler build or pre-validation failed. Return the
+            %% seq_id to the free list and reply to the caller.
+            Data1 = Data#data{idle_seq_ids = [SeqId | Rest]},
+            {keep_state, Data1, [{reply, From, {error, Reason}}]}
+    end.
+
+%% Build a #req for `Item`, run the cache lookup, install in
+%% req_table. Returns {ok, NewData, ReplyActions} on success or
+%% {error, Reason, From} on a synchronous-rejection path (e.g.
+%% sampler_new failed).
+start_request({complete, From, Prompt, Opts}, SeqId, Data) ->
     case sampler_for(Opts, Data) of
-        {ok, Data0} ->
+        {ok, SamplerRef, SamplerCfg, Data0} ->
             PromptTokens = backend_call(Data0, tokenize, [Prompt]),
-            Data1 = Data0#data{
+            Req = #req{
+                seq_id = SeqId,
                 mode = standard,
                 caller = From,
-                caller_pid = undefined,
-                request_ref = undefined,
-                cancel_pending = false,
                 prompt_tokens = PromptTokens,
                 response_target = maps:get(response_tokens, Opts, 4),
                 generated = [],
-                prefill_started_at = erlang:monotonic_time(millisecond),
-                %% Snapshot the effective fingerprint for the life of
-                %% the request. Any concurrent adapter mutation arriving
-                %% between tokens stays out of the cache identity until
-                %% this request finishes.
-                request_fp = Data0#data.effective_fp
+                last_save_at = 0,
+                context_tokens = [],
+                request_fp = Data0#data.effective_fp,
+                sampler_ref = SamplerRef,
+                last_sampler_cfg = SamplerCfg,
+                prefill_started_at = erlang:monotonic_time(millisecond)
             },
-            enter_after_lookup(maps:get(parent_key, Opts, undefined), Data1);
+            ParentKey = maps:get(parent_key, Opts, undefined),
+            Req1 = setup_lookup(Req, ParentKey, Data0),
+            Data1 = put_req(Data0, Req1),
+            {ok, snapshot_admission(Data1, Req1), []};
         {error, Reason} ->
-            {keep_state, Data, [{reply, From, {error, Reason}}]}
-    end.
-
-start_prefill_only(From, PromptTokens, Data) ->
-    %% prefill_only never samples, so no sampler_ref is built. Clear
-    %% any leftover from a prior request and proceed straight to the
-    %% lookup.
-    Data0 = sampler_release(Data),
-    Data1 = Data0#data{
+            {error, Reason, From}
+    end;
+start_request({prefill_only, From, PromptTokens}, SeqId, Data) ->
+    Req = #req{
+        seq_id = SeqId,
         mode = prefill_only,
         caller = From,
-        caller_pid = undefined,
-        request_ref = undefined,
-        cancel_pending = false,
         prompt_tokens = PromptTokens,
         response_target = 0,
         generated = [],
-        prefill_started_at = erlang:monotonic_time(millisecond),
+        last_save_at = 0,
+        context_tokens = [],
         request_fp = Data#data.effective_fp,
-        last_sampler_cfg = undefined
+        sampler_ref = undefined,
+        last_sampler_cfg = undefined,
+        prefill_started_at = erlang:monotonic_time(millisecond)
     },
-    enter_after_lookup(undefined, Data1).
-
-start_infer(From, Tokens, Params, CallerPid, Data) ->
-    Ref = make_ref(),
+    Req1 = setup_lookup(Req, undefined, Data),
+    Data1 = put_req(Data, Req1),
+    %% sampler_ref reset on the data-level holdover so
+    %% get_request_sampler_ref reflects current state.
+    Data2 = Data1#data{last_sampler_ref = undefined},
+    {ok, snapshot_admission(Data2, Req1), []};
+start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Data) ->
     case sampler_for(Params, Data) of
-        {ok, Data0} ->
+        {ok, SamplerRef, SamplerCfg, Data0} ->
+            Ref = make_ref(),
             ok = erllama_inflight:register(Ref, self()),
-            Data1 = Data0#data{
+            Req = #req{
+                seq_id = SeqId,
                 mode = streaming,
-                caller = undefined,
                 caller_pid = CallerPid,
                 request_ref = Ref,
-                cancel_pending = false,
                 prompt_tokens = Tokens,
                 response_target = maps:get(response_tokens, Params, 64),
                 generated = [],
-                prefill_started_at = erlang:monotonic_time(millisecond),
-                request_fp = Data0#data.effective_fp
+                last_save_at = 0,
+                context_tokens = [],
+                request_fp = Data0#data.effective_fp,
+                sampler_ref = SamplerRef,
+                last_sampler_cfg = SamplerCfg,
+                prefill_started_at = erlang:monotonic_time(millisecond)
             },
-            %% Reply with the ref before kicking off prefill so the caller is
-            %% guaranteed to have it before any erllama_token messages land.
             ParentKey = maps:get(parent_key, Params, undefined),
-            add_reply_action(From, {ok, Ref}, enter_after_lookup(ParentKey, Data1));
-        {error, _} = E ->
-            {keep_state, Data, [{reply, From, E}]}
+            Req1 = setup_lookup(Req, ParentKey, Data0),
+            Data1 = put_req(Data0, Req1),
+            {ok, snapshot_admission(Data1, Req1), [{reply, From, {ok, Ref}}]};
+        {error, Reason} ->
+            {error, Reason, From}
     end.
 
-%% Tack a {reply, From, Reply} action onto the gen_statem transition
-%% returned by enter_after_lookup. The lookup path always lands in
-%% enter_generating which returns the 3-tuple form; if that ever
-%% changes, add the corresponding clauses here.
-add_reply_action(From, Reply, {next_state, NextState, NewData}) ->
-    {next_state, NextState, NewData, [{reply, From, Reply}]}.
-
-%% Branches the lookup result into the correct gen_statem transition.
-%% Used by complete/2,3, infer/4, and prefill_only/2 paths. The
-%% `prefill_only` mode short-circuits at the end of prefill, skipping
-%% enter_generating entirely.
-enter_after_lookup(ParentKey, Data) ->
-    case lookup_or_resume(Data#data.prompt_tokens, ParentKey, Data) of
+%% Run the cache lookup for this request's prompt and set up the
+%% #req's `prefill_cursor` and `context_tokens` accordingly. The
+%% warm path runs the kv_unpack + seq_rm_last primer flow under
+%% the request's seq_id; the cold path leaves the full prompt in
+%% the prefill cursor.
+setup_lookup(Req, ParentKey, Data) ->
+    case lookup_or_resume(Req#req.prompt_tokens, ParentKey, Req, Data) of
         {warm, ContextTokens, RemainingTokens, HitKind} ->
-            ok = prime_logits(ContextTokens, RemainingTokens, Data),
-            Data1 = Data#data{
-                context_tokens = ContextTokens ++ RemainingTokens,
-                cache_hit_kind = HitKind,
-                cache_hit_prefix_len = length(ContextTokens)
-            },
-            after_prefill(Data1);
+            setup_warm(Req, ContextTokens, RemainingTokens, HitKind, Data);
         cold ->
-            Data1 = Data#data{cache_hit_kind = cold, cache_hit_prefix_len = 0},
-            enter_prefilling(Data1)
+            setup_cold(Req, Data)
     end.
 
-%% Branch point shared by warm and cold paths once prefill is done.
-%% In `prefill_only` mode the request finishes here without entering
-%% `generating`; otherwise the model proceeds to decode tokens.
-after_prefill(Data = #data{mode = prefill_only}) ->
-    finish_prefill_only(Data);
-after_prefill(Data) ->
-    enter_generating(Data).
+setup_warm(Req, ContextTokens, RemainingTokens, HitKind, Data) ->
+    ok = warm_restore_primer(Req#req.seq_id, ContextTokens, Data),
+    N = length(ContextTokens),
+    case ContextTokens of
+        [] ->
+            Req#req{
+                prefill_cursor = RemainingTokens,
+                context_tokens = [],
+                cache_hit_kind = HitKind,
+                cache_hit_prefix_len = 0
+            };
+        _ ->
+            Last = lists:last(ContextTokens),
+            Kept = lists:sublist(ContextTokens, N - 1),
+            Req#req{
+                prefill_cursor = [Last | RemainingTokens],
+                context_tokens = Kept,
+                cache_hit_kind = HitKind,
+                cache_hit_prefix_len = N
+            }
+    end.
 
-%% =============================================================================
-%% State: prefilling
-%% =============================================================================
+%% Reset the seq's KV before a cold prefill so per_seq.next_pos
+%% starts at 0, then split the prompt per the cold-save policy.
+%% The trim slice goes into prefill_cursor; the remainder is held
+%% in cold_save_remaining and rotated in by maybe_fire_cold_save
+%% after the trim's prefill tick has fired the save.
+setup_cold(Req, Data) ->
+    ok = backend_seq_clear(Req#req.seq_id, Data),
+    Tokens = Req#req.prompt_tokens,
+    case erllama_cache_policy:cold_save_split(Tokens, Data#data.policy) of
+        {trim, TrimmedPrefix, RemainingTokens} ->
+            Req#req{
+                prefill_cursor = TrimmedPrefix,
+                cold_save_remaining = RemainingTokens,
+                context_tokens = [],
+                cache_hit_kind = cold,
+                cache_hit_prefix_len = 0
+            };
+        no_save ->
+            Req#req{
+                prefill_cursor = Tokens,
+                cold_save_remaining = undefined,
+                context_tokens = [],
+                cache_hit_kind = cold,
+                cache_hit_prefix_len = 0
+            }
+    end.
 
-prefilling({call, From}, status, Data) ->
-    {keep_state, Data, [{reply, From, prefilling}]};
-prefilling(EventType, EventContent, Data) ->
-    handle_common(prefilling, EventType, EventContent, Data).
+%% Wipe seq's KV state so prefill starts at position 0. Used on the
+%% cold path to defend against leftover cells from a prior
+%% admission on this seq_id (single-tenant n_seq_max=1 reuses seq 0
+%% across requests).
+backend_seq_clear(SeqId, #data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, seq_rm, 2) of
+        true ->
+            _ = Mod:seq_rm(S, SeqId),
+            ok;
+        false ->
+            case erlang:function_exported(Mod, seq_clear, 1) of
+                true ->
+                    _ = Mod:seq_clear(S),
+                    ok;
+                false ->
+                    ok
+            end
+    end.
 
-%% =============================================================================
-%% State: generating
-%% =============================================================================
+%% Warm-restore primer: load the cached KV into this seq via
+%% kv_unpack, drop the last cell so the model layer can re-prefill
+%% it to refresh logits. Mirrors the v0.2 prime_logits/3 flow but
+%% per-seq.
+%%
+%% Both seq_rm_last arities take the seq's CURRENT length and
+%% remove the cell at position N-1 (via kv_seq_rm(SeqId, N-1, -1)).
+%% Passing N here, not 1: N is the cell-count after kv_unpack, and
+%% the backend uses N-1 as the start position for the removal.
+warm_restore_primer(_SeqId, [], _Data) ->
+    ok;
+warm_restore_primer(SeqId, ContextTokens, Data) ->
+    N = length(ContextTokens),
+    Mod = Data#data.backend,
+    S = Data#data.backend_state,
+    case erlang:function_exported(Mod, seq_rm_last, 3) of
+        true ->
+            _ = Mod:seq_rm_last(S, SeqId, N),
+            ok;
+        false ->
+            case erlang:function_exported(Mod, seq_rm_last, 2) of
+                true when SeqId =:= 0 ->
+                    _ = Mod:seq_rm_last(S, N),
+                    ok;
+                _ ->
+                    ok
+            end
+    end.
 
-generating({call, From}, status, Data) ->
-    {keep_state, Data, [{reply, From, generating}]};
-generating(cast, decode_step, Data) ->
-    decode_step(Data);
-generating(EventType, EventContent, Data) ->
-    handle_common(generating, EventType, EventContent, Data).
+%% Stash a snapshot of the cache_hit + sampler info from the most
+%% recent admission so the obs row and test accessors keep
+%% reporting it after the request finishes.
+snapshot_admission(Data, Req) ->
+    Data#data{
+        last_cache_hit_kind = Req#req.cache_hit_kind,
+        last_cache_hit_prefix_len = Req#req.cache_hit_prefix_len,
+        last_sampler_cfg = Req#req.last_sampler_cfg,
+        last_sampler_ref = Req#req.sampler_ref
+    }.
+
+schedule_tick() ->
+    gen_statem:cast(self(), tick).
+
+%% Report `prefilling` if any in-flight seq still has a non-empty
+%% prefill_cursor; otherwise `generating`. Empty req_table is only
+%% transient between ticks.
+dominant_phase(#data{req_table = T}) ->
+    Reqs = maps:values(T),
+    case Reqs of
+        [] ->
+            generating;
+        _ ->
+            HasPrefilling = lists:any(
+                fun(R) -> R#req.prefill_cursor =/= undefined end,
+                Reqs
+            ),
+            case HasPrefilling of
+                true -> prefilling;
+                false -> generating
+            end
+    end.
+
+put_req(Data, Req) ->
+    Data#data{req_table = maps:put(Req#req.seq_id, Req, Data#data.req_table)}.
+
+remove_req(Data, SeqId) ->
+    Data#data{req_table = maps:remove(SeqId, Data#data.req_table)}.
 
 %% =============================================================================
 %% Common event handler
 %% =============================================================================
 
-handle_common(State, {call, From}, {complete, Prompt, Opts}, Data) ->
-    %% Concurrent calls are queued, not rejected. The head of the
-    %% queue is dispatched whenever the state machine returns to
-    %% idle. This preserves all cache integration semantics: the
-    %% in-flight request finishes its lookups, saves, and pin-and-
-    %% load against its own request_fp snapshot before the queued
-    %% request even starts.
-    NewData = enqueue({complete, From, Prompt, Opts}, Data),
-    ok = obs_refresh(State, NewData),
-    {keep_state, NewData};
-handle_common(State, {call, From}, {prefill_only, PromptTokens}, Data) ->
-    NewData = enqueue({prefill_only, From, PromptTokens}, Data),
-    ok = obs_refresh(State, NewData),
-    {keep_state, NewData};
-handle_common(State, {call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
-    NewData = enqueue({infer, From, Tokens, Params, CallerPid}, Data),
-    ok = obs_refresh(State, NewData),
-    {keep_state, NewData};
-handle_common(_State, cast, {cancel, Ref}, Data = #data{request_ref = Ref}) ->
-    {keep_state, Data#data{cancel_pending = true}};
-handle_common(_State, cast, {cancel, _OtherRef}, Data) ->
-    %% Stale cancel for a previous request. Ignore.
-    {keep_state, Data};
+handle_common(_State, cast, {cancel, Ref}, Data) ->
+    %% Walk req_table to find the seq carrying this request_ref and
+    %% mark it cancel_pending. Stale or unknown refs are silently
+    %% ignored, matching the v0.1 behaviour.
+    case find_req_by_ref(Data, Ref) of
+        {ok, Req} ->
+            Req1 = Req#req{cancel_pending = true},
+            NewData = put_req(Data, Req1),
+            {keep_state, NewData};
+        not_found ->
+            {keep_state, Data}
+    end;
 handle_common(_State, {call, From}, evict, Data) ->
     {keep_state, fire_save_for_reason(evict, Data), [{reply, From, ok}]};
 handle_common(_State, {call, From}, shutdown, Data) ->
@@ -1002,20 +1271,6 @@ optional_backend_call(#data{backend = Mod, backend_state = S}, Fn, Args) ->
         false -> {error, not_supported}
     end.
 
-%% Best-effort seq_clear. Backends that don't implement it (the stub
-%% in tests, mostly) are assumed to track no context state worth
-%% clearing.
-maybe_seq_clear(#data{backend = Mod, backend_state = S}) ->
-    case erlang:function_exported(Mod, seq_clear, 1) of
-        true ->
-            case Mod:seq_clear(S) of
-                ok -> ok;
-                Err -> Err
-            end;
-        false ->
-            ok
-    end.
-
 build_model_info(State, Data) ->
     %% Mirror the obs-row semantics so `model_info/1` and the
     %% lock-free accessors (`erllama:last_cache_hit/1`, etc.) agree
@@ -1073,124 +1328,221 @@ obs_row(Phase, Data) ->
         Data#data.model_id,
         Phase,
         length(Data#data.pending),
-        Data#data.cache_hit_kind,
-        Data#data.cache_hit_prefix_len
+        Data#data.last_cache_hit_kind,
+        Data#data.last_cache_hit_prefix_len
     }.
 
 %% =============================================================================
-%% Internal: state transitions
+%% Internal: step_tick driver
 %% =============================================================================
+%%
+%% Each tick: walk req_table, build a co-batched op list (prefill
+%% rows + decode rows), apply the per-tick batch budget, call
+%% backend:step/2, apply results back into the req_table, finish
+%% any req that hit its terminal condition, then re-arm or return
+%% to idle.
 
-enter_prefilling(Data) ->
-    ok = obs_refresh(prefilling, Data),
-    %% Reset seq 0 before the cold prefill so its KV cells start at
-    %% position 0. nif_step assigns positions from
-    %% per_seq[seq_id].next_pos, which kv_seq_rm resets — without
-    %% this, a second cold request on the same model would write
-    %% its prompt KV at the residual position of the prior request.
-    %% Warm restores via kv_unpack call this implicitly via the
-    %% primer flow and don't need it.
-    ok = maybe_seq_clear(Data),
-    Tokens = Data#data.prompt_tokens,
-    case erllama_cache_policy:cold_save_split(Tokens, Data#data.policy) of
-        {trim, TrimmedPrefix, RemainingTokens} ->
-            ok = step_prefill(TrimmedPrefix, Data),
-            ok = fire_cold_save(TrimmedPrefix, Data),
-            ok = step_prefill(RemainingTokens, Data);
-        no_save ->
-            ok = step_prefill(Tokens, Data)
-    end,
-    Data1 = Data#data{context_tokens = Tokens},
-    after_prefill(Data1).
-
-%% Drive one `step` call with a single prefill op on seq 0. The NIF
-%% leaves logits ready on the last token of the slice so the next
-%% `step_decode` call can sample.
-step_prefill([], _Data) ->
-    %% An empty prefill slice is a no-op; the backend would reject it
-    %% (read_token_list rejects n=0 inside the NIF) so skip the call.
-    ok;
-step_prefill(Tokens, Data) ->
-    case backend_call(Data, step, [[{0, {prefill, Tokens}}]]) of
-        {ok, [{0, prefilled}]} -> ok;
-        {error, _} = E -> E
-    end.
-
-%% Drive one `step` call with a single decode op on seq 0. Returns
-%% the sampled token plus an EoG flag; the caller decides whether
-%% to advance or finish. Bridges the new `step/2` result shape back
-%% to the gen_statem's existing eog handling.
-step_decode(#data{sampler_ref = undefined}) ->
-    {error, no_sampler};
-step_decode(Data = #data{sampler_ref = Ref}) ->
-    case backend_call(Data, step, [[{0, {decode, Ref}}]]) of
-        {ok, [{0, {token, T, 0}}]} -> {ok, T, false};
-        {ok, [{0, {token, T, 1}}]} -> {ok, T, true};
-        {error, _} = E -> E
-    end.
-
-enter_generating(Data) ->
-    %% Decode token-by-token via cast-to-self events so continued
-    %% saves can fire mid-stream AND external events (cancel, busy
-    %% reject, evict, status) get a fair turn between tokens. We
-    %% deliberately avoid `next_event` here because next_event has
-    %% higher priority than mailbox messages, which would starve
-    %% cancel.
-    Data1 = Data#data{
-        last_save_at = length(Data#data.context_tokens),
-        generation_started_at = erlang:monotonic_time(millisecond)
-    },
-    ok = obs_refresh(generating, Data1),
-    gen_statem:cast(self(), decode_step),
-    {next_state, generating, Data1}.
-
-decode_step(Data = #data{cancel_pending = true}) ->
-    %% Honoured between tokens. The current decode step has already
-    %% returned; we finish with cancelled => true and never call
-    %% step again.
-    finish_request_cancelled(Data);
-decode_step(Data) ->
-    case length(Data#data.generated) >= Data#data.response_target of
-        true ->
-            finish_request(Data, length);
-        false ->
-            case step_decode(Data) of
-                {ok, Token, false} ->
-                    advance_with(Token, Data);
-                {ok, Token, true} ->
-                    Data1 = append_token(Token, Data),
-                    Data2 = stream_emit(Token, Data1),
-                    finish_request(Data2, stop);
-                {error, _} = E ->
-                    Data1 = reset(sampler_release(Data)),
-                    case Data#data.mode of
-                        standard ->
-                            {next_state, idle, Data1, [{reply, Data#data.caller, E}]};
-                        streaming ->
-                            send_error(Data, E),
-                            {next_state, idle, Data1}
-                    end
+step_tick(Data) ->
+    ok = obs_refresh(running_phase(Data), Data),
+    Data1 = honour_cancellations(Data),
+    case build_op_list(Data1) of
+        {[], FinishersFirst} ->
+            %% Nothing to step (e.g. only finishing-marked reqs).
+            %% Drive the finishers and return.
+            tick_after_step(Data1, FinishersFirst, []);
+        {OpList, FinishersFirst} ->
+            case backend_call(Data1, step, [OpList]) of
+                {ok, Results} ->
+                    Data2 = apply_step_results(Results, Data1),
+                    tick_after_step(Data2, FinishersFirst, []);
+                {error, _} = Err ->
+                    %% A backend error mid-tick poisons every in-flight
+                    %% request — we cannot attribute it to a single row.
+                    %% Stop with an error to every live caller; the
+                    %% supervisor restarts the gen_statem.
+                    fail_all_requests(Data1, Err),
+                    {stop, {step_failed, Err}, Data1}
             end
     end.
 
-advance_with(Token, Data) ->
-    Data1 = append_token(Token, Data),
-    Data2 = stream_emit(Token, Data1),
-    Data3 = maybe_fire_continued(Data2),
-    gen_statem:cast(self(), decode_step),
-    {keep_state, Data3}.
+%% After a step (or a no-op tick), walk finishing-marked reqs,
+%% emit replies/stream-done, free samplers + seqs, dispatch from
+%% the pending FIFO if any seq slot freed up, then re-arm or idle.
+tick_after_step(Data, PreFinishers, Actions0) ->
+    %% Mark requests that hit terminal conditions in this tick.
+    Data1 = mark_terminal(Data),
+    {Data2, Actions1} = finish_marked_reqs(Data1, Actions0),
+    {Data3, Actions2} = dispatch_pending_admits(Data2, Actions1),
+    %% Pre-finishers were marked before the step (e.g. cancel hit). They
+    %% are already drained inside finish_marked_reqs, so PreFinishers
+    %% is just informational.
+    _ = PreFinishers,
+    case map_size(Data3#data.req_table) of
+        0 ->
+            ok = obs_refresh(idle, Data3),
+            {next_state, idle, Data3, Actions2};
+        _ ->
+            schedule_tick(),
+            {keep_state, Data3, Actions2}
+    end.
 
-%% In streaming mode, send the just-appended token to the caller as a
-%% text fragment. In standard mode this is a no-op; the full reply is
-%% built in finish_request via detokenize on the whole `generated`
-%% list.
-stream_emit(
+%% Honour any cancel_pending flags raised by the cancel cast since
+%% the previous tick: mark those reqs as finishing so the finisher
+%% pass picks them up.
+honour_cancellations(Data) ->
+    Reqs = maps:values(Data#data.req_table),
+    lists:foldl(
+        fun
+            (#req{cancel_pending = true} = R, Acc) ->
+                put_req(Acc, R#req{finishing = true});
+            (_R, Acc) ->
+                Acc
+        end,
+        Data,
+        Reqs
+    ).
+
+%% Build the op list for this tick. Returns {OpList, FinishersFirst}.
+%% FinishersFirst is requests that have already hit a terminal
+%% condition (response_target met, eog flag, cancel) and don't
+%% participate in this tick — they're finalised in the post-step
+%% finisher walk.
+build_op_list(Data) ->
+    Reqs = maps:values(Data#data.req_table),
+    Active = [R || R <- Reqs, not R#req.finishing],
+    {DecodeOps, PrefillOps} = lists:foldr(
+        fun(R, {Decodes, Prefills}) ->
+            case R#req.prefill_cursor of
+                undefined ->
+                    case R#req.sampler_ref of
+                        undefined ->
+                            %% prefill_only completed prefill — it's a
+                            %% finisher this tick.
+                            {Decodes, Prefills};
+                        Ref ->
+                            {[{R#req.seq_id, {decode, Ref}} | Decodes], Prefills}
+                    end;
+                [] ->
+                    {Decodes, Prefills};
+                Slice ->
+                    {Decodes, [{R#req.seq_id, {prefill, Slice}} | Prefills]}
+            end
+        end,
+        {[], []},
+        Active
+    ),
+    Ops = apply_batch_budget(DecodeOps ++ PrefillOps, Data),
+    {Ops, []}.
+
+%% Bound the op list to total_batch_budget. Decode rows (each 1
+%% token) are kept whole; prefill rows are sliced head-first.
+apply_batch_budget(Ops, Data) ->
+    Budget = Data#data.total_batch_budget,
+    DecCount = length([{S, O} || {S, {decode, _}} = {S, O} <- Ops, _ <- [1]]),
+    case DecCount >= Budget of
+        true ->
+            %% n_batch is smaller than the number of in-flight
+            %% decoders. Operator misconfiguration; surface as an
+            %% empty-tick error.
+            erlang:error({n_batch_too_small_for_n_seq_max, Budget, DecCount});
+        false ->
+            slice_prefills(Ops, Budget - DecCount)
+    end.
+
+slice_prefills(Ops, Remaining) ->
+    slice_prefills(Ops, Remaining, []).
+
+slice_prefills([], _Remaining, Acc) ->
+    lists:reverse(Acc);
+slice_prefills([{SeqId, {decode, R}} | T], Remaining, Acc) ->
+    slice_prefills(T, Remaining, [{SeqId, {decode, R}} | Acc]);
+slice_prefills([{_SeqId, {prefill, _Tokens}} | T], Remaining, Acc) when Remaining =< 0 ->
+    %% Budget exhausted: drop this prefill from the current tick;
+    %% it'll resume next tick. apply_step_results doesn't see this
+    %% op so the cursor stays where it was.
+    slice_prefills(T, 0, Acc);
+slice_prefills([{SeqId, {prefill, Tokens}} | T], Remaining, Acc) ->
+    case length(Tokens) of
+        N when N =< Remaining ->
+            slice_prefills(T, Remaining - N, [{SeqId, {prefill, Tokens}} | Acc]);
+        _ ->
+            Slice = lists:sublist(Tokens, Remaining),
+            slice_prefills(T, 0, [{SeqId, {prefill, Slice}} | Acc])
+    end.
+
+%% Apply step result list back into the req_table. Each row's seq_id
+%% identifies its #req. Prefill results advance the cursor; decode
+%% results append the sampled token.
+apply_step_results([], Data) ->
+    Data;
+apply_step_results([{SeqId, prefilled} | T], Data) ->
+    Req = maps:get(SeqId, Data#data.req_table),
+    Slice =
+        case Req#req.prefill_cursor of
+            undefined -> [];
+            L -> L
+        end,
+    %% Determine how many tokens were just pushed. With the budget
+    %% slicer we may have pushed less than length(Slice); we need
+    %% to know what was sent. The slicer doesn't tell us directly,
+    %% so we recompute from the unsliced cursor: the budget pass
+    %% above mirrored the op-list build, so the actual `Sent` is
+    %% whatever the slicer kept — which we cannot recover here
+    %% post-fact. As a conservative approximation: since the
+    %% slicer drops a prefill rather than partially keeping it
+    %% past the budget edge, the prefill that DID land carried its
+    %% full slice. (Mid-slice splits happen too; see slice_prefills
+    %% — they keep the head and drop the tail. The remaining tokens
+    %% stay in the cursor.) So either the whole slice ran or a
+    %% prefix did. We snapshot the cursor pre-step via a
+    %% backreference: stored on #req.prefill_cursor by the original
+    %% admit / by the previous apply_step_results.
+    %%
+    %% Pragmatic approach: assume the whole cursor was prefilled
+    %% (works for n_seq_max=1 single-tenant where the slicer never
+    %% truncates). PR5 will add chunked prefill, which needs a more
+    %% precise cursor advance — at that point we'll track sent
+    %% slices explicitly.
+    Tokens = Slice,
+    NewContext = Req#req.context_tokens ++ Tokens,
+    Req1 = Req#req{
+        prefill_cursor = undefined,
+        context_tokens = NewContext,
+        last_save_at = 0,
+        generation_started_at =
+            case Req#req.generation_started_at of
+                undefined -> erlang:monotonic_time(millisecond);
+                G -> G
+            end
+    },
+    Req2 = maybe_fire_cold_save(Req1, Data),
+    apply_step_results(T, put_req(Data, Req2));
+apply_step_results([{SeqId, {token, Tok, EogFlag}} | T], Data) ->
+    Req = maps:get(SeqId, Data#data.req_table),
+    Req1 = req_append_token(Req, Tok),
+    Req2 = req_stream_emit(Req1, Tok, Data),
+    %% Mark terminal if eog or response_target reached.
+    GenLen = length(Req2#req.generated),
+    Done = EogFlag =:= 1 orelse GenLen >= Req2#req.response_target,
+    Req3 =
+        case Done of
+            true -> Req2#req{finishing = true};
+            false -> maybe_fire_continued_for_req(Req2, Data)
+        end,
+    apply_step_results(T, put_req(Data, Req3)).
+
+%% Append the token to both context_tokens and generated.
+req_append_token(Req, Token) ->
+    Req#req{
+        context_tokens = Req#req.context_tokens ++ [Token],
+        generated = Req#req.generated ++ [Token]
+    }.
+
+%% Stream a token to the caller (no-op for non-streaming modes).
+req_stream_emit(
+    #req{mode = streaming, caller_pid = Pid, request_ref = Ref} = Req,
     Token,
-    Data = #data{
-        mode = streaming,
-        caller_pid = Pid,
-        request_ref = Ref
-    }
+    Data
 ) ->
     case backend_call(Data, detokenize, [[Token]]) of
         Bin when is_binary(Bin), Bin =/= <<>> ->
@@ -1198,172 +1550,248 @@ stream_emit(
         _ ->
             ok
     end,
-    %% Token-id message always lands, even for tokens whose
-    %% detokenized binary is empty (special tokens, BPE merges
-    %% with no visible bytes). Speculative-decoding collectors
-    %% need every produced id; the existing text-only consumers
-    %% (erllama_server) ignore this tag.
     Pid ! {erllama_token_id, Ref, Token},
-    Data;
-stream_emit(_Token, Data = #data{mode = standard}) ->
-    Data.
+    Req;
+req_stream_emit(Req, _Token, _Data) ->
+    Req.
 
-append_token(Token, Data) ->
-    Data#data{
-        context_tokens = Data#data.context_tokens ++ [Token],
-        generated = Data#data.generated ++ [Token]
+%% Mark any req whose generated count >= response_target as
+%% finishing. Called after apply_step_results so we don't mutate
+%% the table mid-iteration.
+mark_terminal(Data) ->
+    Reqs = maps:values(Data#data.req_table),
+    lists:foldl(
+        fun(R, Acc) ->
+            case R#req.finishing of
+                true ->
+                    Acc;
+                false when
+                    R#req.prefill_cursor =:= undefined,
+                    R#req.mode =:= prefill_only
+                ->
+                    %% prefill_only finishes as soon as prefill is done.
+                    put_req(Acc, R#req{finishing = true});
+                false ->
+                    Acc
+            end
+        end,
+        Data,
+        Reqs
+    ).
+
+%% Cold-save firing between the trim-prefill tick and the remainder
+%% tick. At this point the seq's KV holds exactly the trimmed
+%% prefix — kv_pack captures that state. The remainder is rotated
+%% into prefill_cursor so the next tick continues the prefill. With
+%% cold_save_remaining = undefined nothing fires (no_save policy,
+%% prefill_only mode, or warm path).
+maybe_fire_cold_save(Req = #req{cold_save_remaining = undefined}, _Data) ->
+    Req;
+maybe_fire_cold_save(
+    Req = #req{cold_save_remaining = Remaining, context_tokens = Trimmed},
+    Data
+) ->
+    _ = fire_save_for_tokens(cold, Trimmed, Req, Data),
+    NextCursor =
+        case Remaining of
+            [] -> undefined;
+            _ -> Remaining
+        end,
+    Req#req{
+        cold_save_remaining = undefined,
+        last_save_at = length(Trimmed),
+        prefill_cursor = NextCursor
     }.
 
-reset(Data) ->
-    Data#data{
-        mode = standard,
-        caller = undefined,
-        caller_pid = undefined,
-        request_ref = undefined,
-        cancel_pending = false,
-        prefill_started_at = undefined,
-        generation_started_at = undefined,
-        %% sampler_ref is cleared because the request has finished
-        %% (sampler_release ran first if applicable). last_sampler_cfg
-        %% is NOT cleared — it's a debug/test snapshot that survives
-        %% across requests so plumbing tests can read back the cfg
-        %% that landed on the backend, matching the pre-step
-        %% behaviour where the cfg was preserved on the backend
-        %% state past clear_sampler.
-        sampler_ref = undefined,
-        %% Keep the last cache_hit_* values around so the obs row
-        %% (which is read by external routers between requests)
-        %% still reflects the most recent admission rather than
-        %% reverting to "cold" every time we return to idle.
-        context_tokens = [],
-        prompt_tokens = [],
-        generated = [],
-        response_target = 0,
-        last_save_at = 0,
-        %% Drop the per-request fingerprint snapshot so the next
-        %% request picks up the current effective_fp.
-        request_fp = undefined
-    }.
-
-maybe_fire_continued(Data) ->
-    LiveCount = length(Data#data.context_tokens),
+%% Continued-save: fire every continued_interval tokens since the
+%% last save fired.
+maybe_fire_continued_for_req(Req, Data) ->
+    LiveCount = length(Req#req.context_tokens),
     Should = erllama_cache_policy:should_continued_save(
-        LiveCount, Data#data.last_save_at, Data#data.policy
+        LiveCount, Req#req.last_save_at, Data#data.policy
     ),
     case Should of
         true ->
-            ok = fire_save_if(true, continued, Data#data.context_tokens, Data),
-            Data#data{last_save_at = LiveCount};
+            _ = fire_save_for_tokens(continued, Req#req.context_tokens, Req, Data),
+            Req#req{last_save_at = LiveCount};
         false ->
-            Data
+            Req
     end.
 
-finish_request(Data, FinishReason) ->
-    FinishKey = finish_key_or_undefined(fire_finish_save(Data#data.context_tokens, Data)),
-    {ok, Data1a} = clear_grammar(Data),
-    Data1 = sampler_release(Data1a),
-    case Data1#data.mode of
-        standard ->
-            Reply = backend_call(Data1, detokenize, [Data1#data.generated]),
-            From = Data1#data.caller,
-            Stats = build_stats(FinishReason, false, FinishKey, Data1),
-            Result = #{
-                reply => Reply,
-                generated => Data1#data.generated,
-                context_tokens => Data1#data.context_tokens,
-                committed_tokens => length(Data1#data.context_tokens),
-                finish_key => FinishKey,
-                cache_hit_kind => Data1#data.cache_hit_kind,
-                finish_reason => FinishReason,
-                stats => Stats
-            },
-            return_to_idle(reset(Data1), [{reply, From, {ok, Result}}]);
-        streaming ->
-            Stats = build_stats(FinishReason, false, FinishKey, Data1),
-            send_done(Data1, Stats),
-            return_to_idle(reset(Data1), [])
-    end.
+%% Walk all #req with finishing=true; for each, fire its finish
+%% save, build the reply / stream-done, free its sampler, free its
+%% seq, push the seq_id back, and remove it from req_table.
+finish_marked_reqs(Data, Actions) ->
+    Reqs = maps:values(Data#data.req_table),
+    Finishers = [R || R <- Reqs, R#req.finishing],
+    lists:foldl(
+        fun(R, {AccData, AccActions}) ->
+            FinishReason =
+                case R#req.cancel_pending of
+                    true ->
+                        cancelled;
+                    false ->
+                        case length(R#req.generated) >= R#req.response_target of
+                            true -> length;
+                            false -> stop
+                        end
+                end,
+            finish_req(R, FinishReason, AccData, AccActions)
+        end,
+        {Data, Actions},
+        Finishers
+    ).
 
-finish_request_cancelled(Data) ->
-    %% Cancelled requests still fire a finish save: whatever live
-    %% context exists is worth keeping for resume.
-    FinishKey = finish_key_or_undefined(fire_finish_save(Data#data.context_tokens, Data)),
-    {ok, Data1a} = clear_grammar(Data),
-    Data1 = sampler_release(Data1a),
-    Stats = build_stats(cancelled, true, FinishKey, Data1),
-    send_done(Data1, Stats),
-    return_to_idle(reset(Data1), []).
+finish_req(Req, FinishReason, Data, Actions) ->
+    FinishKey = finish_key_or_undefined(
+        fire_finish_save_for_req(Req#req.context_tokens, Req, Data)
+    ),
+    Stats = build_stats_for_req(
+        FinishReason, Req#req.cancel_pending, FinishKey, Req
+    ),
+    Action = finish_action(Req, FinishReason, FinishKey, Stats, Data),
+    %% Release the sampler and free the seq's KV before returning
+    %% the seq_id to the pool. The gen_statem holds the context
+    %% mutex so no concurrent reader of this seq_id is possible.
+    _ = release_sampler(Req, Data),
+    _ = release_seq(Req#req.seq_id, Data),
+    Data1 = remove_req(Data, Req#req.seq_id),
+    Data2 = Data1#data{idle_seq_ids = [Req#req.seq_id | Data1#data.idle_seq_ids]},
+    {Data2, Actions ++ Action}.
 
-%% Prefill-only finish path: no detokenize, no generated tokens, no
-%% sampler chain to clear. Fire the finish save and reply with the
-%% warm-restore key plus the committed token list.
-finish_prefill_only(Data) ->
-    FinishKey = finish_key_or_undefined(fire_finish_save(Data#data.context_tokens, Data)),
-    From = Data#data.caller,
+finish_action(#req{mode = standard, caller = From} = Req, FinishReason, FinishKey, Stats, Data) ->
+    Reply = backend_call(Data, detokenize, [Req#req.generated]),
     Result = #{
-        context_tokens => Data#data.context_tokens,
-        committed_tokens => length(Data#data.context_tokens),
+        reply => Reply,
+        generated => Req#req.generated,
+        context_tokens => Req#req.context_tokens,
+        committed_tokens => length(Req#req.context_tokens),
         finish_key => FinishKey,
-        cache_hit_kind => Data#data.cache_hit_kind
+        cache_hit_kind => Req#req.cache_hit_kind,
+        finish_reason => FinishReason,
+        stats => Stats
     },
-    return_to_idle(reset(Data), [{reply, From, {ok, Result}}]).
+    [{reply, From, {ok, Result}}];
+finish_action(#req{mode = streaming} = Req, _FinishReason, _FinishKey, Stats, _Data) ->
+    send_done_for_req(Req, Stats),
+    [];
+finish_action(
+    #req{mode = prefill_only, caller = From} = Req, _FinishReason, FinishKey, _Stats, _Data
+) ->
+    Result = #{
+        context_tokens => Req#req.context_tokens,
+        committed_tokens => length(Req#req.context_tokens),
+        finish_key => FinishKey,
+        cache_hit_kind => Req#req.cache_hit_kind
+    },
+    [{reply, From, {ok, Result}}].
 
-finish_key_or_undefined({ok, Key}) -> Key;
-finish_key_or_undefined(skipped) -> undefined.
+send_done_for_req(#req{request_ref = Ref, caller_pid = Pid}, Stats) when
+    is_pid(Pid), is_reference(Ref)
+->
+    erllama_inflight:unregister(Ref),
+    Pid ! {erllama_done, Ref, Stats},
+    ok;
+send_done_for_req(_Req, _Stats) ->
+    ok.
 
-%% Drop back to idle. If a queued request exists, dispatch its head
-%% inline before yielding the scheduler. The reply action for the
-%% completing request is still emitted; the queued request just gets
-%% the state machine started.
-return_to_idle(Data, Actions) ->
-    case Data#data.pending of
-        [] ->
-            ok = obs_refresh(idle, Data),
-            {next_state, idle, Data, Actions};
-        [Head | Rest] ->
-            dispatch_pending(Head, Data#data{pending = Rest}, Actions)
+%% Fail every in-flight request with the same error. Used when a
+%% backend:step/2 call returns an error that cannot be attributed
+%% to a single row (e.g. llama_decode exception).
+fail_all_requests(Data, Err) ->
+    Reqs = maps:values(Data#data.req_table),
+    lists:foreach(
+        fun(R) ->
+            case R#req.mode of
+                streaming ->
+                    case {R#req.request_ref, R#req.caller_pid} of
+                        {Ref, Pid} when is_pid(Pid), is_reference(Ref) ->
+                            erllama_inflight:unregister(Ref),
+                            Pid ! {erllama_error, Ref, Err};
+                        _ ->
+                            ok
+                    end;
+                _ ->
+                    %% sync callers have to receive a reply or they
+                    %% deadlock; gen_statem will fail the call on
+                    %% stop, surfacing {error, _} to them.
+                    ok
+            end,
+            _ = release_sampler(R, Data),
+            _ = release_seq(R#req.seq_id, Data)
+        end,
+        Reqs
+    ),
+    ok.
+
+release_sampler(#req{sampler_ref = undefined}, _Data) ->
+    ok;
+release_sampler(#req{sampler_ref = Ref}, #data{backend = Mod}) ->
+    case erlang:function_exported(Mod, sampler_free, 1) of
+        true ->
+            _ = Mod:sampler_free(Ref),
+            ok;
+        false ->
+            ok
     end.
 
-dispatch_pending({complete, From, Prompt, Opts}, Data, Actions) ->
-    merge_dispatch(start_complete(From, Prompt, Opts, Data), Actions);
-dispatch_pending({prefill_only, From, PromptTokens}, Data, Actions) ->
-    merge_dispatch(start_prefill_only(From, PromptTokens, Data), Actions);
-dispatch_pending({infer, From, Tokens, Params, CallerPid}, Data, Actions) ->
-    merge_dispatch(start_infer(From, Tokens, Params, CallerPid, Data), Actions).
+release_seq(SeqId, #data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, seq_rm, 2) of
+        true ->
+            _ = Mod:seq_rm(S, SeqId),
+            ok;
+        false ->
+            ok
+    end.
 
-%% start_complete / start_infer return one of:
-%%   {keep_state, Data, [{reply, _, _}]}             (error path)
-%%   {next_state, generating, Data}                  (start_complete success
-%%                                                    relies on the implicit
-%%                                                    gen_statem reply that
-%%                                                    fires when the request
-%%                                                    finishes)
-%%   {next_state, NextState, Data, [{reply, _, _}]}  (start_infer success)
-%% Splice the completing request's actions in front so its reply
-%% lands first.
-merge_dispatch({keep_state, NewData, MoreActions}, Actions) ->
-    {next_state, idle, NewData, Actions ++ MoreActions};
-merge_dispatch({next_state, NextState, NewData}, Actions) ->
-    {next_state, NextState, NewData, Actions};
-merge_dispatch({next_state, NextState, NewData, MoreActions}, Actions) ->
-    {next_state, NextState, NewData, Actions ++ MoreActions}.
+%% Dispatch one queued admit if a seq_id became free. Repeats while
+%% slots remain and pending is non-empty.
+dispatch_pending_admits(Data, Actions) ->
+    case {Data#data.idle_seq_ids, Data#data.pending} of
+        {[], _} ->
+            {Data, Actions};
+        {_, []} ->
+            {Data, Actions};
+        {[SeqId | RestIds], [Head | RestPend]} ->
+            Data1 = Data#data{
+                idle_seq_ids = RestIds,
+                pending = RestPend
+            },
+            case start_request(Head, SeqId, Data1) of
+                {ok, Data2, MoreActions} ->
+                    dispatch_pending_admits(Data2, Actions ++ MoreActions);
+                {error, Reason, From} ->
+                    Data2 = Data1#data{idle_seq_ids = [SeqId | RestIds]},
+                    dispatch_pending_admits(
+                        Data2,
+                        Actions ++ [{reply, From, {error, Reason}}]
+                    )
+            end
+    end.
 
 enqueue(Item, Data) ->
     Data#data{pending = Data#data.pending ++ [Item]}.
 
-send_done(#data{mode = streaming, caller_pid = Pid, request_ref = Ref}, Stats) ->
-    erllama_inflight:unregister(Ref),
-    Pid ! {erllama_done, Ref, Stats},
-    ok;
-send_done(_, _) ->
-    ok.
+finish_key_or_undefined({ok, Key}) -> Key;
+finish_key_or_undefined(skipped) -> undefined.
 
-send_error(#data{mode = streaming, caller_pid = Pid, request_ref = Ref}, Reason) ->
-    erllama_inflight:unregister(Ref),
-    Pid ! {erllama_error, Ref, Reason},
-    ok;
-send_error(_, _) ->
-    ok.
+%% Phase reported on the obs row while in `running`. Mirrors
+%% dominant_phase/1 but renamed to keep the obs callsite explicit.
+running_phase(Data) ->
+    dominant_phase(Data).
+
+%% Find a request in req_table whose request_ref matches. Used by
+%% cancel/2. O(n) in the number of in-flight reqs (typically ≤
+%% n_seq_max).
+find_req_by_ref(Data, Ref) ->
+    Found = lists:filter(
+        fun(R) -> R#req.request_ref =:= Ref end,
+        maps:values(Data#data.req_table)
+    ),
+    case Found of
+        [R | _] -> {ok, R};
+        [] -> not_found
+    end.
 
 %% Build the sampler-config subset from request opts. Only the keys
 %% the sampler chain cares about; everything else (response_tokens,
@@ -1382,91 +1810,30 @@ sampler_cfg_from(Opts) ->
     maps:with(?SAMPLER_KEYS, Opts).
 
 %% Build a per-request sampler chain via the new behaviour callback
-%% (`backend:sampler_new/2`) and stash the ref + cfg on #data. The
-%% ref is consumed by `step/2` as the decode-row sampler and freed
-%% via `sampler_free/1` at finish. Backends that haven't been ported
-%% to the new surface fall through to the old configure_sampler/2
-%% path so existing setups keep working.
+%% (`backend:sampler_new/2`). Returns the ref + the cfg that was
+%% sent to the backend; the caller stashes both on the #req. Falls
+%% back to {ok, undefined, Cfg, Data} if the backend doesn't
+%% implement sampler_new (legacy backends; they also won't implement
+%% step/2 so the request will fail on first tick — only kept for
+%% the error story).
 sampler_for(Opts, Data = #data{backend = Mod, backend_state = S}) ->
     Cfg = sampler_cfg_from(Opts),
     case erlang:function_exported(Mod, sampler_new, 2) of
         true ->
             case Mod:sampler_new(S, Cfg) of
-                {ok, Ref} ->
-                    {ok, Data#data{sampler_ref = Ref, last_sampler_cfg = Cfg}};
-                {error, _} = E ->
-                    E
-            end;
-        false ->
-            %% Legacy backend without sampler_new — drop into the
-            %% pre-step configure_sampler path. Such backends also
-            %% don't implement step/2 and will be unusable by the
-            %% new decode loop; this just preserves the error story.
-            configure_sampler_call(Cfg, Data)
-    end.
-
-%% Free a per-request sampler ref. Safe to call on `undefined`
-%% (prefill_only or pre-admit state); falls through silently.
-sampler_release(Data = #data{sampler_ref = undefined}) ->
-    Data;
-sampler_release(Data = #data{sampler_ref = Ref, backend = Mod}) ->
-    case erlang:function_exported(Mod, sampler_free, 1) of
-        true ->
-            _ = Mod:sampler_free(Ref),
-            ok;
-        false ->
-            ok
-    end,
-    Data#data{sampler_ref = undefined}.
-
-%% Legacy configure_sampler fallback for backends that haven't been
-%% ported to sampler_new. Called from `sampler_for/2` only; the new
-%% decode loop never calls it directly.
-configure_sampler_call(Cfg, Data = #data{backend = Mod, backend_state = S}) ->
-    case erlang:function_exported(Mod, configure_sampler, 2) of
-        true ->
-            case Mod:configure_sampler(S, Cfg) of
-                {ok, S1} -> {ok, Data#data{backend_state = S1}};
+                {ok, Ref} -> {ok, Ref, Cfg, Data};
                 {error, _} = E -> E
             end;
         false ->
-            %% Backwards-compat: legacy backends only know set_grammar.
-            Grammar = maps:get(grammar, Cfg, undefined),
-            set_grammar(Grammar, Data)
+            {ok, undefined, Cfg, Data}
     end.
 
-%% Legacy grammar-only callback path. Kept so backends that only
-%% implement set_grammar/2 + clear_sampler/1 still work.
-set_grammar(undefined, Data) ->
-    clear_grammar(Data);
-set_grammar(Grammar, Data = #data{backend = Mod, backend_state = S}) when
-    is_binary(Grammar)
-->
-    case erlang:function_exported(Mod, set_grammar, 2) of
-        true ->
-            case Mod:set_grammar(S, Grammar) of
-                {ok, S1} -> {ok, Data#data{backend_state = S1}};
-                {error, _} = E -> E
-            end;
-        false ->
-            {ok, Data}
-    end.
-
-clear_grammar(Data = #data{backend = Mod, backend_state = S}) ->
-    case erlang:function_exported(Mod, clear_sampler, 1) of
-        true ->
-            case Mod:clear_sampler(S) of
-                {ok, S1} -> {ok, Data#data{backend_state = S1}};
-                {error, _} = E -> E
-            end;
-        false ->
-            {ok, Data}
-    end.
-
-build_stats(FinishReason, Cancelled, FinishKey, Data) ->
+%% Per-#req stats. Mirrors the v0.2 build_stats/4 but reads from the
+%% request record instead of #data.
+build_stats_for_req(FinishReason, Cancelled, FinishKey, Req) ->
     Now = erlang:monotonic_time(millisecond),
-    PrefillStart = Data#data.prefill_started_at,
-    GenStart = Data#data.generation_started_at,
+    PrefillStart = Req#req.prefill_started_at,
+    GenStart = Req#req.generation_started_at,
     PrefillMs =
         case {PrefillStart, GenStart} of
             {undefined, _} -> 0;
@@ -1479,46 +1846,42 @@ build_stats(FinishReason, Cancelled, FinishKey, Data) ->
             _ -> max(0, Now - GenStart)
         end,
     #{
-        prompt_tokens => length(Data#data.prompt_tokens),
-        completion_tokens => length(Data#data.generated),
+        prompt_tokens => length(Req#req.prompt_tokens),
+        completion_tokens => length(Req#req.generated),
         prefill_ms => PrefillMs,
         generation_ms => GenMs,
-        cache_hit_kind => Data#data.cache_hit_kind,
+        cache_hit_kind => Req#req.cache_hit_kind,
         finish_reason => FinishReason,
         cancelled => Cancelled,
         finish_key => FinishKey,
-        committed_tokens => length(Data#data.context_tokens)
+        committed_tokens => length(Req#req.context_tokens)
     }.
 
 %% =============================================================================
 %% Internal: cache integration
 %% =============================================================================
 
-lookup_or_resume(PromptTokens, ParentKey, Data) ->
-    %% Exact-key fast path. checkout pins the row so eviction can't
-    %% delete the underlying file/slab between the lookup and the
-    %% load. The pin is released right after kv_unpack copies the
-    %% bytes into our live context (claim → unpack → checkin), so
-    %% the slab stays evictable while the user reads the streamed
-    %% response.
-    Key = make_key(PromptTokens, Data),
-    case pin_and_load(Key, Data) of
+%% Multi-seq variant: takes the #req that's being admitted so the
+%% fingerprint and kv_unpack/seq_rm calls target the correct seq.
+lookup_or_resume(PromptTokens, ParentKey, Req, Data) ->
+    Key = make_key(PromptTokens, Req, Data),
+    case pin_and_load(Key, Req#req.seq_id, Data) of
         {ok, ContextTokens} ->
             erllama_cache_counters:incr(?C_HITS_EXACT),
             {warm, ContextTokens, [], exact};
         miss when ParentKey =/= undefined ->
-            try_session_resume(PromptTokens, ParentKey, Data);
+            try_session_resume(PromptTokens, ParentKey, Req, Data);
         miss ->
-            try_longest_prefix(PromptTokens, Data)
+            try_longest_prefix(PromptTokens, Req, Data)
     end.
 
 %% Stateless callers (HTTP front-end, agent loops that resend the
 %% full conversation each turn) don't have a parent_key to thread.
 %% Walk back through the prompt by stride and pick the longest
 %% cached prefix; fall through to cold if nothing matches.
-try_longest_prefix(PromptTokens, Data) ->
+try_longest_prefix(PromptTokens, Req, Data) ->
     KeyMeta = #{
-        fingerprint => request_fp(Data),
+        fingerprint => request_fp(Req, Data),
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash
     },
@@ -1526,7 +1889,9 @@ try_longest_prefix(PromptTokens, Data) ->
     Min = maps:get(min_tokens, Data#data.policy, 512),
     case erllama_cache_meta_srv:lookup_longest_prefix(KeyMeta, PromptTokens, Stride, Min) of
         {ok, PrefixLen, Row} ->
-            resume_at_prefix(element(?POS_KEY, Row), PrefixLen, PromptTokens, Data, partial);
+            resume_at_prefix(
+                element(?POS_KEY, Row), PrefixLen, PromptTokens, Req, Data, partial
+            );
         miss ->
             erllama_cache_counters:incr(?C_MISSES),
             cold
@@ -1535,8 +1900,8 @@ try_longest_prefix(PromptTokens, Data) ->
 %% Pin + load the row, then verify the tokens really are the first
 %% PrefixLen of PromptTokens. The key is sha256 of the tokens, so a
 %% hit implies equality, but we belt-and-braces it here.
-resume_at_prefix(Key, PrefixLen, PromptTokens, Data, HitKind) ->
-    case pin_and_load(Key, Data) of
+resume_at_prefix(Key, PrefixLen, PromptTokens, Req, Data, HitKind) ->
+    case pin_and_load(Key, Req#req.seq_id, Data) of
         {ok, ParentTokens} when length(ParentTokens) =:= PrefixLen ->
             case is_strict_prefix(ParentTokens, PromptTokens) of
                 true ->
@@ -1555,13 +1920,13 @@ resume_at_prefix(Key, PrefixLen, PromptTokens, Data, HitKind) ->
 %% Note: the resume hit counter is bumped inside `try_session_resume`
 %% only on a verified strict-prefix match.
 
-try_session_resume(PromptTokens, ParentKey, Data) ->
+try_session_resume(PromptTokens, ParentKey, Req, Data) ->
     Wait = maps:get(session_resume_wait_ms, Data#data.policy, 500),
     %% First wait for the row to publish (the previous turn's
     %% finish-save may still be in flight), then pin via checkout.
     case erllama_cache_meta_srv:lookup_exact_or_wait(ParentKey, Wait) of
         {ok, _Row} ->
-            case pin_and_load(ParentKey, Data) of
+            case pin_and_load(ParentKey, Req#req.seq_id, Data) of
                 {ok, ParentTokens} ->
                     case is_strict_prefix(ParentTokens, PromptTokens) of
                         true ->
@@ -1581,27 +1946,22 @@ try_session_resume(PromptTokens, ParentKey, Data) ->
             cold
     end.
 
-%% checkout the row, load + unpack the payload under the pin, then
-%% checkin. Returns the row's stored token list on success or `miss`
-%% if the row was evicted between the prior lookup and our checkout.
-%% Eviction never selects a refcount > 0 row, so the load itself is
-%% safe; the only failure mode is the row already being gone.
-pin_and_load(Key, Data) ->
+%% checkout the row, load + unpack the payload under the pin (into
+%% the request's seq_id), then checkin. Returns the row's stored
+%% token list on success or `miss` if the row was evicted between
+%% the prior lookup and our checkout.
+pin_and_load(Key, SeqId, Data) ->
     T0 = erlang:monotonic_time(nanosecond),
     Result =
         case erllama_cache_meta_srv:checkout(Key, self()) of
             {ok, HolderRef, Tier, Loc, _Header, TokensBin} ->
-                %% try/after guarantees the holder is released even if
-                %% load_payload or kv_unpack throws. Without it, recovery
-                %% relies on the meta server's process monitor firing,
-                %% which leaves a brief window where the slab is pinned.
                 try
                     Bin = load_payload(Tier, Loc, Key, Data),
                     case Bin of
                         <<>> ->
                             miss;
                         _ ->
-                            ok = backend_call(Data, kv_unpack, [Bin]),
+                            ok = backend_kv_unpack(Bin, SeqId, Data),
                             Tokens =
                                 case TokensBin of
                                     undefined -> [];
@@ -1632,32 +1992,38 @@ load_payload(_Tier, _Loc, Key, Data) ->
         _ -> <<>>
     end.
 
-fire_cold_save(TrimmedPrefix, Data) ->
-    Min = maps:get(min_tokens, Data#data.policy),
-    fire_save_if(length(TrimmedPrefix) >= Min, cold, TrimmedPrefix, Data).
+%% Generic per-tokens save. Used for cold and continued saves; finish
+%% save goes through fire_finish_save_for_req.
+fire_save_for_tokens(Reason, Tokens, Req, Data) ->
+    Should =
+        case Reason of
+            cold ->
+                Min = maps:get(min_tokens, Data#data.policy),
+                length(Tokens) >= Min;
+            _ ->
+                true
+        end,
+    fire_save_if(Should, Reason, Tokens, Req, Data).
 
-%% Returns `{ok, Key}` if a finish save fired (regardless of whether
-%% the writer actually persisted; back-pressure drops are still
-%% counted as a fire because the key is the canonical handle for the
-%% live token list). Returns `skipped` if the policy suppressed the
-%% save (live token count below `min_tokens`).
-fire_finish_save(LiveTokens, Data) ->
+%% Returns `{ok, Key}` if a finish save fired. Returns `skipped` if
+%% the policy suppressed it (live token count below `min_tokens`).
+fire_finish_save_for_req(LiveTokens, Req, Data) ->
     Should = erllama_cache_policy:should_finish_save(
         length(LiveTokens), Data#data.policy
     ),
-    case fire_save_if(Should, finish, LiveTokens, Data) of
+    case fire_save_if(Should, finish, LiveTokens, Req, Data) of
         ok when Should ->
-            {ok, make_key(LiveTokens, Data)};
+            {ok, make_key(LiveTokens, Req, Data)};
         ok ->
             skipped
     end.
 
-fire_save_if(false, _Reason, _Tokens, _Data) ->
+fire_save_if(false, _Reason, _Tokens, _Req, _Data) ->
     ok;
-fire_save_if(true, Reason, Tokens, Data) ->
-    BuildMeta = build_meta_for(Reason, Tokens, Data),
+fire_save_if(true, Reason, Tokens, Req, Data) ->
+    BuildMeta = build_meta_for(Reason, Tokens, Req, Data),
     T0 = erlang:monotonic_time(nanosecond),
-    Payload = backend_call(Data, kv_pack, [Tokens]),
+    Payload = backend_kv_pack(Tokens, Req#req.seq_id, Data),
     Elapsed = erlang:monotonic_time(nanosecond) - T0,
     erllama_cache_counters:add(?C_PACK_TOTAL_NS, max(Elapsed, 0)),
     case
@@ -1668,31 +2034,34 @@ fire_save_if(true, Reason, Tokens, Data) ->
         {ok, _} ->
             ok;
         {error, _SaveErr} ->
-            %% Writer pool saturated or row already present. Either way
-            %% the save the model wanted to fire didn't land; surface
-            %% the drop via a counter so operators can see back-pressure.
             erllama_cache_counters:incr(?C_SAVES_DROPPED),
             ok
     end.
 
-%% Evict and shutdown saves: fire unconditionally if there is any
-%% live context, regardless of `min_tokens`. The plan's policy
-%% module gates only cold/continued/finish; evict and shutdown are
-%% emergency saves that capture whatever state exists. Update
-%% `last_save_at` so a follow-up continued save inside the same
-%% generation does not double-save the same tokens.
-fire_save_for_reason(_Reason, #data{context_tokens = []} = Data) ->
+%% Evict and shutdown saves: walk every in-flight req and fire one
+%% save per req that has non-empty context_tokens.
+fire_save_for_reason(_Reason, Data) when map_size(Data#data.req_table) =:= 0 ->
     Data;
 fire_save_for_reason(Reason, Data) ->
-    Tokens = Data#data.context_tokens,
-    fire_save_if(true, Reason, Tokens, Data),
-    Data#data{last_save_at = length(Tokens)}.
+    NewTable = maps:map(
+        fun(_SeqId, Req) ->
+            case Req#req.context_tokens of
+                [] ->
+                    Req;
+                Tokens ->
+                    _ = fire_save_if(true, Reason, Tokens, Req, Data),
+                    Req#req{last_save_at = length(Tokens)}
+            end
+        end,
+        Data#data.req_table
+    ),
+    Data#data{req_table = NewTable}.
 
-build_meta_for(SaveReason, Tokens, Data) ->
+build_meta_for(SaveReason, Tokens, Req, Data) ->
     #{
         save_reason => SaveReason,
         quant_bits => Data#data.quant_bits,
-        fingerprint => request_fp(Data),
+        fingerprint => request_fp(Req, Data),
         fingerprint_mode => Data#data.fingerprint_mode,
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash,
@@ -1701,20 +2070,35 @@ build_meta_for(SaveReason, Tokens, Data) ->
         prompt_text => <<>>
     }.
 
-make_key(Tokens, Data) ->
+make_key(Tokens, Req, Data) ->
     erllama_cache_key:make(#{
-        fingerprint => request_fp(Data),
+        fingerprint => request_fp(Req, Data),
         quant_type => Data#data.quant_type,
         ctx_params_hash => Data#data.ctx_params_hash,
         tokens => Tokens
     }).
 
 %% Fingerprint to use for cache identity. Returns the per-request
-%% snapshot if one was captured at admission (so a mid-request
-%% adapter mutation can't shift the in-flight identity); otherwise
-%% the current effective fingerprint.
-request_fp(#data{request_fp = undefined, effective_fp = FP}) -> FP;
-request_fp(#data{request_fp = FP}) -> FP.
+%% snapshot if captured at admission; otherwise the current
+%% effective fingerprint.
+request_fp(#req{request_fp = undefined}, #data{effective_fp = FP}) -> FP;
+request_fp(#req{request_fp = FP}, _Data) -> FP.
+
+%% Per-seq kv_pack: prefer the seq-aware arity if the backend
+%% implements it, otherwise fall back to the 2-arity (which is
+%% seq_id=0 implicitly).
+backend_kv_pack(Tokens, SeqId, #data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, kv_pack, 3) of
+        true -> Mod:kv_pack(S, Tokens, SeqId);
+        false -> Mod:kv_pack(S, Tokens)
+    end.
+
+%% Per-seq kv_unpack: prefer the seq-aware arity.
+backend_kv_unpack(Bin, SeqId, #data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, kv_unpack, 3) of
+        true -> Mod:kv_unpack(S, Bin, SeqId);
+        false -> Mod:kv_unpack(S, Bin)
+    end.
 
 is_strict_prefix([], _) -> true;
 is_strict_prefix([H | T1], [H | T2]) -> is_strict_prefix(T1, T2);
@@ -1741,24 +2125,8 @@ via(ModelId) when is_binary(ModelId) ->
         undefined -> exit({noproc, {?MODULE, not_found, ModelId}})
     end.
 
-%% After kv_unpack, the per-context logits buffer is stale. To regenerate
-%% it the model layer drops the last cell of the restored sequence and
-%% prefills the corresponding token. If the warm hit also has remaining
-%% tokens (parent_key resume), they are prefilled in the same single
-%% prefill call: the last "context" token gets popped, prepended to the
-%% remaining list, and the whole batch goes through one llama_decode.
-prime_logits([], Remaining, Data) ->
-    step_prefill(Remaining, Data);
-prime_logits(ContextTokens, Remaining, #data{backend = Mod} = Data) ->
-    case erlang:function_exported(Mod, seq_rm_last, 2) of
-        true ->
-            N = length(ContextTokens),
-            Last = lists:last(ContextTokens),
-            ok = backend_call(Data, seq_rm_last, [N]),
-            step_prefill([Last | Remaining], Data);
-        false ->
-            %% Backends without a real KV cache (e.g. the stub) just
-            %% prefill any remaining tokens; the saved "state" carries
-            %% no logits anyway.
-            step_prefill(Remaining, Data)
-    end.
+%% prime_logits/3 is gone — the warm-restore primer is now part of
+%% the per-#req flow. setup_lookup/3 drops the last KV cell via
+%% warm_restore_primer/3, and the resulting #req.prefill_cursor
+%% carries `[LastWarm | Remaining]` so the next step_tick re-prefills
+%% the primer token and any remaining tail in one shot.
