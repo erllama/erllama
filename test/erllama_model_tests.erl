@@ -714,6 +714,57 @@ pending_fifo_fills_when_seq_ids_exhausted_() ->
         drain_messages()
     end).
 
+%% =============================================================================
+%% Chunked prefill (PR5)
+%% =============================================================================
+
+%% A small prefill_chunk_size forces the slicer to split a 12-token
+%% prompt across multiple ticks. The cursor advance must track the
+%% actual slice length sent each tick: if it over- or under-counts,
+%% the final context_tokens diverges from prompt ++ generated, the
+%% finish key changes, and this test fails.
+prefill_cursor_advances_in_chunks_test() ->
+    with_model(#{prefill_chunk_size => 2}, fun(Cfg) ->
+        {ok, #{generated := Gen, finish_key := FinishKey}} =
+            erllama_model:complete(<<"test_model">>, long_prompt(), #{
+                response_tokens => 3
+            }),
+        FullTokens = prompt_tokens(long_prompt()) ++ Gen,
+        ExpectedKey = key_for_tokens(FullTokens, Cfg),
+        ?assertEqual(ExpectedKey, FinishKey),
+        ?assertEqual(3, length(Gen)),
+        ?assertEqual(idle, erllama_model:status(<<"test_model">>))
+    end).
+
+%% Cold save must fire only when the trimmed prefix is fully
+%% prefilled, not after each chunk. With prefill_chunk_size=2 the
+%% trim is split across several ticks; the cold save fires once at
+%% the end, capturing exactly the trim tokens.
+prefill_chunks_cold_save_at_trim_boundary_test() ->
+    with_model(#{prefill_chunk_size => 2}, fun(Cfg) ->
+        {ok, _} = erllama_model:complete(<<"test_model">>, long_prompt(), #{
+            response_tokens => 2
+        }),
+        Tokens = prompt_tokens(long_prompt()),
+        ColdKey = key_for_tokens(Tokens, Cfg),
+        ?assertMatch({ok, _Row}, wait_for_key(ColdKey, 1000))
+    end).
+
+%% Default prefill_chunk_size is max(64, n_batch div 4).
+prefill_chunk_size_default_test() ->
+    ConfigOverrides = #{context_opts => #{n_batch => 1024}},
+    with_model(#{}, ConfigOverrides, fun(_Cfg) ->
+        Policy = erllama_model:get_policy(<<"test_model">>),
+        ?assertEqual(256, maps:get(prefill_chunk_size, Policy))
+    end).
+
+prefill_chunk_size_default_floor_test() ->
+    ConfigOverrides = #{context_opts => #{n_batch => 64}},
+    with_model(#{}, ConfigOverrides, fun(_Cfg) ->
+        Policy = erllama_model:get_policy(<<"test_model">>),
+        ?assertEqual(64, maps:get(prefill_chunk_size, Policy))
+    end).
+
 drain_messages() ->
     receive
         _ -> drain_messages()

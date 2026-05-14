@@ -42,6 +42,13 @@ is added so sessions can warm KV without sampling a reply.
   session across long pauses without consuming generation budget.
 - New `completion_result()` and `prefill_result()` exported types in
   `erllama_model`.
+- `prefill_chunk_size` policy knob caps how many tokens a single
+  prefill row contributes to one `step_tick` (default
+  `max(64, n_batch div 4)`, or `infinity` to disable). A long
+  prompt is sliced across multiple ticks so it never monopolises
+  the batch and concurrent decoders keep making progress between
+  chunks. Layered on the multi-sequence scheduler from 0.2.0; the
+  per-tick batch budget still applies as a safety net.
 
 ### Migration
 
