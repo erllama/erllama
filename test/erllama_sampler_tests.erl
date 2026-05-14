@@ -167,6 +167,11 @@ drain(Ref) ->
 %% =============================================================================
 
 get_stub_cfg(ModelId) ->
-    erllama_model_stub:last_sampler_cfg(
-        erllama_model:get_backend_state(ModelId)
-    ).
+    %% After the scheduler moved to step/2 + per-request samplers,
+    %% the cfg is no longer kept on the backend state — it's
+    %% snapshotted on the model gen_statem's #data so tests can
+    %% read it back without poking at the opaque sampler_ref.
+    case erllama_model:get_last_sampler_cfg(ModelId) of
+        undefined -> #{};
+        Cfg -> Cfg
+    end.
