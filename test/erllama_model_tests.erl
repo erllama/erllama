@@ -10,6 +10,9 @@
 %% =============================================================================
 
 with_model(PolicyOverrides, Body) ->
+    with_model(PolicyOverrides, #{}, Body).
+
+with_model(PolicyOverrides, ConfigOverrides, Body) ->
     ok = erllama_cache_counters:init(),
     erllama_cache_counters:reset(),
     {ok, _} = erllama_registry:start_link(),
@@ -20,7 +23,7 @@ with_model(PolicyOverrides, Body) ->
     Dir = make_tmp_dir(),
     {ok, _} = erllama_cache_disk_srv:start_link(test_disk, Dir),
     Policy = maps:merge(default_policy(), PolicyOverrides),
-    Config = #{
+    BaseConfig = #{
         tier_srv => test_disk,
         tier => disk,
         fingerprint => binary:copy(<<16#AA>>, 32),
@@ -31,6 +34,7 @@ with_model(PolicyOverrides, Body) ->
         context_size => 4096,
         policy => Policy
     },
+    Config = maps:merge(BaseConfig, ConfigOverrides),
     {ok, _} = erllama_model:start_link(<<"test_model">>, Config),
     try
         Body(Config)
@@ -587,6 +591,134 @@ model_info_carries_phase_and_pending_len_test() ->
 %% =============================================================================
 %% Helpers
 %% =============================================================================
+
+%% =============================================================================
+%% Multi-sequence scheduler (n_seq_max > 1)
+%% =============================================================================
+
+%% Two concurrent complete/3 calls with n_seq_max=2 should both
+%% return their own results. The gen_statem dispatches them to
+%% seq_ids 0 and 1, co-batches their decode through one step/2
+%% call per tick, and replies to each caller at its own finish.
+two_concurrent_completes_each_return_own_result_test_() ->
+    {timeout, 10, fun two_concurrent_completes_each_return_own_result_/0}.
+
+two_concurrent_completes_each_return_own_result_() ->
+    ConfigOverrides = #{
+        context_opts => #{n_seq_max => 2, n_batch => 64}
+    },
+    with_model(#{}, ConfigOverrides, fun(_Cfg) ->
+        Parent = self(),
+        Pid1 = spawn_link(fun() ->
+            Parent !
+                {one,
+                    erllama_model:complete(
+                        <<"test_model">>, <<"hi">>, #{response_tokens => 2}
+                    )}
+        end),
+        Pid2 = spawn_link(fun() ->
+            Parent !
+                {two,
+                    erllama_model:complete(
+                        <<"test_model">>, <<"yo">>, #{response_tokens => 2}
+                    )}
+        end),
+        Reply1 =
+            receive
+                {one, R} -> R
+            after 5000 -> erlang:error(timeout_one)
+            end,
+        Reply2 =
+            receive
+                {two, R2} -> R2
+            after 5000 -> erlang:error(timeout_two)
+            end,
+        ?assertMatch({ok, #{reply := _}}, Reply1),
+        ?assertMatch({ok, #{reply := _}}, Reply2),
+        %% Drain link signals.
+        _ = Pid1,
+        _ = Pid2,
+        ?assertEqual(idle, erllama_model:status(<<"test_model">>))
+    end).
+
+%% Once a request finishes its seq_id must return to the idle pool
+%% so a subsequent admission can reuse it.
+seq_id_freed_on_finish_test_() ->
+    {timeout, 10, fun seq_id_freed_on_finish_/0}.
+
+seq_id_freed_on_finish_() ->
+    ConfigOverrides = #{
+        context_opts => #{n_seq_max => 2, n_batch => 64}
+    },
+    with_model(#{}, ConfigOverrides, fun(_Cfg) ->
+        %% Run three sequential completes against an n_seq_max=2
+        %% model. If finish doesn't recycle seq_ids, the third call
+        %% would block forever.
+        lists:foreach(
+            fun(_) ->
+                {ok, _} = erllama_model:complete(
+                    <<"test_model">>, <<"hi">>, #{response_tokens => 2}
+                )
+            end,
+            lists:seq(1, 3)
+        ),
+        ?assertEqual(idle, erllama_model:status(<<"test_model">>))
+    end).
+
+%% Once n_seq_max admits are in flight, the next admit queues in
+%% pending. Fire 3 concurrent infers against an n_seq_max=2 model;
+%% the third must queue and only dispatch after one of the first
+%% two finishes.
+pending_fifo_fills_when_seq_ids_exhausted_test_() ->
+    {timeout, 10, fun pending_fifo_fills_when_seq_ids_exhausted_/0}.
+
+pending_fifo_fills_when_seq_ids_exhausted_() ->
+    ConfigOverrides = #{
+        context_opts => #{n_seq_max => 2, n_batch => 64}
+    },
+    with_model(#{}, ConfigOverrides, fun(_Cfg) ->
+        {ok, Tokens} = erllama_model:tokenize(<<"test_model">>, <<"hi">>),
+        %% Three concurrent admits. With n_seq_max=2 the third is
+        %% queued. All three should ultimately return their refs
+        %% and emit a done message.
+        Parent = self(),
+        Spawn = fun(N) ->
+            spawn_link(fun() ->
+                R = erllama_model:infer(
+                    <<"test_model">>, Tokens, #{response_tokens => 2}, Parent
+                ),
+                Parent ! {ref, N, R}
+            end)
+        end,
+        _ = [Spawn(N) || N <- [a, b, c]],
+        Refs = lists:map(
+            fun(_N) ->
+                receive
+                    {ref, _, {ok, Ref}} -> Ref
+                after 5000 -> erlang:error(no_ref)
+                end
+            end,
+            [a, b, c]
+        ),
+        %% Each Ref should emit at least one erllama_done.
+        lists:foreach(
+            fun(Ref) ->
+                receive
+                    {erllama_done, Ref, _} -> ok
+                after 5000 -> erlang:error({no_done, Ref})
+                end
+            end,
+            Refs
+        ),
+        %% Drain any stray token messages.
+        drain_messages()
+    end).
+
+drain_messages() ->
+    receive
+        _ -> drain_messages()
+    after 0 -> ok
+    end.
 
 stub_detokenize_decimal(Tokens) ->
     string:join([integer_to_list(T) || T <- Tokens], " ").
