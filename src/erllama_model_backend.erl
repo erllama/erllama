@@ -40,6 +40,22 @@ inference, etc.) can plug in via this same surface.
 
 -callback kv_unpack(state(), Bin :: binary()) -> ok | {error, term()}.
 
+%% Optional seq-aware variants. Used by the multi-sequence scheduler
+%% to thread per-request seq_ids through the same pack/unpack/cell-
+%% removal flow the single-seq paths already use. Backends that have
+%% not been ported keep the single-seq callbacks above and `seq_id =
+%% 0` is implied everywhere.
+-callback kv_pack(state(), Tokens :: [erllama_nif:token_id()], seq_id()) ->
+    binary() | {error, term()}.
+
+-callback kv_unpack(state(), Bin :: binary(), seq_id()) -> ok | {error, term()}.
+
+%% Optional. Free all KV cells of a given seq_id and drop any
+%% per-seq tracking inside the backend. Called by the scheduler on
+%% request finish (success, error, or cancel) before the seq_id is
+%% returned to the idle pool.
+-callback seq_rm(state(), seq_id()) -> ok | {error, term()}.
+
 %% Optional. Drop the last KV cell of the active sequence so the
 %% caller can re-prefill the corresponding token to regenerate logits
 %% after a kv_unpack. Backends that don't carry a real KV cache (the
@@ -54,6 +70,31 @@ inference, etc.) can plug in via this same surface.
 
 -callback seq_rm_last(state(), NTokens :: pos_integer()) ->
     ok | {error, term()}.
+
+%% Optional. Drop the last KV cell of a specific seq_id. Seq-aware
+%% counterpart to seq_rm_last/2.
+-callback seq_rm_last(state(), seq_id(), NTokens :: pos_integer()) ->
+    ok | {error, term()}.
+
+%% Optional. Drive one batched-decode tick across a set of in-flight
+%% sequences. Each op is `{prefill, [Token]}` to push the slice into
+%% KV (no sampling) or `{decode, sampler_ref()}` to sample one token
+%% from the prior tick's logits and decode it. Returns one result per
+%% op in input order.
+-callback step(state(), [{seq_id(), step_op()}]) ->
+    {ok, [{seq_id(), step_result()}]} | {error, term()}.
+
+%% Optional. Build a per-request sampler chain from the same config
+%% map `configure_sampler/2` accepts. Returns an opaque handle the
+%% scheduler hands to `step/2` as the decode-row sampler. The chain
+%% lives until `sampler_free/1` (or the backend's terminate/1).
+-callback sampler_new(state(), sampler_opts()) ->
+    {ok, sampler_ref()} | {error, term()}.
+
+%% Optional. Release a sampler chain previously built via
+%% `sampler_new/2`. Idempotent: a double-free returns `ok` or a
+%% backend-defined `{error, released}`.
+-callback sampler_free(sampler_ref()) -> ok | {error, term()}.
 
 %% Optional. Render a normalised chat request through the model's
 %% chat template and tokenise in one step. The Request map carries
@@ -135,8 +176,15 @@ inference, etc.) can plug in via this same surface.
     | {error, term()}.
 
 -optional_callbacks([
+    kv_pack/3,
+    kv_unpack/3,
+    seq_rm/2,
     seq_clear/1,
     seq_rm_last/2,
+    seq_rm_last/3,
+    step/2,
+    sampler_new/2,
+    sampler_free/1,
     apply_chat_template/2,
     embed/2,
     set_grammar/2,
@@ -159,7 +207,16 @@ inference, etc.) can plug in via this same surface.
     seed => non_neg_integer()
 }.
 
--export_type([sampler_opts/0]).
+-type seq_id() :: non_neg_integer().
+-type sampler_ref() :: term().
+-type step_op() ::
+    {prefill, [erllama_nif:token_id()]}
+    | {decode, sampler_ref()}.
+-type step_result() ::
+    prefilled
+    | {token, erllama_nif:token_id(), 0 | 1}.
+
+-export_type([sampler_opts/0, seq_id/0, sampler_ref/0, step_op/0, step_result/0]).
 
 -type chat_request() :: #{
     messages := [chat_message()],
