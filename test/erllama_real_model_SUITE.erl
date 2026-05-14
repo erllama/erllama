@@ -456,38 +456,47 @@ grammar_plus_sampler(Config) ->
 
 %% Under greedy sampling (temperature => 0) two runs of the same
 %% prompt must produce byte-identical output regardless of how the
-%% scheduler slices the prefill. Restart the model first with a
-%% large chunk size (whole prompt in one tick), capture the reply,
-%% restart with a small chunk size (many ticks), capture again, and
-%% assert equality. Catches positional-embedding bugs in nif_step
-%% and last_logits_idx bookkeeping when the seq's last logits-
-%% emitting row moves between ticks.
+%% scheduler slices the prefill. Spin up two parallel models from
+%% the same GGUF, one with `prefill_chunk_size => infinity` and the
+%% other with `=> 16`, feed both the same prompt under the same
+%% params, and assert the replies match. Two distinct model IDs
+%% avoid racing the registry's async DOWN cleanup that a stop +
+%% start_link cycle would hit. Catches positional-embedding bugs
+%% in nif_step and last_logits_idx bookkeeping when the seq's last
+%% logits-emitting row moves between ticks.
 chunked_prefill_matches_unchunked(Config) ->
     Path = ?config(model_path, Config),
-    DiskSrv = ?config(disk_srv, Config),
-    Model = ?config(model, Config),
+    BaseDiskSrv = ?config(disk_srv, Config),
     Params = #{response_tokens => 12, temperature => 0.0, seed => 1},
-    %% Run 1: unchunked.
-    ok = erllama_model:stop(Model),
-    {ok, _} = erllama_model:start_link(
-        Model, chunked_model_config(Path, DiskSrv, infinity)
-    ),
-    {ok, Tokens} = erllama:tokenize(Model, ?LONG_PROMPT),
-    {Text1, _} = run_infer(Model, Tokens, Params),
-    %% Run 2: small chunk size.
-    ok = erllama_model:stop(Model),
-    {ok, _} = erllama_model:start_link(
-        Model, chunked_model_config(Path, DiskSrv, 16)
-    ),
-    {Text2, _} = run_infer(Model, Tokens, Params),
-    ?assertEqual(Text1, Text2),
+    {ModelA, SrvA} = start_chunked_model(Path, BaseDiskSrv, infinity, <<"_a">>),
+    {ModelB, SrvB} = start_chunked_model(Path, BaseDiskSrv, 16, <<"_b">>),
+    try
+        {ok, Tokens} = erllama:tokenize(ModelA, ?LONG_PROMPT),
+        {TextA, _} = run_infer(ModelA, Tokens, Params),
+        {TextB, _} = run_infer(ModelB, Tokens, Params),
+        ?assertEqual(TextA, TextB)
+    after
+        catch erllama_model:stop(ModelA),
+        catch erllama_model:stop(ModelB),
+        catch gen_server:stop(SrvA),
+        catch gen_server:stop(SrvB)
+    end,
     ok.
 
-chunked_model_config(Path, DiskSrv, ChunkSize) ->
-    Base = model_config(Path, DiskSrv),
+start_chunked_model(Path, BaseDiskSrv, ChunkSize, Suffix) ->
+    Srv = list_to_atom(atom_to_list(BaseDiskSrv) ++ binary_to_list(Suffix)),
+    Dir = filename:join(
+        filename:dirname(code:priv_dir(erllama)),
+        "chunked_prefill_" ++ binary_to_list(Suffix)
+    ),
+    ok = filelib:ensure_path(Dir),
+    {ok, _} = erllama_cache_disk_srv:start_link(Srv, Dir),
+    Model = iolist_to_binary([<<"chunked_model">>, Suffix]),
+    Base = model_config(Path, Srv),
     Policy0 = maps:get(policy, Base),
     Policy = Policy0#{prefill_chunk_size => ChunkSize},
-    Base#{policy => Policy}.
+    {ok, _} = erllama_model:start_link(Model, Base#{policy => Policy}),
+    {Model, Srv}.
 
 run_infer(Model, Tokens, Params) ->
     {ok, Ref} = erllama:infer(Model, Tokens, Params, self()),
