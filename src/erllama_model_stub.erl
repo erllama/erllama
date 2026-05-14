@@ -21,7 +21,13 @@
     prefill/2,
     decode_one/2,
     kv_pack/2,
+    kv_pack/3,
     kv_unpack/2,
+    kv_unpack/3,
+    seq_rm/2,
+    step/2,
+    sampler_new/2,
+    sampler_free/1,
     apply_chat_template/2,
     embed/2,
     set_grammar/2,
@@ -82,7 +88,46 @@ decode_one(_S, ContextTokens) ->
 kv_pack(_S, Tokens) ->
     erllama_cache_key:encode_tokens(Tokens).
 
+kv_pack(_S, Tokens, _SeqId) ->
+    erllama_cache_key:encode_tokens(Tokens).
+
 kv_unpack(_S, _Bin) ->
+    ok.
+
+kv_unpack(_S, _Bin, _SeqId) ->
+    ok.
+
+%% No persistent per-seq state in the stub, so seq_rm is a no-op.
+%% The scheduler's tests rely on this being callable; the cache
+%% integration goes through the encoded-token binary instead.
+seq_rm(_S, _SeqId) ->
+    ok.
+
+%% Per-tick batched step. Prefill rows just acknowledge. Decode rows
+%% derive a deterministic next token from
+%% `{decode_step_stub, SeqId, Sampler}` so two concurrent seqs with
+%% different prompts produce different streams and the same seq fed
+%% the same sampler keeps producing the same token (matching the
+%% prior single-seq stub semantics for cache-integration tests).
+step(_S, Ops) ->
+    Results = [stub_step_op(Op) || Op <- Ops],
+    {ok, Results}.
+
+stub_step_op({SeqId, {prefill, _Tokens}}) ->
+    {SeqId, prefilled};
+stub_step_op({SeqId, {decode, Sampler}}) ->
+    %% The token is bound to the sampler ref AND the seq_id so a
+    %% scheduler bug that swaps samplers between seqs would change
+    %% one seq's output stream and be visible in tests. The mock
+    %% never produces eog.
+    T = erlang:phash2({decode_step_stub, SeqId, Sampler}) rem (1 bsl 32),
+    {SeqId, {token, T, 0}}.
+
+%% Sampler refs are opaque references; sampler_free is a no-op.
+sampler_new(_S, _Cfg) ->
+    {ok, make_ref()}.
+
+sampler_free(_Sampler) ->
     ok.
 
 %% Render a chat request as `system\nrole: content\nrole: content\n`

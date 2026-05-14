@@ -30,9 +30,16 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     prefill/2,
     decode_one/2,
     kv_pack/2,
+    kv_pack/3,
     kv_unpack/2,
+    kv_unpack/3,
     seq_clear/1,
+    seq_rm/2,
     seq_rm_last/2,
+    seq_rm_last/3,
+    step/2,
+    sampler_new/2,
+    sampler_free/1,
     apply_chat_template/2,
     embed/2,
     set_grammar/2,
@@ -106,8 +113,16 @@ decode_one(#s{ctx = C}, _ContextTokens) ->
 kv_pack(#s{ctx = C}, Tokens) ->
     erllama_nif:kv_pack(C, Tokens, length(Tokens)).
 
+%% Seq-aware kv_pack. The 2-arity above keeps the v0.1 contract
+%% (seq_id=0); the 3-arity is driven by the multi-sequence scheduler.
+kv_pack(#s{ctx = C}, Tokens, SeqId) when is_integer(SeqId), SeqId >= 0 ->
+    erllama_nif:kv_pack(C, Tokens, length(Tokens), SeqId).
+
 kv_unpack(#s{ctx = C}, Bin) ->
     erllama_nif:kv_unpack(C, Bin, 0).
+
+kv_unpack(#s{ctx = C}, Bin, SeqId) when is_integer(SeqId), SeqId >= 0 ->
+    erllama_nif:kv_unpack(C, Bin, SeqId).
 
 %% Drop the cell at position N-1 from seq 0 so the model layer can
 %% re-prefill the corresponding token and regenerate logits.
@@ -117,9 +132,34 @@ kv_unpack(#s{ctx = C}, Bin) ->
 seq_rm_last(#s{ctx = C}, NTokens) when NTokens > 0 ->
     erllama_nif:kv_seq_rm(C, 0, NTokens - 1, -1).
 
+%% Seq-aware variant of seq_rm_last/2.
+seq_rm_last(#s{ctx = C}, SeqId, NTokens) when
+    is_integer(SeqId), SeqId >= 0, NTokens > 0
+->
+    erllama_nif:kv_seq_rm(C, SeqId, NTokens - 1, -1).
+
+%% Free all KV cells of a specific seq_id. Used by the scheduler when
+%% a request finishes and its seq_id returns to the idle pool.
+seq_rm(#s{ctx = C}, SeqId) when is_integer(SeqId), SeqId >= 0 ->
+    erllama_nif:kv_seq_rm(C, SeqId, 0, -1).
+
 %% Wipe seq 0 entirely. p0=0, p1=-1 means "from position 0 to infinity".
 seq_clear(#s{ctx = C}) ->
     erllama_nif:kv_seq_rm(C, 0, 0, -1).
+
+%% Drive one batched-decode tick. Forwards directly to the NIF; the
+%% scheduler owns the op list and the sampler refs.
+step(#s{ctx = C}, Ops) ->
+    erllama_nif:step(C, Ops).
+
+%% Build a per-request sampler chain. The opaque sampler_ref is held
+%% by the scheduler for the request's lifetime and freed when the
+%% request finishes.
+sampler_new(#s{ctx = C}, Cfg) when is_map(Cfg) ->
+    erllama_nif:sampler_new(C, Cfg).
+
+sampler_free(SamplerRef) ->
+    erllama_nif:sampler_free(SamplerRef).
 
 apply_chat_template(#s{model = M}, Request) ->
     erllama_nif:apply_chat_template(M, Request).
