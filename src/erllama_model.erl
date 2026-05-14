@@ -298,6 +298,15 @@ concurrently through one decode call per tick.
     %% Per-request sampler chain handle. `undefined` for prefill_only.
     sampler_ref :: term() | undefined,
     last_sampler_cfg = undefined :: map() | undefined,
+    %% Tokens to prefill AFTER the next cold save fires. Cold-save
+    %% policy splits the prompt into a trimmed prefix (which lands
+    %% as the cold save) and a remainder. The trimmed prefix goes
+    %% into prefill_cursor; this field holds the remainder. After
+    %% the trim's prefill tick fires the cold save, this gets
+    %% rotated into prefill_cursor on the next tick. `undefined`
+    %% when no cold save is pending (no_save policy, prefill_only
+    %% mode, or warm-restore path).
+    cold_save_remaining = undefined :: undefined | [non_neg_integer()],
     %% Set when this request has emitted its final result. The next
     %% step_tick iteration drops it from req_table; deferring the
     %% removal lets the tick walk results without mid-iteration
@@ -930,12 +939,31 @@ setup_lookup(Req, ParentKey, Data) ->
             %% per_seq.next_pos must start at 0. The NIF's
             %% kv_seq_rm refreshes the per-seq tracking.
             ok = backend_seq_clear(Req#req.seq_id, Data),
-            Req#req{
-                prefill_cursor = Req#req.prompt_tokens,
-                context_tokens = [],
-                cache_hit_kind = cold,
-                cache_hit_prefix_len = 0
-            }
+            %% Cold path splits into trimmed-prefix (the cold save
+            %% target) + remainder. The trim prefills first so the
+            %% kv_pack at save time captures exactly the trim's KV
+            %% state; only after that fires do we prefill the
+            %% remainder. With no_save the whole prompt prefills in
+            %% one tick and no cold save runs.
+            Tokens = Req#req.prompt_tokens,
+            case erllama_cache_policy:cold_save_split(Tokens, Data#data.policy) of
+                {trim, TrimmedPrefix, RemainingTokens} ->
+                    Req#req{
+                        prefill_cursor = TrimmedPrefix,
+                        cold_save_remaining = RemainingTokens,
+                        context_tokens = [],
+                        cache_hit_kind = cold,
+                        cache_hit_prefix_len = 0
+                    };
+                no_save ->
+                    Req#req{
+                        prefill_cursor = Tokens,
+                        cold_save_remaining = undefined,
+                        context_tokens = [],
+                        cache_hit_kind = cold,
+                        cache_hit_prefix_len = 0
+                    }
+            end
     end.
 
 %% Wipe seq's KV state so prefill starts at position 0. Used on the
@@ -1547,27 +1575,29 @@ mark_terminal(Data) ->
         Reqs
     ).
 
-%% Cold-save firing right after the prompt's prefill completes.
-%% Only fires when policy says yes AND this request hasn't yet
-%% fired a cold save (last_save_at = 0).
+%% Cold-save firing between the trim-prefill tick and the remainder
+%% tick. At this point the seq's KV holds exactly the trimmed
+%% prefix — kv_pack captures that state. The remainder is rotated
+%% into prefill_cursor so the next tick continues the prefill. With
+%% cold_save_remaining = undefined nothing fires (no_save policy,
+%% prefill_only mode, or warm path).
+maybe_fire_cold_save(Req = #req{cold_save_remaining = undefined}, _Data) ->
+    Req;
 maybe_fire_cold_save(
-    Req = #req{last_save_at = 0, context_tokens = Tokens},
+    Req = #req{cold_save_remaining = Remaining, context_tokens = Trimmed},
     Data
-) when Tokens =/= [] ->
-    %% Apply the policy split: only fire cold if the trim/no_save
-    %% rule allows. For the trimmed-prefix case we'd ideally save
-    %% a partial slice, but the new step path has already pushed
-    %% the full prompt into KV by now. So we fire a cold save of
-    %% the full prompt when the policy indicates it.
-    case erllama_cache_policy:cold_save_split(Tokens, Data#data.policy) of
-        {trim, TrimmedPrefix, _Rest} ->
-            _ = fire_save_for_tokens(cold, TrimmedPrefix, Req, Data),
-            Req#req{last_save_at = length(TrimmedPrefix)};
-        no_save ->
-            Req
-    end;
-maybe_fire_cold_save(Req, _Data) ->
-    Req.
+) ->
+    _ = fire_save_for_tokens(cold, Trimmed, Req, Data),
+    NextCursor =
+        case Remaining of
+            [] -> undefined;
+            _ -> Remaining
+        end,
+    Req#req{
+        cold_save_remaining = undefined,
+        last_save_at = length(Trimmed),
+        prefill_cursor = NextCursor
+    }.
 
 %% Continued-save: fire every continued_interval tokens since the
 %% last save fired.
