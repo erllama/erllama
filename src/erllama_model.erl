@@ -53,6 +53,8 @@ stubs get replaced; the cache integration is unaffected.
     set_adapter_scale/3,
     list_adapters/1,
     get_backend_state/1,
+    get_last_sampler_cfg/1,
+    get_request_sampler_ref/1,
     cache_key_meta/1,
     verify/4
 ]).
@@ -237,7 +239,17 @@ stubs get replaced; the cache integration is unaffected.
     %% lookup_or_resume time so the observability snapshot can carry
     %% a richer routing signal than the kind alone. 0 for cold or
     %% before any request has been admitted.
-    cache_hit_prefix_len = 0 :: non_neg_integer()
+    cache_hit_prefix_len = 0 :: non_neg_integer(),
+    %% Per-request sampler chain handle built at admit time and
+    %% freed at finish. `undefined` for prefill_only mode (no
+    %% sampling needed) and between requests. Held opaquely; the
+    %% backend defines the underlying type.
+    sampler_ref :: term() | undefined,
+    %% Snapshot of the sampler-config map fed to backend:sampler_new.
+    %% Test-only; exposed via `get_last_sampler_cfg/1` so the
+    %% sampler-plumbing tests can assert what landed on the backend
+    %% without poking at the (opaque) sampler_ref.
+    last_sampler_cfg = undefined :: map() | undefined
 }).
 
 %% =============================================================================
@@ -459,6 +471,23 @@ get_backend_state(Model) ->
     {_State, Data} = sys:get_state(via(Model)),
     Data#data.backend_state.
 
+%% Test-only: returns the sampler-config map the most recent admit
+%% passed into backend:sampler_new/2. `undefined` if no sampler has
+%% been built (fresh model, or last request was prefill_only). Used
+%% by erllama_sampler_tests to verify the cfg projection without
+%% poking at the opaque sampler_ref.
+-doc false.
+get_last_sampler_cfg(Model) ->
+    {_State, Data} = sys:get_state(via(Model)),
+    Data#data.last_sampler_cfg.
+
+%% Test-only: returns the current per-request sampler_ref or
+%% `undefined`. Used to assert the ref is freed at finish.
+-doc false.
+get_request_sampler_ref(Model) ->
+    {_State, Data} = sys:get_state(via(Model)),
+    Data#data.sampler_ref.
+
 %% Snapshot of the cache key triple a probe needs to hit the
 %% cache for this model's current state. Effective fingerprint
 %% (with attached LoRA composition) so the lookup matches what
@@ -621,7 +650,7 @@ public_verify_reply({ok, Accepted, NextToken, _NewBState}) ->
     {ok, Accepted, NextToken}.
 
 start_complete(From, Prompt, Opts, Data) ->
-    case configure_sampler_for(Opts, Data) of
+    case sampler_for(Opts, Data) of
         {ok, Data0} ->
             PromptTokens = backend_call(Data0, tokenize, [Prompt]),
             Data1 = Data0#data{
@@ -646,32 +675,28 @@ start_complete(From, Prompt, Opts, Data) ->
     end.
 
 start_prefill_only(From, PromptTokens, Data) ->
-    %% Reset any leftover sampler state from a previous request so the
-    %% prefill-only path stays deterministic regardless of what ran
-    %% before. The sampler chain is not used here, but backends that
-    %% lazily allocate state may rely on the reset.
-    case configure_sampler_for(#{}, Data) of
-        {ok, Data0} ->
-            Data1 = Data0#data{
-                mode = prefill_only,
-                caller = From,
-                caller_pid = undefined,
-                request_ref = undefined,
-                cancel_pending = false,
-                prompt_tokens = PromptTokens,
-                response_target = 0,
-                generated = [],
-                prefill_started_at = erlang:monotonic_time(millisecond),
-                request_fp = Data0#data.effective_fp
-            },
-            enter_after_lookup(undefined, Data1);
-        {error, Reason} ->
-            {keep_state, Data, [{reply, From, {error, Reason}}]}
-    end.
+    %% prefill_only never samples, so no sampler_ref is built. Clear
+    %% any leftover from a prior request and proceed straight to the
+    %% lookup.
+    Data0 = sampler_release(Data),
+    Data1 = Data0#data{
+        mode = prefill_only,
+        caller = From,
+        caller_pid = undefined,
+        request_ref = undefined,
+        cancel_pending = false,
+        prompt_tokens = PromptTokens,
+        response_target = 0,
+        generated = [],
+        prefill_started_at = erlang:monotonic_time(millisecond),
+        request_fp = Data#data.effective_fp,
+        last_sampler_cfg = undefined
+    },
+    enter_after_lookup(undefined, Data1).
 
 start_infer(From, Tokens, Params, CallerPid, Data) ->
     Ref = make_ref(),
-    case configure_sampler_for(Params, Data) of
+    case sampler_for(Params, Data) of
         {ok, Data0} ->
             ok = erllama_inflight:register(Ref, self()),
             Data1 = Data0#data{
@@ -1058,26 +1083,51 @@ obs_row(Phase, Data) ->
 
 enter_prefilling(Data) ->
     ok = obs_refresh(prefilling, Data),
-    %% Reset seq 0 so the cold prefill starts at position 0.
-    %% llama_batch_get_one auto-positions the new batch starting at
-    %% n_past, so without this guard the second cold request on the
-    %% same model would write its prompt KV at positions
-    %% [previous_n_past..] instead of [0..], producing different
-    %% output for the same prompt + seed across repeated calls.
-    %% Warm restores via kv_unpack overwrite the seq state directly
-    %% and don't need this.
+    %% Reset seq 0 before the cold prefill so its KV cells start at
+    %% position 0. nif_step assigns positions from
+    %% per_seq[seq_id].next_pos, which kv_seq_rm resets — without
+    %% this, a second cold request on the same model would write
+    %% its prompt KV at the residual position of the prior request.
+    %% Warm restores via kv_unpack call this implicitly via the
+    %% primer flow and don't need it.
     ok = maybe_seq_clear(Data),
     Tokens = Data#data.prompt_tokens,
     case erllama_cache_policy:cold_save_split(Tokens, Data#data.policy) of
         {trim, TrimmedPrefix, RemainingTokens} ->
-            ok = backend_call(Data, prefill, [TrimmedPrefix]),
+            ok = step_prefill(TrimmedPrefix, Data),
             ok = fire_cold_save(TrimmedPrefix, Data),
-            ok = backend_call(Data, prefill, [RemainingTokens]);
+            ok = step_prefill(RemainingTokens, Data);
         no_save ->
-            ok = backend_call(Data, prefill, [Tokens])
+            ok = step_prefill(Tokens, Data)
     end,
     Data1 = Data#data{context_tokens = Tokens},
     after_prefill(Data1).
+
+%% Drive one `step` call with a single prefill op on seq 0. The NIF
+%% leaves logits ready on the last token of the slice so the next
+%% `step_decode` call can sample.
+step_prefill([], _Data) ->
+    %% An empty prefill slice is a no-op; the backend would reject it
+    %% (read_token_list rejects n=0 inside the NIF) so skip the call.
+    ok;
+step_prefill(Tokens, Data) ->
+    case backend_call(Data, step, [[{0, {prefill, Tokens}}]]) of
+        {ok, [{0, prefilled}]} -> ok;
+        {error, _} = E -> E
+    end.
+
+%% Drive one `step` call with a single decode op on seq 0. Returns
+%% the sampled token plus an EoG flag; the caller decides whether
+%% to advance or finish. Bridges the new `step/2` result shape back
+%% to the gen_statem's existing eog handling.
+step_decode(#data{sampler_ref = undefined}) ->
+    {error, no_sampler};
+step_decode(Data = #data{sampler_ref = Ref}) ->
+    case backend_call(Data, step, [[{0, {decode, Ref}}]]) of
+        {ok, [{0, {token, T, 0}}]} -> {ok, T, false};
+        {ok, [{0, {token, T, 1}}]} -> {ok, T, true};
+        {error, _} = E -> E
+    end.
 
 enter_generating(Data) ->
     %% Decode token-by-token via cast-to-self events so continued
@@ -1097,22 +1147,22 @@ enter_generating(Data) ->
 decode_step(Data = #data{cancel_pending = true}) ->
     %% Honoured between tokens. The current decode step has already
     %% returned; we finish with cancelled => true and never call
-    %% decode_one again.
+    %% step again.
     finish_request_cancelled(Data);
 decode_step(Data) ->
     case length(Data#data.generated) >= Data#data.response_target of
         true ->
             finish_request(Data, length);
         false ->
-            case backend_call(Data, decode_one, [Data#data.context_tokens]) of
-                {ok, Token} ->
+            case step_decode(Data) of
+                {ok, Token, false} ->
                     advance_with(Token, Data);
-                {eog, Token} ->
+                {ok, Token, true} ->
                     Data1 = append_token(Token, Data),
                     Data2 = stream_emit(Token, Data1),
                     finish_request(Data2, stop);
                 {error, _} = E ->
-                    Data1 = reset(Data),
+                    Data1 = reset(sampler_release(Data)),
                     case Data#data.mode of
                         standard ->
                             {next_state, idle, Data1, [{reply, Data#data.caller, E}]};
@@ -1173,6 +1223,14 @@ reset(Data) ->
         cancel_pending = false,
         prefill_started_at = undefined,
         generation_started_at = undefined,
+        %% sampler_ref is cleared because the request has finished
+        %% (sampler_release ran first if applicable). last_sampler_cfg
+        %% is NOT cleared — it's a debug/test snapshot that survives
+        %% across requests so plumbing tests can read back the cfg
+        %% that landed on the backend, matching the pre-step
+        %% behaviour where the cfg was preserved on the backend
+        %% state past clear_sampler.
+        sampler_ref = undefined,
         %% Keep the last cache_hit_* values around so the obs row
         %% (which is read by external routers between requests)
         %% still reflects the most recent admission rather than
@@ -1202,7 +1260,8 @@ maybe_fire_continued(Data) ->
 
 finish_request(Data, FinishReason) ->
     FinishKey = finish_key_or_undefined(fire_finish_save(Data#data.context_tokens, Data)),
-    {ok, Data1} = clear_grammar(Data),
+    {ok, Data1a} = clear_grammar(Data),
+    Data1 = sampler_release(Data1a),
     case Data1#data.mode of
         standard ->
             Reply = backend_call(Data1, detokenize, [Data1#data.generated]),
@@ -1229,7 +1288,8 @@ finish_request_cancelled(Data) ->
     %% Cancelled requests still fire a finish save: whatever live
     %% context exists is worth keeping for resume.
     FinishKey = finish_key_or_undefined(fire_finish_save(Data#data.context_tokens, Data)),
-    {ok, Data1} = clear_grammar(Data),
+    {ok, Data1a} = clear_grammar(Data),
+    Data1 = sampler_release(Data1a),
     Stats = build_stats(cancelled, true, FinishKey, Data1),
     send_done(Data1, Stats),
     return_to_idle(reset(Data1), []).
@@ -1321,15 +1381,47 @@ send_error(_, _) ->
 sampler_cfg_from(Opts) ->
     maps:with(?SAMPLER_KEYS, Opts).
 
-%% Configure the per-request sampler chain. Wired to both
-%% configure_sampler/2 (preferred) and the older set_grammar/2 callback
-%% as a fallback for backends that haven't been ported. If the caller
-%% passed no sampler keys at all we still call the backend so any
-%% leftover state from a previous request is reset.
-configure_sampler_for(Opts, Data) ->
+%% Build a per-request sampler chain via the new behaviour callback
+%% (`backend:sampler_new/2`) and stash the ref + cfg on #data. The
+%% ref is consumed by `step/2` as the decode-row sampler and freed
+%% via `sampler_free/1` at finish. Backends that haven't been ported
+%% to the new surface fall through to the old configure_sampler/2
+%% path so existing setups keep working.
+sampler_for(Opts, Data = #data{backend = Mod, backend_state = S}) ->
     Cfg = sampler_cfg_from(Opts),
-    configure_sampler_call(Cfg, Data).
+    case erlang:function_exported(Mod, sampler_new, 2) of
+        true ->
+            case Mod:sampler_new(S, Cfg) of
+                {ok, Ref} ->
+                    {ok, Data#data{sampler_ref = Ref, last_sampler_cfg = Cfg}};
+                {error, _} = E ->
+                    E
+            end;
+        false ->
+            %% Legacy backend without sampler_new — drop into the
+            %% pre-step configure_sampler path. Such backends also
+            %% don't implement step/2 and will be unusable by the
+            %% new decode loop; this just preserves the error story.
+            configure_sampler_call(Cfg, Data)
+    end.
 
+%% Free a per-request sampler ref. Safe to call on `undefined`
+%% (prefill_only or pre-admit state); falls through silently.
+sampler_release(Data = #data{sampler_ref = undefined}) ->
+    Data;
+sampler_release(Data = #data{sampler_ref = Ref, backend = Mod}) ->
+    case erlang:function_exported(Mod, sampler_free, 1) of
+        true ->
+            _ = Mod:sampler_free(Ref),
+            ok;
+        false ->
+            ok
+    end,
+    Data#data{sampler_ref = undefined}.
+
+%% Legacy configure_sampler fallback for backends that haven't been
+%% ported to sampler_new. Called from `sampler_for/2` only; the new
+%% decode loop never calls it directly.
 configure_sampler_call(Cfg, Data = #data{backend = Mod, backend_state = S}) ->
     case erlang:function_exported(Mod, configure_sampler, 2) of
         true ->
@@ -1656,17 +1748,17 @@ via(ModelId) when is_binary(ModelId) ->
 %% prefill call: the last "context" token gets popped, prepended to the
 %% remaining list, and the whole batch goes through one llama_decode.
 prime_logits([], Remaining, Data) ->
-    backend_call(Data, prefill, [Remaining]);
+    step_prefill(Remaining, Data);
 prime_logits(ContextTokens, Remaining, #data{backend = Mod} = Data) ->
     case erlang:function_exported(Mod, seq_rm_last, 2) of
         true ->
             N = length(ContextTokens),
             Last = lists:last(ContextTokens),
             ok = backend_call(Data, seq_rm_last, [N]),
-            backend_call(Data, prefill, [[Last | Remaining]]);
+            step_prefill([Last | Remaining], Data);
         false ->
             %% Backends without a real KV cache (e.g. the stub) just
             %% prefill any remaining tokens; the saved "state" carries
             %% no logits anyway.
-            backend_call(Data, prefill, [Remaining])
+            step_prefill(Remaining, Data)
     end.
