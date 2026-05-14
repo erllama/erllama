@@ -989,16 +989,20 @@ backend_seq_clear(SeqId, #data{backend = Mod, backend_state = S}) ->
 %% kv_unpack, drop the last cell so the model layer can re-prefill
 %% it to refresh logits. Mirrors the v0.2 prime_logits/3 flow but
 %% per-seq.
+%%
+%% Both seq_rm_last arities take the seq's CURRENT length and
+%% remove the cell at position N-1 (via kv_seq_rm(SeqId, N-1, -1)).
+%% Passing N here, not 1: N is the cell-count after kv_unpack, and
+%% the backend uses N-1 as the start position for the removal.
 warm_restore_primer(_SeqId, [], _Data) ->
     ok;
 warm_restore_primer(SeqId, ContextTokens, Data) ->
     N = length(ContextTokens),
     Mod = Data#data.backend,
     S = Data#data.backend_state,
-    %% kv_unpack already ran inside pin_and_load. Drop the last cell.
     case erlang:function_exported(Mod, seq_rm_last, 3) of
         true ->
-            _ = Mod:seq_rm_last(S, SeqId, 1),
+            _ = Mod:seq_rm_last(S, SeqId, N),
             ok;
         false ->
             case erlang:function_exported(Mod, seq_rm_last, 2) of
