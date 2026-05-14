@@ -73,6 +73,16 @@ crashes deliberately so the supervisor restarts and the operator
 fixes `n_batch` / `n_seq_max`. Otherwise prefill rows are sliced
 head-first to fit; truncated tails resume next tick.
 
+## Chunked prefill
+
+Each prefill row is additionally capped by the `prefill_chunk_size`
+policy knob (default `max(64, n_batch div 4)`, or `infinity` to
+disable). The effective slice per prefill row is
+`min(length(remaining), prefill_chunk_size, available_budget)`. A
+long prompt is therefore sliced across several ticks even when the
+batch budget alone would have accommodated it in one, leaving room
+for concurrent decoders to make progress between chunks.
+
 ## Cache save reasons
 
 - **cold**: fired right after a fresh prompt's prefill completes,
@@ -140,6 +150,7 @@ concurrently through one decode call per tick.
     get_backend_state/1,
     get_last_sampler_cfg/1,
     get_request_sampler_ref/1,
+    get_policy/1,
     cache_key_meta/1,
     verify/4
 ]).
@@ -612,6 +623,14 @@ get_request_sampler_ref(Model) ->
     {_State, Data} = sys:get_state(via(Model)),
     Data#data.last_sampler_ref.
 
+%% Test-only: returns the resolved policy map. Used to assert
+%% defaults (e.g. `prefill_chunk_size`) without poking record
+%% layout from the test module.
+-doc false.
+get_policy(Model) ->
+    {_State, Data} = sys:get_state(via(Model)),
+    Data#data.policy.
+
 %% Snapshot of the cache key triple a probe needs to hit the
 %% cache for this model's current state. Effective fingerprint
 %% (with attached LoRA composition) so the lookup matches what
@@ -663,7 +682,7 @@ build_init_data(ModelId, Config, Backend, BState) ->
         quant_bits = maps:get(quant_bits, Config, 16),
         ctx_params_hash = maps:get(ctx_params_hash, Config, default_ctx_params_hash()),
         context_size = maps:get(context_size, Config, 4096),
-        policy = resolve_policy(Config),
+        policy = resolve_policy(Config, NBatch),
         backend = Backend,
         backend_state = BState,
         adapters = [],
@@ -699,7 +718,12 @@ compute_vram_estimate(Backend, BState) ->
 
 %% Per-model policy. Caller can override any subset; missing keys
 %% fall back to the app env defaults declared in `erllama.app.src`.
-resolve_policy(Config) ->
+%%
+%% `prefill_chunk_size` defaults to `max(64, NBatch div 4)` so a
+%% long prompt doesn't monopolise the batch and stall concurrent
+%% decoders. Pass `infinity` to disable per-row chunking (the per-
+%% tick batch budget still applies).
+resolve_policy(Config, NBatch) ->
     Defaults = #{
         min_tokens => application:get_env(erllama, min_tokens, 512),
         cold_min_tokens => application:get_env(erllama, cold_min_tokens, 512),
@@ -707,7 +731,8 @@ resolve_policy(Config) ->
         continued_interval => application:get_env(erllama, continued_interval, 2048),
         boundary_trim_tokens => application:get_env(erllama, boundary_trim_tokens, 32),
         boundary_align_tokens => application:get_env(erllama, boundary_align_tokens, 2048),
-        session_resume_wait_ms => application:get_env(erllama, session_resume_wait_ms, 500)
+        session_resume_wait_ms => application:get_env(erllama, session_resume_wait_ms, 500),
+        prefill_chunk_size => max(64, NBatch div 4)
     },
     maps:merge(Defaults, maps:get(policy, Config, #{})).
 
@@ -1353,7 +1378,8 @@ step_tick(Data) ->
         {OpList, FinishersFirst} ->
             case backend_call(Data1, step, [OpList]) of
                 {ok, Results} ->
-                    Data2 = apply_step_results(Results, Data1),
+                    Pairs = pair_ops_with_results(OpList, Results),
+                    Data2 = apply_step_results(Pairs, Data1),
                     tick_after_step(Data2, FinishersFirst, []);
                 {error, _} = Err ->
                     %% A backend error mid-tick poisons every in-flight
@@ -1364,6 +1390,14 @@ step_tick(Data) ->
                     {stop, {step_failed, Err}, Data1}
             end
     end.
+
+%% Pair each op with its result by matching on seq_id. The backend
+%% returns results in op-list order but we tolerate reordering by
+%% looking up each op's result via its seq_id; the (seq_id, op)
+%% pair is unique within a tick.
+pair_ops_with_results(OpList, Results) ->
+    ResultBySeq = maps:from_list(Results),
+    [{Op, maps:get(SeqId, ResultBySeq)} || {SeqId, _} = Op <- OpList].
 
 %% After a step (or a no-op tick), walk finishing-marked reqs,
 %% emit replies/stream-done, free samplers + seqs, dispatch from
@@ -1436,8 +1470,11 @@ build_op_list(Data) ->
 
 %% Bound the op list to total_batch_budget. Decode rows (each 1
 %% token) are kept whole; prefill rows are sliced head-first.
+%% Each prefill row is additionally capped at `prefill_chunk_size`
+%% so a long prompt doesn't monopolise the batch.
 apply_batch_budget(Ops, Data) ->
     Budget = Data#data.total_batch_budget,
+    ChunkSize = maps:get(prefill_chunk_size, Data#data.policy, infinity),
     DecCount = length([{S, O} || {S, {decode, _}} = {S, O} <- Ops, _ <- [1]]),
     case DecCount >= Budget of
         true ->
@@ -1446,78 +1483,81 @@ apply_batch_budget(Ops, Data) ->
             %% empty-tick error.
             erlang:error({n_batch_too_small_for_n_seq_max, Budget, DecCount});
         false ->
-            slice_prefills(Ops, Budget - DecCount)
+            slice_prefills(Ops, Budget - DecCount, ChunkSize)
     end.
 
-slice_prefills(Ops, Remaining) ->
-    slice_prefills(Ops, Remaining, []).
+slice_prefills(Ops, Remaining, ChunkSize) ->
+    slice_prefills(Ops, Remaining, ChunkSize, []).
 
-slice_prefills([], _Remaining, Acc) ->
+slice_prefills([], _Remaining, _ChunkSize, Acc) ->
     lists:reverse(Acc);
-slice_prefills([{SeqId, {decode, R}} | T], Remaining, Acc) ->
-    slice_prefills(T, Remaining, [{SeqId, {decode, R}} | Acc]);
-slice_prefills([{_SeqId, {prefill, _Tokens}} | T], Remaining, Acc) when Remaining =< 0 ->
+slice_prefills([{SeqId, {decode, R}} | T], Remaining, ChunkSize, Acc) ->
+    slice_prefills(T, Remaining, ChunkSize, [{SeqId, {decode, R}} | Acc]);
+slice_prefills([{_SeqId, {prefill, _Tokens}} | T], Remaining, ChunkSize, Acc) when
+    Remaining =< 0
+->
     %% Budget exhausted: drop this prefill from the current tick;
     %% it'll resume next tick. apply_step_results doesn't see this
     %% op so the cursor stays where it was.
-    slice_prefills(T, 0, Acc);
-slice_prefills([{SeqId, {prefill, Tokens}} | T], Remaining, Acc) ->
-    case length(Tokens) of
-        N when N =< Remaining ->
-            slice_prefills(T, Remaining - N, [{SeqId, {prefill, Tokens}} | Acc]);
-        _ ->
-            Slice = lists:sublist(Tokens, Remaining),
-            slice_prefills(T, 0, [{SeqId, {prefill, Slice}} | Acc])
+    slice_prefills(T, 0, ChunkSize, Acc);
+slice_prefills([{SeqId, {prefill, Tokens}} | T], Remaining, ChunkSize, Acc) ->
+    Cap = prefill_slice_cap(length(Tokens), Remaining, ChunkSize),
+    case Cap >= length(Tokens) of
+        true ->
+            slice_prefills(
+                T, Remaining - length(Tokens), ChunkSize, [{SeqId, {prefill, Tokens}} | Acc]
+            );
+        false ->
+            Slice = lists:sublist(Tokens, Cap),
+            slice_prefills(T, Remaining - Cap, ChunkSize, [{SeqId, {prefill, Slice}} | Acc])
     end.
 
-%% Apply step result list back into the req_table. Each row's seq_id
-%% identifies its #req. Prefill results advance the cursor; decode
-%% results append the sampled token.
+prefill_slice_cap(N, Remaining, infinity) ->
+    min(N, Remaining);
+prefill_slice_cap(N, Remaining, ChunkSize) when is_integer(ChunkSize), ChunkSize > 0 ->
+    min(N, min(Remaining, ChunkSize)).
+
+%% Apply step result list back into the req_table. Each entry is
+%% the op the scheduler sent paired with the backend's result for
+%% that op. Prefill results advance the cursor by the actual slice
+%% length the slicer kept; decode results append the sampled token.
 apply_step_results([], Data) ->
     Data;
-apply_step_results([{SeqId, prefilled} | T], Data) ->
+apply_step_results([{{SeqId, {prefill, Slice}}, prefilled} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
-    Slice =
+    SentLen = length(Slice),
+    Cursor0 =
         case Req#req.prefill_cursor of
             undefined -> [];
             L -> L
         end,
-    %% Determine how many tokens were just pushed. With the budget
-    %% slicer we may have pushed less than length(Slice); we need
-    %% to know what was sent. The slicer doesn't tell us directly,
-    %% so we recompute from the unsliced cursor: the budget pass
-    %% above mirrored the op-list build, so the actual `Sent` is
-    %% whatever the slicer kept — which we cannot recover here
-    %% post-fact. As a conservative approximation: since the
-    %% slicer drops a prefill rather than partially keeping it
-    %% past the budget edge, the prefill that DID land carried its
-    %% full slice. (Mid-slice splits happen too; see slice_prefills
-    %% — they keep the head and drop the tail. The remaining tokens
-    %% stay in the cursor.) So either the whole slice ran or a
-    %% prefix did. We snapshot the cursor pre-step via a
-    %% backreference: stored on #req.prefill_cursor by the original
-    %% admit / by the previous apply_step_results.
-    %%
-    %% Pragmatic approach: assume the whole cursor was prefilled
-    %% (works for n_seq_max=1 single-tenant where the slicer never
-    %% truncates). PR5 will add chunked prefill, which needs a more
-    %% precise cursor advance — at that point we'll track sent
-    %% slices explicitly.
-    Tokens = Slice,
-    NewContext = Req#req.context_tokens ++ Tokens,
+    Remaining = lists:nthtail(SentLen, Cursor0),
+    NewContext = Req#req.context_tokens ++ Slice,
+    NewCursor =
+        case Remaining of
+            [] -> undefined;
+            _ -> Remaining
+        end,
     Req1 = Req#req{
-        prefill_cursor = undefined,
+        prefill_cursor = NewCursor,
         context_tokens = NewContext,
-        last_save_at = 0,
         generation_started_at =
             case Req#req.generation_started_at of
                 undefined -> erlang:monotonic_time(millisecond);
                 G -> G
             end
     },
-    Req2 = maybe_fire_cold_save(Req1, Data),
+    %% Cold save fires only on the transition from cursor non-empty
+    %% to cursor empty: at that point the seq's KV holds exactly the
+    %% trimmed prefix that cold_save_split selected, and the
+    %% remainder rotates back into prefill_cursor.
+    Req2 =
+        case NewCursor of
+            undefined -> maybe_fire_cold_save(Req1#req{last_save_at = 0}, Data);
+            _ -> Req1
+        end,
     apply_step_results(T, put_req(Data, Req2));
-apply_step_results([{SeqId, {token, Tok, EogFlag}} | T], Data) ->
+apply_step_results([{{SeqId, {decode, _}}, {token, Tok, EogFlag}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     Req1 = req_append_token(Req, Tok),
     Req2 = req_stream_emit(Req1, Tok, Data),

@@ -51,7 +51,8 @@
     temperature_zero_is_greedy/1,
     grammar_plus_sampler/1,
     verify_does_not_mutate_caller_visible_state/1,
-    verify_accepted_count_le_k/1
+    verify_accepted_count_le_k/1,
+    chunked_prefill_matches_unchunked/1
 ]).
 
 -define(MODEL_ENV, "LLAMA_TEST_MODEL").
@@ -85,7 +86,8 @@ all() ->
         temperature_zero_is_greedy,
         grammar_plus_sampler,
         verify_does_not_mutate_caller_visible_state,
-        verify_accepted_count_le_k
+        verify_accepted_count_le_k,
+        chunked_prefill_matches_unchunked
     ].
 
 init_per_suite(Config) ->
@@ -451,6 +453,41 @@ grammar_plus_sampler(Config) ->
     ?assert(Trimmed1 =:= <<"yes">> orelse Trimmed1 =:= <<"no">>),
     ?assertEqual(Text1, Text2),
     ok.
+
+%% Under greedy sampling (temperature => 0) two runs of the same
+%% prompt must produce byte-identical output regardless of how the
+%% scheduler slices the prefill. Restart the model first with a
+%% large chunk size (whole prompt in one tick), capture the reply,
+%% restart with a small chunk size (many ticks), capture again, and
+%% assert equality. Catches positional-embedding bugs in nif_step
+%% and last_logits_idx bookkeeping when the seq's last logits-
+%% emitting row moves between ticks.
+chunked_prefill_matches_unchunked(Config) ->
+    Path = ?config(model_path, Config),
+    DiskSrv = ?config(disk_srv, Config),
+    Model = ?config(model, Config),
+    Params = #{response_tokens => 12, temperature => 0.0, seed => 1},
+    %% Run 1: unchunked.
+    ok = erllama_model:stop(Model),
+    {ok, _} = erllama_model:start_link(
+        Model, chunked_model_config(Path, DiskSrv, infinity)
+    ),
+    {ok, Tokens} = erllama:tokenize(Model, ?LONG_PROMPT),
+    {Text1, _} = run_infer(Model, Tokens, Params),
+    %% Run 2: small chunk size.
+    ok = erllama_model:stop(Model),
+    {ok, _} = erllama_model:start_link(
+        Model, chunked_model_config(Path, DiskSrv, 16)
+    ),
+    {Text2, _} = run_infer(Model, Tokens, Params),
+    ?assertEqual(Text1, Text2),
+    ok.
+
+chunked_model_config(Path, DiskSrv, ChunkSize) ->
+    Base = model_config(Path, DiskSrv),
+    Policy0 = maps:get(policy, Base),
+    Policy = Policy0#{prefill_chunk_size => ChunkSize},
+    Base#{policy => Policy}.
 
 run_infer(Model, Tokens, Params) ->
     {ok, Ref} = erllama:infer(Model, Tokens, Params, self()),
