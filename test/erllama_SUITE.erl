@@ -205,9 +205,19 @@ warm_read_pins_via_checkout(Config) ->
         1,
         maps:get(hits_exact, After) - maps:get(hits_exact, Before)
     ),
-    %% Find the cold-save row in the meta and confirm hits >= 1.
-    [Row | _] = erllama_cache_meta_srv:dump(),
-    ?assert(element(?POS_HITS, Row) >= 1),
+    %% Confirm at least one row was pinned via checkout. Looking at
+    %% just the first row of dump/0 is fragile: TBL_META is a `set`
+    %% table whose ordering depends on key hashes, and finish-save
+    %% keys can include non-deterministic generated tokens, so the
+    %% first row could be the (POS_HITS=0) finish row rather than
+    %% the (POS_HITS>=1) cold row that actually got hit. Scan all
+    %% rows instead.
+    ?assert(
+        lists:any(
+            fun(R) -> element(?POS_HITS, R) >= 1 end,
+            erllama_cache_meta_srv:dump()
+        )
+    ),
     ok.
 
 eviction_drops_files_and_meta(Config) ->
