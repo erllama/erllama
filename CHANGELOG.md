@@ -6,10 +6,11 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-## [0.2.0] - unreleased
+## [0.2.0] - 2026-05-15
 
-API reshape: `complete/2,3` now returns a map, and `prefill_only/2`
-is added so sessions can warm KV without sampling a reply.
+Multi-sequence batched scheduling, map-shaped completion results,
+chunked prefill, per-model observability, and direct passthrough of
+the llama.cpp multi-GPU / flash-attention / KV-quant params.
 
 ### Changed (breaking)
 
@@ -18,52 +19,135 @@ is added so sessions can warm KV without sampling a reply.
   `{ok, ReplyBinary, GeneratedTokens}` tuple. The map carries:
   - `reply :: binary()`
   - `generated :: [token_id()]`
-  - `context_tokens :: [token_id()]` — full token list (prompt ++ generated)
-  - `committed_tokens :: non_neg_integer()` — `length(context_tokens)`
+  - `context_tokens :: [token_id()]` (prompt ++ generated)
+  - `committed_tokens :: non_neg_integer()` (`length(context_tokens)`)
   - `finish_key :: cache_key() | undefined` — token-exact key for the
     full context, suitable as `parent_key` on the next turn;
     `undefined` if the finish save was suppressed
   - `cache_hit_kind :: exact | partial | cold`
   - `finish_reason :: stop | length | cancelled`
   - `stats :: stats()`
+
+  Mechanical migration:
+
+  ```erlang
+  %% before
+  {ok, Reply, _Tokens} = erllama:complete(Model, Prompt).
+  %% after
+  {ok, #{reply := Reply, finish_key := FK}} =
+      erllama:complete(Model, Prompt).
+  ```
+
 - Streaming `{erllama_done, Ref, Stats}` (`infer/4`) `Stats` map
-  gains two additive keys: `finish_key` and `committed_tokens`.
-  No shape break — existing keys (`prompt_tokens`,
-  `completion_tokens`, `prefill_ms`, `generation_ms`,
-  `cache_hit_kind`, `finish_reason`, `cancelled`) remain.
+  gains two additive keys: `finish_key` and `committed_tokens`. No
+  shape break for existing consumers (#21).
 
 ### Added
 
-- `erllama:prefill_only/2` and `erllama_model:prefill_only/2` —
-  decode a prompt into KV state and fire a finish save without
-  sampling any output tokens. Returns a `prefill_result()` map with
-  `context_tokens`, `committed_tokens`, `finish_key`, and
-  `cache_hit_kind`. Useful for priming the cache or holding a warm
-  session across long pauses without consuming generation budget.
-- New `completion_result()` and `prefill_result()` exported types in
-  `erllama_model`.
+#### Multi-sequence batched scheduler (#24, #25, #26, #27)
+
+- `erllama_nif:step/2` is the new multi-sequence batched decode
+  primitive. One `llama_decode` call mixes prefill and decode rows
+  freely (SARATHI-style co-batching), bounded by the live context's
+  `n_batch`. Returns `{error, batch_overflow}` cleanly so a
+  budget-aware scheduler can shrink and retry, and `{error,
+  no_logits}` when a decode row has no prefill yet on its seq.
+- Per-context `per_seq[]` tracking (`last_logits_idx`, `next_pos`)
+  with `ERLLAMA_N_SEQ_MAX_CAP = 256`. `kv_unpack` / `kv_seq_rm`
+  refresh the per-seq position so subsequent `step` calls see
+  correct state.
+- `erllama_model_backend` behaviour gains optional callbacks
+  `step/2`, `sampler_new/2`, `sampler_free/1`, `seq_rm/2`,
+  `seq_rm_last/3`, plus seq-aware `kv_pack/3` and `kv_unpack/3`.
+  All optional; existing backends keep compiling.
+- The model gen_statem now runs a multi-tenant scheduler. With
+  `context_opts.n_seq_max => 1` (the default), behaviour is
+  bit-identical to 0.1: exactly one request runs at a time. Setting
+  `n_seq_max > 1` lets up to N requests prefill and decode
+  concurrently through one `llama_decode` per tick. State collapses
+  from `idle/prefilling/generating` to `idle/running`; admissions
+  past the seq-id capacity queue FIFO in `pending`.
+- Each in-flight request owns its own sampler chain (built at
+  admission via `backend:sampler_new/2`, freed at finish), so
+  concurrent requests with different `temperature` / `seed` /
+  `grammar` settings never share sampler state.
+- Cache save reasons (`cold`, `continued`, `finish`, `evict`,
+  `shutdown`) all thread through the request's `seq_id` and remain
+  token-exact per-sequence.
+
+#### Chunked prefill (#28)
+
 - `prefill_chunk_size` policy knob caps how many tokens a single
-  prefill row contributes to one `step_tick` (default
-  `max(64, n_batch div 4)`, or `infinity` to disable). A long
+  prefill row contributes to one tick. Default
+  `max(64, n_batch div 4)`; pass `infinity` to disable. A long
   prompt is sliced across multiple ticks so it never monopolises
   the batch and concurrent decoders keep making progress between
-  chunks. Layered on the multi-sequence scheduler from 0.2.0; the
-  per-tick batch budget still applies as a safety net.
+  chunks. Layered on top of the `n_batch` per-tick budget.
 
-### Migration
+#### `prefill_only/2` (#21)
 
-Callers matching the old 3-tuple need the map shape. Mechanical:
+- `erllama:prefill_only/2` and `erllama_model:prefill_only/2` decode
+  a prompt into KV state and fire a finish save without sampling
+  any output tokens. Returns a `prefill_result()` map carrying
+  `context_tokens`, `committed_tokens`, `finish_key`, and
+  `cache_hit_kind`. Useful for priming the cache before a burst of
+  short follow-ups, or for holding a warm session across long pauses
+  without consuming generation budget.
 
-```erlang
-%% before:
-{ok, Reply, _Tokens} = erllama:complete(Model, Prompt).
+#### Per-model observability (#22)
 
-%% after:
-{ok, #{reply := Reply}} = erllama:complete(Model, Prompt).
-```
+- New public ETS table `erllama_model_obs`, owned by
+  `erllama_inflight`, written by each model gen_statem on every
+  state transition and read lock-free from any process (including
+  remote nodes via `erpc`).
+- Four new accessors on `erllama`:
+  - `phase/1`: `idle | prefilling | generating` for one model id.
+  - `pending_len/1`: gen_statem pending FIFO depth (calls queued
+    behind whatever is currently running).
+  - `last_cache_hit/1`: `#{kind, prefix_len}` of the most recent
+    admission, or `undefined` if the model has never admitted.
+  - `queue_depth/1`: per-model variant of the existing global
+    `queue_depth/0`; counts admitted streaming `infer/4` rows.
+- `model_info/1` map gains `phase`, `pending_len`, and
+  `last_cache_hit` keys. Additive: existing keys preserved.
 
-Streaming consumers need no code change unless they want the new
-`finish_key` / `committed_tokens` keys.
+#### llama.cpp option passthrough (#23)
+
+- `erllama_nif:load_model/2` now reads three additional keys from
+  `model_opts`:
+  - `split_mode :: none | layer | row`: multi-GPU split policy.
+  - `main_gpu :: non_neg_integer()`: GPU index when `split_mode = none`.
+  - `tensor_split :: [float()]`: per-device proportions (up to 16
+    entries; shorter lists zero-fill).
+- `erllama_nif:new_context/2` reads three more from `context_opts`:
+  - `flash_attn :: boolean() | auto`: enable, disable, or defer to
+    llama.cpp.
+  - `type_k`, `type_v :: f16 | f32 | bf16 | q4_0 | q5_0 | q5_1 | q8_0`:
+    KV cache element type for keys and values.
+- Bad atoms raise `badarg` before the load runs.
+
+### Fixed
+
+- `warm_restore_primer` passed `1` instead of the current cell count
+  to the prefill primer, so warm restores that ran the primer at a
+  non-zero offset wrote KV at the wrong position. The primer now
+  takes the live cell count from the per-seq tracker.
+- The cold prefill path could fire the cold save inside the
+  remainder prefill rather than between the trim prefix and the
+  remainder, leading to a save row that did not match the
+  trim-aligned boundary. The cold save now fires at the
+  cursor-emptied transition between the trim and the remainder.
+
+### Internal
+
+- New types exported from `erllama_model`: `completion_result/0`,
+  `prefill_result/0`.
+- `erllama_model_t` now owns the `tensor_split` buffer; the vendored
+  llama.cpp aliases the pointer rather than copying it, so its
+  storage must outlive the model.
+- `erllama_model_stub` derives per-seq tokens from
+  `phash2({decode_step_stub, SeqId, Sampler})` so a scheduler bug
+  that swaps samplers between seqs becomes observable in tests.
 
 ## [0.1.2] - 2026-05-12
 
@@ -425,7 +509,8 @@ Initial public release.
 
 Same idea as [antirez/ds4](https://github.com/antirez/ds4).
 
-[Unreleased]: https://github.com/erllama/erllama/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/erllama/erllama/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/erllama/erllama/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/erllama/erllama/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/erllama/erllama/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/erllama/erllama/releases/tag/v0.1.0

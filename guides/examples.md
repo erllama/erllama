@@ -218,7 +218,93 @@ The grammar is per-request: the sampler chain is reset to grammar →
 greedy for the duration of the request and cleared on completion or
 cancellation.
 
-## 9. Inspecting cache state
+## 9. Warm a session without sampling (`prefill_only/2`)
+
+Useful for priming the cache before a burst of short follow-ups,
+or for holding a warm session across long pauses without consuming
+generation budget.
+
+```erlang
+{ok, SysToks} = erllama:apply_chat_template(ModelId, #{
+    messages => [
+        #{role => system, content => SystemPrompt},
+        #{role => user,   content => FirstUserTurn}
+    ]
+}),
+{ok, #{finish_key := FK,
+       committed_tokens := N,
+       cache_hit_kind := cold}} =
+    erllama:prefill_only(ModelId, SysToks),
+
+%% Later turn: pass FK as parent_key so the next complete/3 skips
+%% the longest-prefix walk and resumes from the warm row.
+{ok, #{reply := R}} =
+    erllama:complete(ModelId, NextUserTurn, #{parent_key => FK}).
+```
+
+`finish_key` is `undefined` if the prompt was shorter than
+`min_tokens` and the finish save was suppressed.
+
+## 10. Multi-tenant concurrent decoding (`n_seq_max`)
+
+Default is single-tenant. Opt in with `context_opts.n_seq_max > 1`
+and up to N requests prefill and decode concurrently through one
+`llama_decode` per tick.
+
+```erlang
+{ok, _} = erllama:load_model(<<"chat">>, Config#{
+    context_opts => #{n_ctx => 8192, n_batch => 4096, n_seq_max => 4}
+}),
+
+Parent = self(),
+Workers = [
+    spawn(fun() ->
+        Q = list_to_binary(io_lib:format("Worker ~p question.", [N])),
+        {ok, #{reply := R}} = erllama:complete(<<"chat">>, Q),
+        Parent ! {N, R}
+    end) || N <- lists:seq(1, 4)
+],
+[receive {N, _R} -> ok end || N <- lists:seq(1, 4)].
+```
+
+Per-request samplers are isolated: each worker can pass its own
+`temperature`, `seed`, or `grammar` in the `Opts` map without
+spilling sampler state across the other in-flight requests.
+Admissions past `n_seq_max` queue FIFO in the model's `pending`
+list - observable via `erllama:pending_len/1`.
+
+Long prompts are sliced by `prefill_chunk_size` (default
+`max(64, n_batch div 4)`) so a single heavy prompt cannot
+monopolise the batch. See [caching](caching.md) for warm-prefix
+behaviour across concurrent workers.
+
+## 11. Lock-free observability for routers
+
+A cluster router that bin-packs requests onto the least-loaded node
+should not serialise behind the work it is probing. These accessors
+read a public ETS row, never cross the model gen_statem:
+
+```erlang
+1> erllama:phase(<<"chat">>).
+generating
+2> erllama:pending_len(<<"chat">>).
+3
+3> erllama:queue_depth(<<"chat">>).
+1
+4> erllama:last_cache_hit(<<"chat">>).
+#{kind => partial, prefix_len => 1024}
+5> erllama:queue_depth().
+%% global: total admitted streaming infer/4 rows across all loaded models.
+4
+```
+
+`phase/1` returns `idle | prefilling | generating` and falls back to
+`idle` for unknown ids. `last_cache_hit/1` returns `undefined` if
+the model has not admitted any request yet. All four are O(1) ETS
+reads and safe to call from a hot path or via `erpc` from another
+node.
+
+## 12. Inspecting cache state
 
 ```erlang
 %% Hit/miss/save counters and per-path latency totals.
@@ -240,7 +326,7 @@ erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 erllama_cache:gc().
 ```
 
-## 10. Memory-pressure-driven eviction (in `sys.config`)
+## 13. Memory-pressure-driven eviction (in `sys.config`)
 
 ```erlang
 {erllama, [
@@ -259,7 +345,7 @@ Sources shipped: `noop`, `system`, `nvidia_smi`, `{module, M}`. Roll
 your own with `-behaviour(erllama_pressure)` and pass
 `{module, M}` as the source.
 
-## 11. Cache-only tests (no model required)
+## 14. Cache-only tests (no model required)
 
 The cache subsystem is independently usable. eunit tests that
 exercise save/load round-trips never touch llama.cpp:
@@ -302,7 +388,7 @@ round_trip_test() ->
 The lazy `llama_backend_init` means cache-only tests never trigger
 `ggml_backend_load_all` — no Metal/CUDA discovery cost.
 
-## 12. End-to-end against a real GGUF
+## 15. End-to-end against a real GGUF
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.Q4_K_M.gguf \
@@ -314,7 +400,7 @@ parent-key resume, longest-prefix walk, eviction, and a multi-model
 concurrent run. Without the env var it skips so default
 `rebar3 ct` stays green.
 
-## 13. Microbench: cold vs. warm
+## 16. Microbench: cold vs. warm
 
 ```bash
 bench/run.sh tiny    # TinyLlama 1.1B Q4_K_M

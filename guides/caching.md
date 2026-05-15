@@ -87,6 +87,7 @@ behind a few thresholds, all overridable per-model.
 | `boundary_trim_tokens` | 32 | Drop the last N tokens before saving. Mid-token, mid-sentence boundaries make poor resume points; trim to a safe alignment. |
 | `boundary_align_tokens` | 2048 | Round trim down to a multiple of this. Sets the longest-prefix walk's stride. |
 | `session_resume_wait_ms` | 500 | When a `parent_key` is supplied and the cache sees an in-flight finish save, wait up to this long for it to publish before falling through to a fresh prefill. |
+| `prefill_chunk_size` | `max(64, n_batch div 4)` | Per-tick cap on how many tokens a single prefill row contributes. Not a save gate - lives in the same `policy` map but caps the scheduler's per-tick slice so a long prompt never monopolises the batch. `infinity` to disable. |
 
 Bigger `boundary_align_tokens` = fewer probes per longest-prefix
 walk but coarser hit alignment. 2048 is the default; 256 makes
