@@ -133,6 +133,7 @@ for the toolchain.
 | [Configuration](guides/configuration.md) | Full `sys.config` and per-model option reference. |
 | [Building](guides/building.md) | Platform-specific build notes (Linux, macOS, FreeBSD), CUDA/Metal toggles, common build issues. |
 | [Examples](guides/examples.md) | Drop-in patterns for one-shot completion, stateless HTTP servers, multi-turn sessions, concurrent agents, cache inspection. |
+| [Tool calls + cache primitives](guides/examples.md#11-tool-call-streaming-tool_call_markers) | Tool-call streaming, suffix replay via `prefill_only/3`, sticky sessions. |
 
 For the API reference (`erllama`, `erllama_cache`, `erllama_scheduler`,
 `erllama_nif`), see the **[generated module docs on
@@ -295,6 +296,113 @@ across long pauses:
 {ok, #{reply := R}} =
     erllama:complete(M, UserTurn, #{parent_key => FK}).
 ```
+
+## Tool-call handling
+
+Models whose chat template emits structured tool-call markers
+(qwen3's `<tool_call>...</tool_call>`, DSML, OpenAI-style XML, ...)
+have those boundaries surfaced on the streaming wire so an HTTP
+front end can capture the **exact bytes the model sampled**,
+store them under a tool id, and splice them back verbatim on the
+next turn. Keeping the bytes byte-exact across turns is what
+makes the KV-cache prefix match keep working through multi-turn
+tool-bearing conversations.
+
+### How a model becomes tool-aware
+
+Each model declares its own markers in `load_model/2`:
+
+```erlang
+erllama:load_model(<<"qwen3-tool">>, #{
+    backend => erllama_model_llama,
+    model_path => "/models/qwen3-7b.gguf",
+    tool_call_markers => #{
+        start => <<"<tool_call>">>,
+        end   => <<"</tool_call>">>
+    }
+}).
+```
+
+The strings vary per model family. erllama tokenises both through
+the model's own vocabulary at load time; multi-token markers
+(BPE-split `<tool_call>`) work because the comparison is by
+token-id set, not text. Omitting `tool_call_markers` keeps the
+backend on the existing path — no tool-call messages, no
+sampler swap.
+
+### Wire shape
+
+A streaming `infer/4` against a tool-aware model sees:
+
+```erlang
+{erllama_token, Ref, {tool_call_delta, Bin}}    %% one per chunk of the call body
+{erllama_tool_call_end, Ref, Full :: binary()}  %% every delta concatenated
+```
+
+`Full` is the entire byte sequence the model emitted inside the
+span. Store it under a minted tool id; on the next turn, splice
+the exact bytes back into the prompt instead of canonicalising
+the caller-supplied JSON. The next prompt's prefix matches the
+cached row byte-for-byte and the KV-cache hit fires as usual.
+
+### Deterministic syntax handling
+
+When a model is loaded with `tool_call_markers`, erllama builds a
+second sampler chain at admission with `temperature=0`. The
+moment a sampled token matches the start marker, the scheduler
+swaps the request onto that greedy chain so every following
+syntax token is deterministic from a fixed prefix. The greedy
+chain is freed at request finish; non-tool-call traffic never
+touches it.
+
+Optional inner markers let payload string bodies stay diverse:
+
+```erlang
+tool_call_markers => #{
+    start         => <<"<tool_call>">>,
+    end           => <<"</tool_call>">>,
+    payload_start => <<"<arg>">>,
+    payload_end   => <<"</arg>">>
+}
+```
+
+With these set, tokens between `payload_start` and `payload_end`
+swap back to the request's normal sampler — file contents and
+edits keep their normal sampling distribution while the tool
+call's syntactic skeleton stays byte-stable. Without them, the
+entire span uses the greedy sampler (the simpler regime, fine
+for tool calls with short literal arguments).
+
+### What erllama does and does not do
+
+erllama surfaces the boundaries and guarantees the bytes are
+deterministic. It does **not** mint tool ids, parse `Full` into
+SDK-shaped JSON, or canonicalise JSON back into bytes — those
+belong in the HTTP layer. The downstream caller is responsible
+for:
+
+- Storing `Full` under a tool id (in-memory ETS, persisted to a
+  sibling SQLite / DETS file, etc.).
+- Parsing `Full` into the SDK's `tool_use` JSON for the SSE
+  output.
+- Falling back to a canonicaliser (deterministic JSON →
+  template-bytes render) when the tool id isn't in the map.
+- Forwarding the bytes verbatim into the prompt on subsequent
+  turns.
+
+erllama provides two adjacent primitives that make this story
+work end-to-end:
+
+- **`erllama:prefill_only/3` with `parent_key`** — chain
+  cache-warming calls deterministically before each turn's
+  inference hits the model.
+- **`session_id` on `infer/4` / `complete/3` +
+  `erllama:end_session/2`** — pin the request's seq_id across
+  turns so the next turn truncates-and-prefills in place on the
+  already-live KV cells (`cache_hit_kind => sticky`).
+
+See [`guides/examples.md`](guides/examples.md#11-tool-call-streaming-tool_call_markers)
+sections 11–13 for full code patterns.
 
 ## Requirements
 
