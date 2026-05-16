@@ -218,7 +218,93 @@ The grammar is per-request: the sampler chain is reset to grammar →
 greedy for the duration of the request and cleared on completion or
 cancellation.
 
-## 9. Warm a session without sampling (`prefill_only/2`)
+## 9. Stop sequences
+
+Halt generation as soon as one of the caller-supplied strings
+appears in the detokenised output. The match is trimmed from the
+streamed text and from the synchronous `reply`; the matched binary
+is reported as `stop_sequence` in the result map and in the
+streaming `Stats`.
+
+```erlang
+{ok, #{reply := Reply, finish_reason := FinishReason} = Result} =
+    erllama:complete(ModelId, <<"Write a short list, then say END.">>,
+                     #{response_tokens => 64,
+                       stop_sequences => [<<"END">>, <<"\n\nUser:">>]}),
+case maps:find(stop_sequence, Result) of
+    {ok, S} ->
+        %% Generation halted on a caller-supplied stop string.
+        %% FinishReason is `stop`; `reply` has been trimmed at the
+        %% first occurrence of S.
+        io:format("stopped at ~p, reply=~p~n", [S, Reply]);
+    error ->
+        %% No stop string fired: FinishReason is `length`, `stop`
+        %% (natural EOG), or `cancelled`.
+        io:format("finished ~p, reply=~p~n", [FinishReason, Reply])
+end.
+```
+
+Streaming works the same way: the matched string never appears in
+any `{erllama_token, _, _}` chunk, and the final
+`{erllama_done, _, Stats}` carries the matched value:
+
+```erlang
+{ok, Tokens} = erllama:tokenize(ModelId, Prompt),
+{ok, Ref} = erllama:infer(ModelId, Tokens,
+                          #{response_tokens => 200,
+                            stop_sequences => [<<"\n\nUser:">>]},
+                          self()),
+
+receive
+    {erllama_done, Ref, #{stop_sequence := <<"\n\nUser:">>}} ->
+        stopped_at_user_turn;
+    {erllama_done, Ref, _Stats} ->
+        finished_without_match
+end.
+```
+
+The first occurrence by **text position** wins; the scanner holds
+back the last `(max_stop_len - 1)` bytes of each chunk so a match
+crossing a chunk boundary is still detected, then flushes the tail
+on terminal end when no match fired.
+
+## 10. Extended thinking (`thinking_delta` / `thinking_end`)
+
+When `Params` carries `thinking => enabled` and the backend
+supports extended thinking, streaming requests receive
+thinking-phase fragments as `{erllama_token, Ref, {thinking_delta,
+Bin}}` and a single `{erllama_thinking_end, Ref, Sig}` close marker
+before any non-thinking token. `Sig` is an opaque integrity
+signature (or `<<>>` when none is available) that thinking-capable
+SDKs verify on the next turn.
+
+```erlang
+{ok, Tokens} = erllama:tokenize(ModelId, <<"Solve: 23 * 17.">>),
+{ok, Ref} = erllama:infer(ModelId, Tokens,
+                          #{response_tokens => 256,
+                            thinking => enabled},
+                          self()),
+
+loop(Ref, _Thinking = <<>>, _Answer = <<>>, _Sig = <<>>) ->
+    receive
+        {erllama_token, Ref, {thinking_delta, Bin}} ->
+            loop(Ref, <<Thinking/binary, Bin/binary>>, Answer, Sig);
+        {erllama_thinking_end, Ref, NewSig} ->
+            loop(Ref, Thinking, Answer, NewSig);
+        {erllama_token, Ref, Bin} when is_binary(Bin) ->
+            loop(Ref, Thinking, <<Answer/binary, Bin/binary>>, Sig);
+        {erllama_done, Ref, _Stats} ->
+            #{thinking => Thinking, answer => Answer, signature => Sig}
+    end.
+```
+
+With `thinking => disabled` (the default), backends without
+thinking support, or when no thinking phase fires, no
+`{thinking_delta, _}` payloads and no `erllama_thinking_end`
+messages arrive — the stream is identical to a plain text-only
+request.
+
+## 11. Warm a session without sampling (`prefill_only/2`)
 
 Useful for priming the cache before a burst of short follow-ups,
 or for holding a warm session across long pauses without consuming
@@ -245,7 +331,7 @@ generation budget.
 `finish_key` is `undefined` if the prompt was shorter than
 `min_tokens` and the finish save was suppressed.
 
-## 10. Multi-tenant concurrent decoding (`n_seq_max`)
+## 12. Multi-tenant concurrent decoding (`n_seq_max`)
 
 Default is single-tenant. Opt in with `context_opts.n_seq_max > 1`
 and up to N requests prefill and decode concurrently through one
@@ -278,7 +364,7 @@ Long prompts are sliced by `prefill_chunk_size` (default
 monopolise the batch. See [caching](caching.md) for warm-prefix
 behaviour across concurrent workers.
 
-## 11. Lock-free observability for routers
+## 13. Lock-free observability for routers
 
 A cluster router that bin-packs requests onto the least-loaded node
 should not serialise behind the work it is probing. These accessors
@@ -304,7 +390,7 @@ the model has not admitted any request yet. All four are O(1) ETS
 reads and safe to call from a hot path or via `erpc` from another
 node.
 
-## 12. Inspecting cache state
+## 14. Inspecting cache state
 
 ```erlang
 %% Hit/miss/save counters and per-path latency totals.
@@ -326,7 +412,7 @@ erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 erllama_cache:gc().
 ```
 
-## 13. Memory-pressure-driven eviction (in `sys.config`)
+## 15. Memory-pressure-driven eviction (in `sys.config`)
 
 ```erlang
 {erllama, [
@@ -345,7 +431,7 @@ Sources shipped: `noop`, `system`, `nvidia_smi`, `{module, M}`. Roll
 your own with `-behaviour(erllama_pressure)` and pass
 `{module, M}` as the source.
 
-## 14. Cache-only tests (no model required)
+## 16. Cache-only tests (no model required)
 
 The cache subsystem is independently usable. eunit tests that
 exercise save/load round-trips never touch llama.cpp:
@@ -388,7 +474,7 @@ round_trip_test() ->
 The lazy `llama_backend_init` means cache-only tests never trigger
 `ggml_backend_load_all` — no Metal/CUDA discovery cost.
 
-## 15. End-to-end against a real GGUF
+## 17. End-to-end against a real GGUF
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.Q4_K_M.gguf \
@@ -400,7 +486,7 @@ parent-key resume, longest-prefix walk, eviction, and a multi-model
 concurrent run. Without the env var it skips so default
 `rebar3 ct` stays green.
 
-## 16. Microbench: cold vs. warm
+## 18. Microbench: cold vs. warm
 
 ```bash
 bench/run.sh tiny    # TinyLlama 1.1B Q4_K_M

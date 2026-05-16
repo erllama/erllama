@@ -194,7 +194,8 @@ inference, etc.) can plug in via this same surface.
     unload_adapter/2,
     apply_adapters/2,
     extra_metadata/1,
-    verify/4
+    verify/4,
+    thinking_signature/2
 ]).
 
 -type sampler_opts() :: #{
@@ -214,9 +215,28 @@ inference, etc.) can plug in via this same surface.
     | {decode, sampler_ref()}.
 -type step_result() ::
     prefilled
-    | {token, erllama_nif:token_id(), 0 | 1}.
+    | {token, erllama_nif:token_id(), 0 | 1}
+    %% Thinking-phase token: scheduler detokenises and emits
+    %% {erllama_token, Ref, {thinking_delta, Bin}} instead of a plain
+    %% text fragment. Backends without extended-thinking support
+    %% never emit this variant.
+    | {thinking_token, erllama_nif:token_id()}
+    %% Marker that the thinking phase has closed for this decode row.
+    %% The scheduler resolves a signature via thinking_signature/1
+    %% (or `<<>>` when the callback is not exported) and sends
+    %% {erllama_thinking_end, Ref, Sig} before any subsequent token.
+    | thinking_end.
 
 -export_type([sampler_opts/0, seq_id/0, sampler_ref/0, step_op/0, step_result/0]).
+
+%% Optional. Returns the integrity signature for the most recently
+%% closed thinking block on the given sequence. Called by the
+%% scheduler once it sees `thinking_end` in a step result, before
+%% emitting the corresponding `erllama_thinking_end` message. The
+%% binary is opaque to the scheduler and forwarded verbatim to the
+%% caller; `<<>>` means "no signature available" and tells the
+%% downstream to omit `signature_delta` from its wire output.
+-callback thinking_signature(state(), seq_id()) -> binary().
 
 -type chat_request() :: #{
     messages := [chat_message()],

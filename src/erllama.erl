@@ -185,6 +185,15 @@ identifies this request; tokens are delivered to `CallerPid` via
 async messages:
 
 - `{erllama_token, Ref, Bin :: binary()}` — text fragment
+- `{erllama_token, Ref, {thinking_delta, Bin :: binary()}}` —
+  fragment of an extended-thinking block; only emitted when
+  `Params` carries `thinking => enabled` and the backend supports
+  it
+- `{erllama_thinking_end, Ref, Sig :: binary()}` — close marker for
+  a thinking block, carrying an opaque integrity signature; emitted
+  exactly once per closed block before any subsequent
+  `{erllama_token, _, _}` message. `Sig` is `<<>>` when no
+  signature is available
 - `{erllama_done, Ref, Stats}` — normal completion
 - `{erllama_error, Ref, Reason}` — failure
 
