@@ -46,6 +46,7 @@ an explicit `model_id` in the config map.
     complete/2,
     complete/3,
     prefill_only/2,
+    prefill_only/3,
     infer/4,
     cancel/1,
     status/1,
@@ -183,6 +184,20 @@ because the token count is below the configured `min_tokens`.
     {ok, erllama_model:prefill_result()} | {error, term()}.
 prefill_only(Model, PromptTokens) ->
     erllama_model:prefill_only(Model, PromptTokens).
+
+-doc """
+Same as `prefill_only/2` but accepts `Opts`. The only recognised
+key today is `parent_key`: when set to a prior turn's `finish_key`
+and `PromptTokens` extends that prior context, erllama warm-restores
+from the prior row and prefills only the new suffix before firing
+the finish save. Useful for chaining cache-warming calls across
+multiple turns deterministically rather than relying on the
+implicit longest-prefix walk.
+""".
+-spec prefill_only(model(), [erllama_nif:token_id()], map()) ->
+    {ok, erllama_model:prefill_result()} | {error, term()}.
+prefill_only(Model, PromptTokens, Opts) when is_map(Opts) ->
+    erllama_model:prefill_only(Model, PromptTokens, Opts).
 
 -doc """
 Streaming inference. Returns immediately with a `reference()` that
