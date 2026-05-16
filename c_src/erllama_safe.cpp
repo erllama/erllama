@@ -22,6 +22,14 @@
 #include <pthread.h>
 #include <stdint.h>
 
+#ifndef ERLLAMA_THREAD_LOCAL
+#  if defined(__cplusplus) && __cplusplus >= 201103L
+#    define ERLLAMA_THREAD_LOCAL thread_local
+#  else
+#    define ERLLAMA_THREAD_LOCAL __thread
+#  endif
+#endif
+
 // Sentinel returned by erllama_safe_decode on a thrown exception.
 // Mirrors the macro in erllama_nif.c; both sides must agree.
 #define ERLLAMA_DECODE_EXC_SENTINEL INT_MIN
@@ -35,29 +43,29 @@ typedef enum {
     ERLLAMA_LOAD_EXCEPTION = 3,  // C++ exception caught
 } erllama_load_status_t;
 
-// Best-effort capture of the most recent llama log line. The
-// _v2 model load wrapper clears the buffer immediately before
-// calling llama_model_load_from_file and inspects it on a NULL
-// return to classify malformed-GGUF cases. llama_log_set is
-// process-global, so the classification is **not** reliable
-// under concurrent loads -- the captured line may belong to
-// the other load. Treat MALFORMED vs FAILED as informational
-// only; they both mean "load did not succeed". A complete fix
-// would require subprocess isolation, out of scope here.
-static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
-static char g_last_log_line[512] = {0};
+// Best-effort capture of the most recent llama log line on the
+// calling thread. The _v2 model load wrapper clears the buffer
+// immediately before calling llama_model_load_from_file and
+// inspects it on a NULL return to classify malformed-GGUF cases.
+//
+// llama_log_set is process-global, but the capture buffer is
+// thread-local: each loader thread reads only what was logged
+// on that same thread, so concurrent loads cannot scramble each
+// other's classification. A message emitted from a worker thread
+// spawned inside llama.cpp will not be visible to the loader,
+// in which case the load is reported as FAILED rather than
+// MALFORMED -- informational degradation only.
+static ERLLAMA_THREAD_LOCAL char t_last_log_line[512] = {0};
 
 static void erllama_log_capture(enum ggml_log_level level,
                                 const char *text, void *user_data) noexcept {
     (void) level;
     (void) user_data;
     if (!text) return;
-    pthread_mutex_lock(&g_log_mu);
     size_t n = strlen(text);
-    if (n >= sizeof(g_last_log_line)) n = sizeof(g_last_log_line) - 1;
-    memcpy(g_last_log_line, text, n);
-    g_last_log_line[n] = '\0';
-    pthread_mutex_unlock(&g_log_mu);
+    if (n >= sizeof(t_last_log_line)) n = sizeof(t_last_log_line) - 1;
+    memcpy(t_last_log_line, text, n);
+    t_last_log_line[n] = '\0';
 }
 
 extern "C" {
@@ -238,6 +246,16 @@ int erllama_safe_backend_free(void) noexcept {
     }
 }
 
+// Clear the process-global log callback so a NIF unload cannot
+// leave llama.cpp pointing at a function in a soon-to-be-unmapped
+// shared object. Called from the NIF unload path.
+void erllama_safe_log_unset(void) noexcept {
+    try {
+        llama_log_set(nullptr, nullptr);
+    } catch (...) {
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Model / context lifecycle
 // ---------------------------------------------------------------------------
@@ -262,9 +280,7 @@ erllama_safe_model_load_from_file_v2(const char *path,
                                      struct llama_model_params params,
                                      erllama_load_status_t *out_status) noexcept {
     if (out_status) *out_status = ERLLAMA_LOAD_FAILED;
-    pthread_mutex_lock(&g_log_mu);
-    g_last_log_line[0] = '\0';
-    pthread_mutex_unlock(&g_log_mu);
+    t_last_log_line[0] = '\0';
 
     struct llama_model *m = nullptr;
     try {
@@ -278,9 +294,7 @@ erllama_safe_model_load_from_file_v2(const char *path,
         return m;
     }
 
-    pthread_mutex_lock(&g_log_mu);
-    bool malformed = strstr(g_last_log_line, "GGML_ASSERT") != nullptr;
-    pthread_mutex_unlock(&g_log_mu);
+    bool malformed = strstr(t_last_log_line, "GGML_ASSERT") != nullptr;
     if (out_status) {
         *out_status = malformed ? ERLLAMA_LOAD_MALFORMED : ERLLAMA_LOAD_FAILED;
     }
