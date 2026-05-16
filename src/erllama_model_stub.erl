@@ -36,7 +36,7 @@
     load_adapter/2,
     unload_adapter/2,
     apply_adapters/2,
-    thinking_signature/2,
+    thinking_signature/3,
     %% Test helpers: read back what the most recent configure_sampler
     %% / clear_sampler / apply_adapters call saw.
     last_sampler_cfg/1,
@@ -159,10 +159,10 @@ decode_token(SeqId, Sampler) ->
     T = erlang:phash2({decode_step_stub, SeqId, Sampler}) rem (1 bsl 32),
     {SeqId, {token, T, 0}}.
 
-%% Deterministic per-seq stub signature. Real backends would return
-%% an HMAC over the model's thinking state; the stub just hashes the
-%% seq_id so tests can assert a non-empty 32-byte value.
-thinking_signature(_S, SeqId) ->
+%% Deterministic per-seq stub signature. The stub ignores `Bytes`
+%% and hashes the seq_id; real backends derive their signature from
+%% the observed thinking text via HMAC.
+thinking_signature(_S, SeqId, _Bytes) ->
     crypto:hash(sha256, <<"stub-thinking-sig-", (integer_to_binary(SeqId))/binary>>).
 
 %% Sampler refs are opaque references. Free drops the per-sampler

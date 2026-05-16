@@ -387,12 +387,11 @@ concurrently through one decode call per tick.
     %% `thinking = disabled` as a backend bug (stray thinking
     %% output not opted in by the caller).
     thinking = disabled :: enabled | disabled,
-    %% Running concat of detokenized thinking-phase bytes. The
-    %% scheduler uses it to spot the open/close transitions and to
-    %% feed a fallback signature derivation for backends that don't
-    %% export thinking_signature/2. Reset to <<>> on each
-    %% thinking_end so a second thinking block on the same request
-    %% gets its own signature input.
+    %% Running concat of detokenized thinking-phase bytes. Passed
+    %% to the backend's `thinking_signature/3` so it can sign the
+    %% observed text directly (e.g. via HMAC). Reset to <<>> on
+    %% each thinking_end so a second thinking block on the same
+    %% request gets its own signature input.
     thinking_bytes = <<>> :: binary(),
     %% Set when the request was already failed with an
     %% `erllama_error` (e.g. backend contract violation). The
@@ -1798,13 +1797,15 @@ req_thinking_end(Req, _Data) ->
     Req#req{thinking_bytes = <<>>}.
 
 %% Resolve the integrity signature for the just-closed thinking
-%% block. Calls the backend's optional `thinking_signature/2` if
-%% exported; otherwise falls back to `<<>>` so the downstream omits
-%% `signature_delta` from its SSE output.
-thinking_signature(#req{seq_id = SeqId}, #data{backend = Mod, backend_state = S}) ->
-    case erlang:function_exported(Mod, thinking_signature, 2) of
+%% block. Calls the backend's optional `thinking_signature/3` with
+%% the accumulated thinking bytes; otherwise falls back to `<<>>`
+%% so the downstream omits `signature_delta` from its SSE output.
+thinking_signature(#req{seq_id = SeqId, thinking_bytes = Bytes}, #data{
+    backend = Mod, backend_state = S
+}) ->
+    case erlang:function_exported(Mod, thinking_signature, 3) of
         true ->
-            case Mod:thinking_signature(S, SeqId) of
+            case Mod:thinking_signature(S, SeqId, Bytes) of
                 Bin when is_binary(Bin) -> Bin;
                 _ -> <<>>
             end;

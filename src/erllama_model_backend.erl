@@ -195,7 +195,7 @@ inference, etc.) can plug in via this same surface.
     apply_adapters/2,
     extra_metadata/1,
     verify/4,
-    thinking_signature/2
+    thinking_signature/3
 ]).
 
 -type sampler_opts() :: #{
@@ -232,11 +232,15 @@ inference, etc.) can plug in via this same surface.
 %% Optional. Returns the integrity signature for the most recently
 %% closed thinking block on the given sequence. Called by the
 %% scheduler once it sees `thinking_end` in a step result, before
-%% emitting the corresponding `erllama_thinking_end` message. The
-%% binary is opaque to the scheduler and forwarded verbatim to the
-%% caller; `<<>>` means "no signature available" and tells the
-%% downstream to omit `signature_delta` from its wire output.
--callback thinking_signature(state(), seq_id()) -> binary().
+%% emitting the corresponding `erllama_thinking_end` message.
+%% `Bytes` is the detokenised concatenation of the thinking-phase
+%% tokens the scheduler observed for this block; backends that sign
+%% the produced text (e.g. an HMAC for tamper detection across
+%% turns) can use it directly. The binary returned is opaque to the
+%% scheduler and forwarded verbatim to the caller; `<<>>` means "no
+%% signature available" and tells the downstream to omit
+%% `signature_delta` from its wire output.
+-callback thinking_signature(state(), seq_id(), Bytes :: binary()) -> binary().
 
 -type chat_request() :: #{
     messages := [chat_message()],
