@@ -702,5 +702,7 @@ shared-prefix scenario; see `bench/README.md`.
   `erllama:load_model/1,2`, with examples and pitfalls.
 - [Caching](caching.md) — tiers, save reasons, lookup paths,
   watermarks.
+- [Tool calls](tool-calls.md) — marker configuration, deterministic
+  syntax, and exact byte replay across turns.
 - [Configuration](configuration.md) — full `sys.config` reference.
 - [Building](building.md) — platform-specific build notes.

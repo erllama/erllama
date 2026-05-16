@@ -3,109 +3,74 @@
 [![CI](https://github.com/erllama/erllama/actions/workflows/ci.yml/badge.svg)](https://github.com/erllama/erllama/actions/workflows/ci.yml)
 [![Hex.pm](https://img.shields.io/hexpm/v/erllama.svg)](https://hex.pm/packages/erllama)
 
-erllama is a native Erlang/OTP wrapper around `llama.cpp` with a
-**token-exact, multi-tier, supervised KV cache**. It turns a
-multi-second prefill into a millisecond restore, and lets you keep
-**more warm state than fits in RAM** by promoting cold-but-popular
-prefixes down to the disk tier.
+Run `llama.cpp` from Erlang. Keep prompts warm. Stay inside OTP.
 
-If you have ever waited five seconds for a chat assistant to
-acknowledge "hello" — that's prompt prefill. erllama caches the
-work so the second turn, the third turn, and every subsequent agent
-sharing the same system prompt skip it.
+erllama is a native Erlang/OTP runtime for `llama.cpp` with supervised
+model processes, OpenAI-shaped completion APIs, and a token-exact KV
+cache that turns repeated prompt prefill from seconds into milliseconds.
 
-## A 30-second taste
+If your app sends the same system prompt, agent scaffold, or conversation
+prefix again and again, erllama saves the model state once and restores it
+on the next request. No fuzzy matching. No hidden session server. Just
+exact tokens, exact cache keys, and OTP supervision around the whole path.
+
+## Why erllama?
+
+- **Fast repeat prompts.** Cache hits restore KV state instead of
+  recomputing prompt prefill.
+- **Native OTP shape.** Each loaded model is a supervised process with a
+  clear lifecycle: load, complete, stream, observe, unload.
+- **Bigger-than-RAM warmth.** Hot prefixes can live in RAM, warm prefixes
+  in tmpfs, and large working sets on disk.
+- **Stateless-server friendly.** Resend the full conversation every turn
+  and still get longest-prefix cache hits.
+- **Multi-model safe.** Cache rows include the model fingerprint and
+  context shape, so different models never collide on identical prompts.
+- **Observable by default.** Hit/miss counters and per-model state probes
+  are cheap enough to call from routers.
+- **Built on `llama.cpp`.** Local GGUF inference with the platform support
+  you expect: Metal, BLAS, CUDA toggles, and plain CPU fallback.
+
+## Quick taste
 
 ```erlang
 1> {ok, _} = application:ensure_all_started(erllama).
 2> Path = "/srv/models/tinyllama-1.1b-chat.Q4_K_M.gguf".
 3> {ok, Bin} = file:read_file(Path).
-4> {ok, M} = erllama:load_model(#{
-       backend     => erllama_model_llama,
-       model_path  => Path,
+4> {ok, Model} = erllama:load_model(#{
+       backend => erllama_model_llama,
+       model_path => Path,
        fingerprint => crypto:hash(sha256, Bin)
    }).
 {ok, <<"erllama_model_2375">>}
 
-5> {ok, #{reply := Reply, finish_key := FK}} =
-       erllama:complete(M, <<"Once upon a time">>).
-%% ~3 s on a CPU box. Prompt prefill, async cold save fired.
+5> {ok, #{reply := Reply, finish_key := Key}} =
+       erllama:complete(Model, <<"Once upon a time">>).
+%% First call: cold prefill, async save.
 
-6> {ok, #{reply := Reply2}} = erllama:complete(M, <<"Once upon a time">>).
-%% ~10 ms. Cache hit; KV state restored, one decode for fresh logits.
+6> {ok, #{reply := Reply2}} =
+       erllama:complete(Model, <<"Once upon a time">>).
+%% Same prompt: KV cache restore.
 
-7> {ok, _} = erllama:complete(M, <<"Once upon a time, in a quiet village">>).
-%% ~50 ms. Longest-prefix walk found the cached row even though
-%% the new prompt is longer.
+7> {ok, #{reply := Reply3}} =
+       erllama:complete(Model,
+                        <<"Once upon a time, in a quiet village">>).
+%% Longer prompt: longest cached prefix wins.
 
-8> {ok, _} = erllama:complete(M, <<"and they lived happily ever after">>,
-                               #{parent_key => FK}).
-%% Exact session resume from the saved row in step 5.
+8> {ok, #{reply := Reply4}} =
+       erllama:complete(Model, <<"and they lived happily ever after">>,
+                        #{parent_key => Key}).
+%% Stateful resume from the previous finish save.
 ```
 
-`load_model/1` returns a binary `model_id` that is also the registered
-name for the underlying gen_statem. Pass it to `complete/2,3`,
-`unload/1`, etc.
+`load_model/1` returns a binary model id. Pass it to `complete/2,3`,
+`infer/4`, `tokenize/2`, `unload/1`, and the rest of the public API.
 
-That is the whole pitch. The cache is on by default, runs under
-its own supervisor, and never returns approximate matches.
+## Install
 
-## What you get
+erllama targets Erlang/OTP **28** and rebar3 **3.25+**.
 
-- **Many models in one BEAM.** Load TinyLlama and Llama-3-8B side by
-  side, hot-swap a model without bouncing the cache, give each model
-  its own `policy` and `tier`. One shared cache; rows are
-  fingerprint-segregated so models never collide on identical
-  prompts.
-- **Token-exact hits.** Cache key is
-  `sha256(model_fp || quant || ctx_params || tokens_le32)`. Same
-  tokens, same key, guaranteed-correct restore.
-- **Three storage tiers.** ETS slabs for the hottest data, files
-  on `/dev/shm` for warm working set, on-disk files (plain read
-  I/O) for everything else. Each tier supervised independently
-  with its own quota and LRU.
-- **Bigger than RAM.** Disk is a first-class tier, not a fallback.
-  A 70B model in Q4 already takes ~40 GB of weights; the disk tier
-  holds the warm KV state your working set needs without crowding
-  weights out of RAM.
-- **Shared-prefix hits across agents.** Spawn N workers that all
-  start with the same system prompt: the first cold-prefills, every
-  subsequent worker gets a longest-prefix hit on the shared part.
-- **Multi-turn warmth.** Pass the previous turn's `parent_key` and
-  the cache waits up to `session_resume_wait_ms` for the in-flight
-  finish save to publish.
-- **Stateless-friendly.** OpenAI/Anthropic-shaped servers that
-  resend the full conversation each turn get hits automatically
-  through a longest-prefix walk. No `parent_key` needed.
-- **Crash-safe saves.** Reserve, write temp, validate, atomic
-  `link(2)`, announce. Two-stage TTL cleanup adopts orphans on
-  writer crash.
-- **Memory-pressure-driven eviction.** Pluggable pressure source
-  (`memsup`, `nvidia-smi`, or your own callback). Off by default.
-- **Always-on metrics.** Hits, misses, saves, evictions, and
-  per-path latency totals exposed via `erllama_cache:get_counters/0`.
-  Per-counter cost is ~10-20 ns; you cannot meaningfully turn them
-  off.
-- **Multi-sequence batched scheduler.** Opt in with
-  `context_opts.n_seq_max > 1` and up to N requests prefill and
-  decode concurrently through a single `llama_decode` per tick.
-  Default `n_seq_max => 1` keeps single-tenant behaviour
-  bit-identical to 0.1.
-- **Chunked prefill.** A long prompt is sliced into per-tick
-  chunks (`prefill_chunk_size`, default `max(64, n_batch div 4)`)
-  so it never monopolises the batch and concurrent decoders keep
-  making progress.
-- **Lock-free observability.** `erllama:phase/1`,
-  `pending_len/1`, `last_cache_hit/1`, and `queue_depth/1` read a
-  public ETS row without crossing the model gen_statem, so a
-  router can probe "is this model busy?" without serialising
-  behind the work it is probing.
-
-## Installation
-
-erllama targets Erlang/OTP **28** with rebar3 **3.25+**.
-
-Add to `rebar.config`:
+Add it to `rebar.config`:
 
 ```erlang
 {deps, [
@@ -113,424 +78,172 @@ Add to `rebar.config`:
 ]}.
 ```
 
-Then in your supervision tree, wait for the application to start
-before loading models:
+Then start the application before loading models:
 
 ```erlang
-ok = application:ensure_started(erllama).
+{ok, _} = application:ensure_all_started(erllama).
 ```
 
-The first compile builds vendored llama.cpp (~3 minutes on a fast
-machine). Subsequent builds are cached. See [requirements](#requirements)
-for the toolchain.
+The first compile builds the vendored `llama.cpp`. See
+[Building](guides/building.md) for platform notes and CUDA/Metal options.
 
-## Documentation
+## Common patterns
 
-| Guide | What it covers |
-|---|---|
-| [Loading a model](guides/loading.md) | Every option to `erllama:load_model/1,2`, with examples and pitfalls. |
-| [Caching](guides/caching.md) | Tiers, save reasons, lookup paths, watermarks. The operator's manual. |
-| [Configuration](guides/configuration.md) | Full `sys.config` and per-model option reference. |
-| [Building](guides/building.md) | Platform-specific build notes (Linux, macOS, FreeBSD), CUDA/Metal toggles, common build issues. |
-| [Examples](guides/examples.md) | Drop-in patterns for one-shot completion, stateless HTTP servers, multi-turn sessions, concurrent agents, cache inspection. |
-| [Tool calls + cache primitives](guides/examples.md#11-tool-call-streaming-tool_call_markers) | Tool-call streaming, suffix replay via `prefill_only/3`, sticky sessions. |
+### Stateless HTTP completion
 
-For the API reference (`erllama`, `erllama_cache`, `erllama_scheduler`,
-`erllama_nif`), see the **[generated module docs on
-HexDocs](https://hexdocs.pm/erllama)** or run `rebar3 ex_doc`
-locally.
-
-For the design rationale behind the cache:
-
-- [Cache design](internals/cache-design.md) — why multi-tier, why
-  token-exact, what was deliberately left out.
-- [Publish protocol](internals/publish-protocol.md) — the
-  five-stage crash-safe save protocol.
-- [NIF safety](internals/nif-safety.md) — two-resource lifetime,
-  exception shim, why disk reads use plain `file:read_file/1`.
-
-## Many models in one BEAM
-
-Each loaded model is its own supervised `gen_statem` under
-`erllama_model_sup`. The cache is process-wide and segregates rows
-by fingerprint, so the only thing two models share is the byte
-budget.
+OpenAI/Anthropic-shaped servers usually resend the whole conversation on
+each turn. That is fine. erllama walks the prompt backward and restores
+the longest exact prefix it has already saved.
 
 ```erlang
-{ok, _} = erllama:load_model(<<"tiny">>, TinyConfig).
-{ok, _} = erllama:load_model(<<"big">>,  BigConfig).
+handle_completion(ModelId, Prompt) ->
+    {ok, #{reply := Reply}} =
+        erllama:complete(ModelId, Prompt, #{response_tokens => 256}),
+    Reply.
+```
 
-{ok, #{reply := R1}} = erllama:complete(<<"tiny">>, <<"summarise: ...">>).
-{ok, #{reply := R2}} = erllama:complete(<<"big">>,  <<"deep analysis of: ...">>).
+### Stateful Erlang session
+
+If your session process already tracks turns, keep the returned
+`finish_key` and pass it as `parent_key` on the next request. That skips
+the longest-prefix walk and resumes directly from the saved row.
+
+```erlang
+{ok, #{reply := R1, finish_key := K1}} =
+    erllama:complete(ModelId, Prompt1),
+
+{ok, #{reply := R2, finish_key := K2}} =
+    erllama:complete(ModelId, Prompt2, #{parent_key => K1}).
+```
+
+### Many models in one BEAM
+
+Each loaded model is its own supervised process. The cache is shared, but
+rows are fingerprint-segregated.
+
+```erlang
+{ok, _} = erllama:load_model(<<"tiny">>, TinyConfig),
+{ok, _} = erllama:load_model(<<"big">>, BigConfig),
+
+{ok, #{reply := R1}} = erllama:complete(<<"tiny">>, <<"summarise: ...">>),
+{ok, #{reply := R2}} = erllama:complete(<<"big">>, <<"deep analysis: ...">>),
 
 ok = erllama:unload(<<"tiny">>).
 ```
 
-| Capability | How |
-|---|---|
-| N models in one BEAM | `load_model/2` per binary id; each is one `gen_statem` |
-| No cross-model collisions | Cache key includes the model fingerprint |
-| Hot-swap a model | `unload/1` then `load_model/2`; the cache survives |
-| Per-model `policy` | `policy => #{...}` on the load; merges over app-env defaults |
-| Per-model `tier` | `tier_srv => MyDisk, tier => disk` per model |
-| Shared-prefix hits across agents | Longest-prefix walk on every cold prompt |
-| Concurrent saves bounded | Single writer pool with a leak-proof semaphore |
-
-Tested end-to-end in
-`test/erllama_SUITE.erl:concurrent_complete_under_writer_cap` —
-four models with distinct fingerprints running parallel completions
-under one writer cap.
-
-## A slightly longer example
-
-A real load with all the cache parameters. The disk tier requires a
-running `erllama_cache_disk_srv` started by the operator; the RAM tier
-(`erllama_cache_ram`) starts automatically with the application.
-
-```erlang
-{ok, _} = erllama_cache_disk_srv:start_link(my_disk, "/var/lib/erllama/kvc"),
-{ok, Bin} = file:read_file("/srv/models/llama-3.1-8b.Q4_K_M.gguf"),
-Fp = crypto:hash(sha256, Bin),
-CtxHash = crypto:hash(sha256, term_to_binary({8192, 4096})),
-
-{ok, M} = erllama:load_model(#{
-    backend          => erllama_model_llama,
-    model_path       => "/srv/models/llama-3.1-8b.Q4_K_M.gguf",
-    model_opts       => #{
-        n_gpu_layers => 99,
-        split_mode   => layer,           %% multi-GPU split policy
-        main_gpu     => 0,
-        tensor_split => [0.5, 0.5]       %% 50/50 across two devices
-    },
-    context_opts     => #{
-        n_ctx        => 8192,
-        n_batch      => 4096,
-        n_seq_max    => 4,               %% admit up to 4 concurrent reqs
-        flash_attn   => auto,            %% boolean() | auto
-        type_k       => f16,             %% KV cache element type
-        type_v       => f16
-    },
-    fingerprint      => Fp,
-    fingerprint_mode => safe,
-    quant_type       => q4_k_m,
-    quant_bits       => 4,
-    ctx_params_hash  => CtxHash,
-    context_size     => 8192,
-    tier_srv         => my_disk,
-    tier             => disk,
-    policy           => #{
-        boundary_trim_tokens   => 32,
-        boundary_align_tokens  => 256,
-        session_resume_wait_ms => 500,
-        prefill_chunk_size     => 1024   %% cap per-tick prefill slice
-    }
-}).
-```
-
-Stateless OpenAI/Anthropic-shaped server:
-
-```erlang
-handle_completion(ModelId, Prompt) ->
-    {ok, #{reply := Reply}} = erllama:complete(ModelId, Prompt),
-    Reply.
-```
-
-No `parent_key`. The cache walks the new prompt backward by the
-configured stride and finds the longest cached prefix. If the new
-prompt is yesterday's conversation plus one fresh turn, the walk
-hits.
-
-Stateful Erlang-native multi-turn: the session layer threads
-`parent_key` between turns. `complete/2,3` already returns the
-`finish_key` for the full context; pass it as `parent_key` on the
-next turn.
-
-```erlang
-%% First turn: cold prefill. The model fires an async finish save
-%% and returns its key.
-{ok, #{reply := R1, finish_key := ParentKey}} =
-    erllama:complete(M, Prompt1),
-
-%% Second turn: pass ParentKey to skip the longest-prefix walk.
-{ok, #{reply := R2}} =
-    erllama:complete(M, Prompt2, #{parent_key => ParentKey}).
-```
-
-Inspect cache state from a shell:
+### Inspect live state
 
 ```erlang
 1> erllama_cache:get_counters().
 #{hits_exact => 142, hits_resume => 17, hits_longest_prefix => 89,
-  misses => 12, saves_cold => 12, saves_continued => 67,
-  saves_finish => 31, evictions => 3, ...}
+  misses => 12, saves_cold => 12, saves_finish => 31, ...}
 
-2> erllama_cache_meta_srv:dump().
-%% List of raw ETS rows:
-%%   {Key, Tier, Size, LastUsedNs, Refcount, Status, HeaderBin,
-%%    Location, TokensRef, Hits}
-[{<<_:256>>, disk, 8388608, 1737..., 0, available, _, _, _, 4}, ...]
-```
-
-Per-model observability is lock-free (reads a public ETS row, never
-crosses the model gen_statem):
-
-```erlang
-1> erllama:phase(<<"big">>).
+2> erllama:phase(<<"big">>).
 generating
-2> erllama:pending_len(<<"big">>).
+3> erllama:pending_len(<<"big">>).
 3
-3> erllama:last_cache_hit(<<"big">>).
+4> erllama:last_cache_hit(<<"big">>).
 #{kind => partial, prefix_len => 1024}
-4> erllama:queue_depth(<<"big">>).
-2
 ```
 
-Warm a session without sampling. Useful for priming the cache
-before a burst of short follow-ups, or for holding a warm context
-across long pauses:
+## Documentation
 
-```erlang
-{ok, Toks} = erllama:tokenize(M, SystemPrompt),
-{ok, #{finish_key := FK}} = erllama:prefill_only(M, Toks),
-%% Later turns pass FK as parent_key to skip the longest-prefix walk.
-{ok, #{reply := R}} =
-    erllama:complete(M, UserTurn, #{parent_key => FK}).
+| Need | Read |
+|---|---|
+| Load a model | [Loading a model](guides/loading.md) |
+| Configure cache tiers and save policy | [Caching](guides/caching.md) |
+| Configure `sys.config` and per-model options | [Configuration](guides/configuration.md) |
+| Build from source | [Building](guides/building.md) |
+| Copy working snippets | [Examples](guides/examples.md) |
+| Stream tool calls while preserving cache hits | [Tool calls](guides/tool-calls.md) |
+| Understand cache design tradeoffs | [Cache design](internals/cache-design.md) |
+| Understand crash-safe save publication | [Publish protocol](internals/publish-protocol.md) |
+| Understand request admission and decode flow | [Request lifecycle](internals/request-lifecycle.md) |
+| Understand NIF lifetime safety | [NIF safety](internals/nif-safety.md) |
+
+API reference for `erllama`, `erllama_cache`, `erllama_scheduler`, and
+`erllama_nif` is published on
+[HexDocs](https://hexdocs.pm/erllama). You can also build it locally:
+
+```bash
+rebar3 ex_doc
 ```
 
-## Tool-call handling
+## Architecture
 
-Models whose chat template emits structured tool-call markers
-(qwen3's `<tool_call>...</tool_call>`, DSML, OpenAI-style XML, ...)
-have those boundaries surfaced on the streaming wire so an HTTP
-front end can capture the **exact bytes the model sampled**,
-store them under a tool id, and splice them back verbatim on the
-next turn. Keeping the bytes byte-exact across turns is what
-makes the KV-cache prefix match keep working through multi-turn
-tool-bearing conversations.
-
-### How a model becomes tool-aware
-
-Each model declares its own markers in `load_model/2`:
-
-```erlang
-erllama:load_model(<<"qwen3-tool">>, #{
-    backend => erllama_model_llama,
-    model_path => "/models/qwen3-7b.gguf",
-    tool_call_markers => #{
-        start => <<"<tool_call>">>,
-        end   => <<"</tool_call>">>
-    }
-}).
+```text
+erllama_sup
+├── erllama_cache_sup
+│   ├── erllama_cache_meta_srv
+│   ├── erllama_cache_ram
+│   └── erllama_cache_writer
+├── erllama_registry
+├── erllama_inflight
+├── erllama_model_sup
+│   └── erllama_model      one supervised gen_statem per loaded model
+└── erllama_scheduler      memory-pressure poller, off by default
 ```
 
-The strings vary per model family. erllama tokenises both through
-the model's own vocabulary at load time; multi-token markers
-(BPE-split `<tool_call>`) work because the comparison is by
-token-id set, not text. Omitting `tool_call_markers` keeps the
-backend on the existing path — no tool-call messages, no
-sampler swap.
+Disk and `ram_file` tier servers are started by the operator, one per
+root directory, then referenced by loaded models through `tier_srv` and
+`tier`.
 
-### Wire shape
-
-A streaming `infer/4` against a tool-aware model sees:
-
-```erlang
-{erllama_token, Ref, {tool_call_delta, Bin}}    %% one per chunk of the call body
-{erllama_tool_call_end, Ref, Full :: binary()}  %% every delta concatenated
-```
-
-`Full` is the entire byte sequence the model emitted inside the
-span. Store it under a minted tool id; on the next turn, splice
-the exact bytes back into the prompt instead of canonicalising
-the caller-supplied JSON. The next prompt's prefix matches the
-cached row byte-for-byte and the KV-cache hit fires as usual.
-
-### Deterministic syntax handling
-
-When a model is loaded with `tool_call_markers`, erllama builds a
-second sampler chain at admission with `temperature=0`. The
-moment a sampled token matches the start marker, the scheduler
-swaps the request onto that greedy chain so every following
-syntax token is deterministic from a fixed prefix. The greedy
-chain is freed at request finish; non-tool-call traffic never
-touches it.
-
-Optional inner markers let payload string bodies stay diverse:
-
-```erlang
-tool_call_markers => #{
-    start         => <<"<tool_call>">>,
-    end           => <<"</tool_call>">>,
-    payload_start => <<"<arg>">>,
-    payload_end   => <<"</arg>">>
-}
-```
-
-With these set, tokens between `payload_start` and `payload_end`
-swap back to the request's normal sampler — file contents and
-edits keep their normal sampling distribution while the tool
-call's syntactic skeleton stays byte-stable. Without them, the
-entire span uses the greedy sampler (the simpler regime, fine
-for tool calls with short literal arguments).
-
-### What erllama does and does not do
-
-erllama surfaces the boundaries and guarantees the bytes are
-deterministic. It does **not** mint tool ids, parse `Full` into
-SDK-shaped JSON, or canonicalise JSON back into bytes — those
-belong in the HTTP layer. The downstream caller is responsible
-for:
-
-- Storing `Full` under a tool id (in-memory ETS, persisted to a
-  sibling SQLite / DETS file, etc.).
-- Parsing `Full` into the SDK's `tool_use` JSON for the SSE
-  output.
-- Falling back to a canonicaliser (deterministic JSON →
-  template-bytes render) when the tool id isn't in the map.
-- Forwarding the bytes verbatim into the prompt on subsequent
-  turns.
-
-erllama provides two adjacent primitives that make this story
-work end-to-end:
-
-- **`erllama:prefill_only/3` with `parent_key`** — chain
-  cache-warming calls deterministically before each turn's
-  inference hits the model.
-- **`session_id` on `infer/4` / `complete/3` +
-  `erllama:end_session/2`** — pin the request's seq_id across
-  turns so the next turn truncates-and-prefills in place on the
-  already-live KV cells (`cache_hit_kind => sticky`).
-
-See [`guides/examples.md`](guides/examples.md#11-tool-call-streaming-tool_call_markers)
-sections 11–13 for full code patterns.
+The important invariant is simple: cache hits are token-exact. A key is
+derived from the model fingerprint, quantization, context shape, and full
+token list. erllama may find a shorter saved prefix for a longer prompt,
+but it never returns an approximate match.
 
 ## Requirements
 
 - Erlang/OTP **28**
 - rebar3 **3.25+**
-- C++17 toolchain (Apple clang or recent gcc; `cmake` >= 3.20)
-- Apple Silicon: Metal + Accelerate auto-detected.
-- Linux: BLAS auto-detected; CUDA off by default (toggle via
-  `ERLLAMA_OPTS=-DGGML_CUDA=ON`).
-- FreeBSD: `erlang-runtime28` from ports, plus `cmake bash gmake`.
-
-## Architecture at a glance
-
-```
-erllama_sup                         one_for_one root
-├── erllama_cache_sup
-│   ├── erllama_cache_meta_srv      sole writer; meta + LRU + reservations
-│   ├── erllama_cache_ram           RAM tier (ETS slabs)
-│   └── erllama_cache_writer        writer pool, leak-proof semaphore
-├── erllama_registry                {ModelId, pid()} name registry
-├── erllama_inflight                {request_ref, pid()} index for cancel/end_session
-├── erllama_model_sup               simple_one_for_one for dynamic models
-│   └── erllama_model (per loaded model, one gen_statem each)
-└── erllama_scheduler               memory-pressure poller (off by default)
-```
-
-Disk and `ram_file` tier servers (`erllama_cache_disk_srv`,
-`erllama_cache_ramfile_srv`) are started by the operator outside
-this tree — one per root directory — and referenced by each
-loaded model through `tier_srv` and `tier`. The cache pipeline
-fans out to them through the `meta_srv` reservation flow.
-
-### Inside a request
-
-The per-model `gen_statem` has two states: **idle** (no
-in-flight requests) and **running** (one or more requests
-prefilling and/or decoding through the multi-seq scheduler).
-Every incoming request takes the same path:
-
-1. **Admit.** Pop a `seq_id` from the idle pool (or reuse the
-   session's pinned seq when `session_id` is set). Optionally
-   build a per-request sampler chain.
-2. **Resolve the cache.** Token-exact lookup; on a partial hit
-   walk the longest cached prefix. The result is
-   `cache_hit_kind :: exact | partial | cold | sticky`.
-3. **Warm-restore or cold-prefill.** Warm: `kv_unpack` the
-   stored payload under the seq's id, then re-prefill the last
-   cell as a logits primer. Cold: clear the seq and prefill the
-   prompt. Sticky: skip both — the cells are already live, just
-   prefill the new suffix.
-4. **Decode.** A single `nif_step` per tick mixes prefill and
-   decode rows across every active request (SARATHI-style
-   co-batching, bounded by `n_batch`). Tool-call and thinking
-   markers are recognised inline and surfaced on the streaming
-   wire.
-5. **Save.** `cold` save fires at the trimmed-prefix boundary
-   during prefill, `continued` saves every `continued_interval`
-   tokens during decode, and a `finish` save when the request
-   terminates. Sticky requests keep the seq's KV live; one-shot
-   requests release it back to the idle pool.
-
-For the publish protocol, the reservation state machine, and the
-exception-safe NIF wrappers, see
-[internals/publish-protocol.md](internals/publish-protocol.md) and
-[internals/nif-safety.md](internals/nif-safety.md).
+- C++17 toolchain
+- `cmake` >= 3.20
+- Apple Silicon: Metal + Accelerate are auto-detected
+- Linux: BLAS is auto-detected; CUDA is enabled with
+  `ERLLAMA_OPTS=-DGGML_CUDA=ON`
+- FreeBSD: `erlang-runtime28` plus `cmake bash gmake`
 
 ## Status
 
-**Pre-release.** Core cache, scheduler, and NIF: 166 EUnit + 11
-PropEr + 7 stub Common Test cases. End-to-end CT suite gated on
-`LLAMA_TEST_MODEL` (6 cases, passing locally with TinyLlama 1.1B
-Q4_K_M).
+erllama is pre-release. The cache, scheduler, and NIF safety wrappers have
+unit, property, and Common Test coverage. The real-model Common Test suite
+is gated by `LLAMA_TEST_MODEL` so normal CI can run without a GGUF file.
 
-See [CHANGELOG.md](CHANGELOG.md) for the release notes.
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Contributing
 
 The contributor guide is [AGENTS.md](AGENTS.md). The short version:
 
 ```bash
-rebar3 fmt          # auto-format (always run first)
-rebar3 compile      # warnings_as_errors
-rebar3 eunit        # unit tests
-rebar3 proper       # property tests
-rebar3 ct           # Common Test (without a real model)
-rebar3 lint         # Elvis
-rebar3 dialyzer     # static analysis
-rebar3 xref         # cross-reference
+rebar3 fmt
+rebar3 compile
+rebar3 eunit
+rebar3 proper
+rebar3 ct
+rebar3 lint
+rebar3 dialyzer
+rebar3 xref
 ```
 
-End-to-end against a real GGUF:
+Run the real-model suite when you have a GGUF available:
 
 ```bash
-LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.gguf \
+LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.Q4_K_M.gguf \
     rebar3 ct --suite=test/erllama_real_model_SUITE
 ```
 
-Bumping the vendored llama.cpp: see [UPDATE_LLAMA.md](UPDATE_LLAMA.md).
+Bumping the vendored `llama.cpp` is covered in
+[UPDATE_LLAMA.md](UPDATE_LLAMA.md).
 
-## Coming next: erllama_cluster
+## Related projects
 
-A separate OTP application is in development to coordinate a fleet of
-erllama nodes into a single inference cluster. Each node continues to
-run erllama as a standalone library — local model loading, local KV
-cache, local inference. The cluster layer sits on top and decides
-which node serves which request.
+`erllama_cluster` is planned as a separate OTP application for routing,
+cache-aware placement, speculative decoding, and distributed inference
+across erllama nodes.
 
-Three distribution strategies, all in v1:
-
-- **Request distribution** with pluggable load-balancing and
-  cache-affinity routing — follow-up requests prefer the node that
-  warmed the KV cache for the prefix.
-- **Speculative decoding across nodes** — small draft model on one
-  node, large verifier on another, coordinated per request.
-- **Pipeline parallelism** — models too large for one node split by
-  layer ranges across multiple nodes, hidden states passed between
-  shards as Erlang binaries.
-
-Transport is QUIC, via Erlang distribution carried over
-[erlang_quic](https://github.com/benoitc/erlang_quic) — a pure Erlang
-QUIC implementation, no C NIF in the protocol path. Circuit breakers
-per `{Node, ModelId}` driven by `nodeup`/`nodedown` rather than
-application-level pings. A globally registered scheduler handles
-cluster-wide GPU budgeting and on-demand model placement, with local
-fallback schedulers elected by `pg` quorum on network partition.
-
-Repository: <https://github.com/erllama/erllama_cluster> (under
-construction).
+Repository: <https://github.com/erllama/erllama_cluster>
 
 ## Acknowledgements
 
