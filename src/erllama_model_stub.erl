@@ -68,13 +68,19 @@
     %% by a `tool_call_end` are emitted after the thinking phase (or
     %% from the start when `thinking_capable = false`). Same per-sampler
     %% state machine as the thinking phase.
-    tool_call_capable = false :: boolean()
+    tool_call_capable = false :: boolean(),
+    %% Opt-in: extends the tool-call phase with payload markers,
+    %% letting tests exercise the scheduler's sampler-swap on
+    %% payload_open / payload_close. Only meaningful when
+    %% tool_call_capable is also true.
+    tool_call_payload_capable = false :: boolean()
 }).
 
 init(Config) ->
     {ok, #stub{
         thinking_capable = bool_opt(thinking_capable, Config),
-        tool_call_capable = bool_opt(tool_call_capable, Config)
+        tool_call_capable = bool_opt(tool_call_capable, Config),
+        tool_call_payload_capable = bool_opt(tool_call_payload_capable, Config)
     }}.
 
 bool_opt(Key, Config) ->
@@ -117,10 +123,11 @@ kv_unpack(_S, _Bin) ->
 kv_unpack(_S, _Bin, _SeqId) ->
     ok.
 
-%% No persistent per-seq state in the stub, so seq_rm is a no-op.
-%% The scheduler's tests rely on this being callable; the cache
-%% integration goes through the encoded-token binary instead.
-seq_rm(_S, _SeqId) ->
+%% Drops the per-seq phase counter when the scheduler releases a
+%% seq's KV. Without this, a subsequent admission to the same
+%% seq_id would inherit the prior request's state.
+seq_rm(_S, SeqId) ->
+    erlang:erase({stub_phase, SeqId}),
     ok.
 
 %% Per-tick batched step. Prefill rows just acknowledge. Decode rows
@@ -146,20 +153,27 @@ stub_step_op({SeqId, {decode, Sampler}}, #stub{
     decode_token(SeqId, Sampler);
 stub_step_op(
     {SeqId, {decode, Sampler}},
-    #stub{thinking_capable = TC, tool_call_capable = UC}
+    #stub{
+        thinking_capable = TC,
+        tool_call_capable = UC,
+        tool_call_payload_capable = PC
+    }
 ) ->
-    Phase = next_phase(Sampler, TC, UC),
-    advance_phase(Sampler, Phase, SeqId).
+    Phase = next_phase(SeqId, TC, UC),
+    advance_phase(SeqId, Sampler, Phase, PC).
 
-%% Phases (per-sampler, via process dict) walk in order:
+%% Phases (per-seq_id, via process dict) walk in order:
 %%   thinking_emit_0, thinking_emit_1, thinking_done,
-%%   tool_call_emit_0, tool_call_emit_1, tool_call_done,
+%%   tool_call_emit_0, [payload_open, payload_emit, payload_close,]
+%%   tool_call_emit_1 (when no payload markers), tool_call_end_due,
 %%   normal
 %% Phases for disabled features are skipped, so a stub with only
 %% thinking_capable goes thinking_emit_0 -> thinking_emit_1 ->
-%% thinking_done -> normal.
-next_phase(Sampler, TC, UC) ->
-    case erlang:get({stub_phase, Sampler}) of
+%% thinking_done -> normal. The key is seq_id (not sampler ref)
+%% so mid-request sampler swaps (the greedy-on-syntax path) don't
+%% reset the state machine.
+next_phase(SeqId, TC, UC) ->
+    case erlang:get({stub_phase, SeqId}) of
         undefined when TC -> thinking_emit_0;
         undefined when UC -> tool_call_emit_0;
         undefined -> normal;
@@ -168,30 +182,56 @@ next_phase(Sampler, TC, UC) ->
         Other -> Other
     end.
 
-advance_phase(Sampler, thinking_emit_0, SeqId) ->
-    erlang:put({stub_phase, Sampler}, thinking_emit_1),
-    T = erlang:phash2({thinking_step_stub, SeqId, Sampler, 0}) rem (1 bsl 32),
-    {SeqId, {thinking_token, T}};
-advance_phase(Sampler, thinking_emit_1, SeqId) ->
-    erlang:put({stub_phase, Sampler}, thinking_end_due),
-    T = erlang:phash2({thinking_step_stub, SeqId, Sampler, 1}) rem (1 bsl 32),
-    {SeqId, {thinking_token, T}};
-advance_phase(Sampler, thinking_end_due, SeqId) ->
-    erlang:put({stub_phase, Sampler}, thinking_done),
-    {SeqId, thinking_end};
-advance_phase(Sampler, tool_call_emit_0, SeqId) ->
-    erlang:put({stub_phase, Sampler}, tool_call_emit_1),
-    T = erlang:phash2({tool_call_step_stub, SeqId, Sampler, 0}) rem (1 bsl 32),
-    {SeqId, {tool_call_token, T}};
-advance_phase(Sampler, tool_call_emit_1, SeqId) ->
-    erlang:put({stub_phase, Sampler}, tool_call_end_due),
-    T = erlang:phash2({tool_call_step_stub, SeqId, Sampler, 1}) rem (1 bsl 32),
-    {SeqId, {tool_call_token, T}};
-advance_phase(Sampler, tool_call_end_due, SeqId) ->
-    erlang:put({stub_phase, Sampler}, normal),
-    {SeqId, tool_call_end};
-advance_phase(Sampler, normal, SeqId) ->
+%% Phase transitions: each clause picks the next phase, then either
+%% emits a token (via with_phase_token/4) or a bare marker (via
+%% with_phase/3).
+advance_phase(SeqId, Sampler, thinking_emit_0, _PC) ->
+    with_phase_token(SeqId, Sampler, thinking_emit_1, {thinking, 0});
+advance_phase(SeqId, Sampler, thinking_emit_1, _PC) ->
+    with_phase_token(SeqId, Sampler, thinking_end_due, {thinking, 1});
+advance_phase(SeqId, _Sampler, thinking_end_due, _PC) ->
+    with_phase(SeqId, thinking_done, thinking_end);
+advance_phase(SeqId, Sampler, tool_call_emit_0, true) ->
+    with_phase_token(SeqId, Sampler, tool_call_payload_open_due, {tool_call, 0});
+advance_phase(SeqId, Sampler, tool_call_emit_0, false) ->
+    with_phase_token(SeqId, Sampler, tool_call_emit_1, {tool_call, 0});
+advance_phase(SeqId, Sampler, tool_call_emit_1, _PC) ->
+    with_phase_token(SeqId, Sampler, tool_call_end_due, {tool_call, 1});
+advance_phase(SeqId, Sampler, tool_call_payload_open_due, _PC) ->
+    with_phase_marker(SeqId, Sampler, tool_call_payload_emit, payload_open);
+advance_phase(SeqId, Sampler, tool_call_payload_emit, _PC) ->
+    with_phase_token(SeqId, Sampler, tool_call_payload_close_due, {tool_call, payload_body});
+advance_phase(SeqId, Sampler, tool_call_payload_close_due, _PC) ->
+    with_phase_marker(SeqId, Sampler, tool_call_end_due, payload_close);
+advance_phase(SeqId, _Sampler, tool_call_end_due, _PC) ->
+    with_phase(SeqId, normal, tool_call_end);
+advance_phase(SeqId, Sampler, normal, _PC) ->
     decode_token(SeqId, Sampler).
+
+%% Advance the per-seq phase and return a step_result with a token
+%% derived from the (seq, sampler, seed) tuple. The seed
+%% disambiguates ticks within the same phase so two consecutive
+%% thinking_tokens get distinct ids.
+with_phase_token(SeqId, Sampler, NextPhase, Seed) ->
+    with_phase_tagged(SeqId, Sampler, NextPhase, Seed, tag_for_seed(Seed)).
+
+with_phase_marker(SeqId, Sampler, NextPhase, Marker) ->
+    with_phase_tagged(SeqId, Sampler, NextPhase, Marker, tag_for_marker(Marker)).
+
+with_phase_tagged(SeqId, Sampler, NextPhase, Seed, Tag) ->
+    erlang:put({stub_phase, SeqId}, NextPhase),
+    T = erlang:phash2({tool_call_step_stub, SeqId, Sampler, Seed}) rem (1 bsl 32),
+    {SeqId, {Tag, T}}.
+
+tag_for_seed({thinking, _}) -> thinking_token;
+tag_for_seed({tool_call, _}) -> tool_call_token.
+
+tag_for_marker(payload_open) -> tool_call_payload_open;
+tag_for_marker(payload_close) -> tool_call_payload_close.
+
+with_phase(SeqId, NextPhase, MarkerResult) ->
+    erlang:put({stub_phase, SeqId}, NextPhase),
+    {SeqId, MarkerResult}.
 
 decode_token(SeqId, Sampler) ->
     T = erlang:phash2({decode_step_stub, SeqId, Sampler}) rem (1 bsl 32),
@@ -209,8 +249,8 @@ thinking_signature(_S, SeqId, _Bytes) ->
 sampler_new(_S, _Cfg) ->
     {ok, make_ref()}.
 
-sampler_free(Sampler) ->
-    erlang:erase({stub_phase, Sampler}),
+sampler_free(_Sampler) ->
+    %% Stub state is now keyed on seq_id; cleanup happens in seq_rm.
     ok.
 
 %% Render a chat request as `system\nrole: content\nrole: content\n`

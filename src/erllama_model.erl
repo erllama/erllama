@@ -436,6 +436,24 @@ concurrently through one decode call per tick.
     %% the request is one-shot; the seq returns to the idle pool
     %% on finish as before.
     session_id = undefined :: term() | undefined,
+    %% Secondary sampler ref configured for greedy decoding
+    %% (temperature = 0). When the model is loaded with
+    %% `tool_call_markers` this is built at admission alongside the
+    %% normal sampler; the scheduler swaps to it for tool-call
+    %% syntax tokens so they stay byte-deterministic.
+    %% `undefined` when no tool-call markers exist or the backend
+    %% doesn't expose `sampler_new`.
+    tool_call_greedy_sampler_ref = undefined :: term() | undefined,
+    %% Tri-state pointing at which sampler the next decode op
+    %% should use:
+    %%   `normal`              -> Req#req.sampler_ref
+    %%   `tool_call_syntax`    -> Req#req.tool_call_greedy_sampler_ref
+    %%                            (falls back to sampler_ref when
+    %%                            the greedy ref couldn't be built)
+    %%   `tool_call_payload`   -> Req#req.sampler_ref (caller's
+    %%                            normal chain, used for string
+    %%                            payload bodies inside a span)
+    active_sampler = normal :: normal | tool_call_syntax | tool_call_payload,
     %% Caller-side thinking-phase cap (`undefined` means no cap).
     %% Counted in delivered `{thinking_delta, _}` payloads, not raw
     %% thinking_token step results, so an empty detokenisation does
@@ -1148,6 +1166,7 @@ start_request({complete, From, Prompt, Opts}, SeqId, Mode, Data) ->
         {ok, SamplerRef, SamplerCfg, Data0} ->
             PromptTokens = backend_call(Data0, tokenize, [Prompt]),
             {Stops, StopPat, StopMax} = stop_sequences_from(Opts),
+            GreedyRef = greedy_sampler_for(Data0),
             Req = #req{
                 seq_id = SeqId,
                 mode = standard,
@@ -1166,7 +1185,8 @@ start_request({complete, From, Prompt, Opts}, SeqId, Mode, Data) ->
                 stop_max_len = StopMax,
                 thinking = thinking_from(Opts),
                 thinking_budget = thinking_budget_from(Opts),
-                session_id = maps:get(session_id, Opts, undefined)
+                session_id = maps:get(session_id, Opts, undefined),
+                tool_call_greedy_sampler_ref = GreedyRef
             },
             Req1 = setup_admission_path(Req, Mode, PromptTokens, Opts, Data0),
             Data1 = put_req(Data0, Req1),
@@ -1202,6 +1222,7 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Mode, Data) ->
             Ref = make_ref(),
             ok = erllama_inflight:register(Ref, self()),
             {Stops, StopPat, StopMax} = stop_sequences_from(Params),
+            GreedyRef = greedy_sampler_for(Data0),
             Req = #req{
                 seq_id = SeqId,
                 mode = streaming,
@@ -1221,7 +1242,8 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Mode, Data) ->
                 stop_max_len = StopMax,
                 thinking = thinking_from(Params),
                 thinking_budget = thinking_budget_from(Params),
-                session_id = maps:get(session_id, Params, undefined)
+                session_id = maps:get(session_id, Params, undefined),
+                tool_call_greedy_sampler_ref = GreedyRef
             },
             Req1 = setup_admission_path(Req, Mode, Tokens, Params, Data0),
             Data1 = put_req(Data0, Req1),
@@ -1769,7 +1791,7 @@ build_op_list(Data) ->
         fun(R, {Decodes, Prefills}) ->
             case R#req.prefill_cursor of
                 undefined ->
-                    case R#req.sampler_ref of
+                    case active_sampler_ref(R) of
                         undefined ->
                             %% prefill_only completed prefill — it's a
                             %% finisher this tick.
@@ -1923,12 +1945,32 @@ apply_step_results([{{SeqId, {decode, _}}, thinking_end} | T], Data) ->
     apply_step_results(T, put_req(Data, Req1));
 apply_step_results([{{SeqId, {decode, _}}, {tool_call_token, Tok}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
-    Req1 = req_tool_call_emit(Req, Tok, Data),
+    %% Entering or continuing the tool-call span: subsequent
+    %% decode ops run through the greedy sampler so syntax tokens
+    %% stay deterministic.
+    Req1 = req_tool_call_emit(Req#req{active_sampler = tool_call_syntax}, Tok, Data),
     apply_step_results(T, put_req(Data, Req1));
 apply_step_results([{{SeqId, {decode, _}}, tool_call_end} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
-    Req1 = req_tool_call_end(Req, Data),
-    apply_step_results(T, put_req(Data, Req1)).
+    %% Close the span: emit the carrying close message and revert to
+    %% the request's normal sampler for any post-call tokens.
+    Req1 = (req_tool_call_end(Req, Data))#req{active_sampler = normal},
+    apply_step_results(T, put_req(Data, Req1));
+apply_step_results([{{SeqId, {decode, _}}, {tool_call_payload_open, Tok}} | T], Data) ->
+    Req = maps:get(SeqId, Data#data.req_table),
+    %% The marker token itself is part of the captured tool-call
+    %% body bytes; emit it as a delta and accumulate. After the
+    %% marker, subsequent decode ops sample through the request's
+    %% normal sampler so caller-supplied string contents stay
+    %% diverse.
+    Req1 = req_tool_call_emit(Req, Tok, Data),
+    apply_step_results(T, put_req(Data, Req1#req{active_sampler = tool_call_payload}));
+apply_step_results([{{SeqId, {decode, _}}, {tool_call_payload_close, Tok}} | T], Data) ->
+    Req = maps:get(SeqId, Data#data.req_table),
+    %% Closing payload marker: capture its bytes and switch back to
+    %% greedy sampling for the rest of the tool-call body.
+    Req1 = req_tool_call_emit(Req, Tok, Data),
+    apply_step_results(T, put_req(Data, Req1#req{active_sampler = tool_call_syntax})).
 
 %% Append the token to both context_tokens and generated.
 req_append_token(Req, Token) ->
@@ -2362,16 +2404,22 @@ fail_all_requests(Data, Err) ->
     ),
     ok.
 
-release_sampler(#req{sampler_ref = undefined}, _Data) ->
-    ok;
-release_sampler(#req{sampler_ref = Ref}, #data{backend = Mod}) ->
+release_sampler(#req{sampler_ref = SRef, tool_call_greedy_sampler_ref = GRef}, #data{
+    backend = Mod
+}) ->
     case erlang:function_exported(Mod, sampler_free, 1) of
         true ->
-            _ = Mod:sampler_free(Ref),
-            ok;
+            free_sampler_ref(Mod, SRef),
+            free_sampler_ref(Mod, GRef);
         false ->
             ok
     end.
+
+free_sampler_ref(_Mod, undefined) ->
+    ok;
+free_sampler_ref(Mod, Ref) ->
+    _ = Mod:sampler_free(Ref),
+    ok.
 
 release_seq(SeqId, #data{backend = Mod, backend_state = S}) ->
     case erlang:function_exported(Mod, seq_rm, 2) of
@@ -2468,6 +2516,37 @@ sampler_for(Opts, Data = #data{backend = Mod, backend_state = S}) ->
             end;
         false ->
             {ok, undefined, Cfg, Data}
+    end.
+
+%% Pick the sampler ref to send with the next decode op for this
+%% request. Default is the request's normal chain; while a tool-call
+%% span is open and the optional payload sub-state isn't active, the
+%% scheduler routes through the request's greedy ref so syntax tokens
+%% sample deterministically. Falls back to the normal ref when the
+%% greedy ref couldn't be built (older backends without sampler_new).
+active_sampler_ref(#req{active_sampler = tool_call_syntax} = R) ->
+    case R#req.tool_call_greedy_sampler_ref of
+        undefined -> R#req.sampler_ref;
+        GreedyRef -> GreedyRef
+    end;
+active_sampler_ref(R) ->
+    R#req.sampler_ref.
+
+%% Build a second sampler chain configured for greedy decoding
+%% (temperature = 0). Used when the model is loaded with
+%% `tool_call_markers`: tool-call syntax tokens go through this
+%% sampler so they're byte-deterministic from a fixed prefix.
+%% Returns `undefined` when the backend doesn't expose
+%% `sampler_new/2` or when no tool-call markers are configured.
+greedy_sampler_for(#data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, sampler_new, 2) of
+        false ->
+            undefined;
+        true ->
+            case Mod:sampler_new(S, #{temperature => 0.0}) of
+                {ok, Ref} -> Ref;
+                {error, _} -> undefined
+            end
     end.
 
 %% Parse `stop_sequences` from an Opts/Params map. Non-binary or

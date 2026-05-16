@@ -454,6 +454,26 @@ non_tool_call_stub_emits_no_tool_messages_test() ->
         ?assertEqual(done, lists:last(Kinds))
     end).
 
+tool_call_payload_markers_appear_in_concatenated_bytes_test() ->
+    %% With payload markers configured the close message must
+    %% include every emitted delta in order: syntax start +
+    %% payload_open + payload body + payload_close. The downstream
+    %% needs all of these bytes for exact replay.
+    with_model(
+        #{tool_call_capable => true, tool_call_payload_capable => true},
+        fun(Id) ->
+            {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+            {ok, Ref} = erllama:infer(
+                Id, Tokens, #{response_tokens => 2}, self()
+            ),
+            Events = collect_all(Ref, 5000),
+            Deltas = [B || {tool_call_delta, B} <- Events],
+            [{tool_call_end, Full}] = [E || {tool_call_end, _} = E <- Events],
+            ?assert(length(Deltas) >= 4),
+            ?assertEqual(iolist_to_binary(Deltas), Full)
+        end
+    ).
+
 thinking_and_tool_call_capable_stub_emits_both_phases_test() ->
     %% When both phases are enabled the stub walks thinking first,
     %% then tool calls, then normal tokens. Asserting ordering keeps

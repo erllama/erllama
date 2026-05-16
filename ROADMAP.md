@@ -128,6 +128,15 @@ lz4/zstd helps a little; TurboQuant is unproven for this. We have no
 benchmark data we trust enough to ship a default; both stay
 deferred.
 
+### KTM-inside-KV-files persistence
+
+ds4 packs its tool-id → bytes map ("KTM") as appended sections
+inside the disk KV cache files. Tempting because the lifetime
+matches the KV row, but couples erllama's stable cache binary
+format to an evolving HTTP-layer concept. Keep the two stores
+separate; revisit only if running them side-by-side produces
+measurable I/O amplification.
+
 ### Cluster / distributed inference
 
 A model loaded on node A served from node B. The cache subsystem is
