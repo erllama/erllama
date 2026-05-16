@@ -225,7 +225,18 @@ inference, etc.) can plug in via this same surface.
     %% The scheduler resolves a signature via thinking_signature/1
     %% (or `<<>>` when the callback is not exported) and sends
     %% {erllama_thinking_end, Ref, Sig} before any subsequent token.
-    | thinking_end.
+    | thinking_end
+    %% Tool-call token: scheduler detokenises and emits
+    %% {erllama_token, Ref, {tool_call_delta, Bin}} so the downstream
+    %% can capture the exact bytes the model produced for the call.
+    %% Backends without tool-call markers never emit this variant.
+    | {tool_call_token, erllama_nif:token_id()}
+    %% Marker that the current tool-call span has closed. The
+    %% scheduler emits {erllama_tool_call_end, Ref, Full :: binary()}
+    %% carrying the concatenated bytes of every {tool_call_delta, _}
+    %% it sent for this span, so the downstream does not have to
+    %% buffer chunks itself.
+    | tool_call_end.
 
 -export_type([sampler_opts/0, seq_id/0, sampler_ref/0, step_op/0, step_result/0]).
 
