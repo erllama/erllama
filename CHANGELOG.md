@@ -6,6 +6,60 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-05-16
+
+Tool-call exact-replay scaffolding for downstream HTTP front ends.
+Models loaded with `tool_call_markers` produce structured boundary
+messages on the streaming wire so a caller can capture the exact
+bytes the model sampled, store them under a tool id, and splice
+them back verbatim on later turns to keep the KV-cache prefix
+match working. Companion primitives expose explicit suffix replay
+and sticky per-session seq_id pinning.
+
+### Added
+
+- `tool_call_markers => #{start, end, payload_start (optional),
+  payload_end (optional)}` on `erllama:load_model/2` Config. Each
+  binary is tokenised through the model's own vocabulary at load
+  time; multi-token markers are supported. Omitting the key keeps
+  the backend on the existing path (#39, #42).
+- Streaming wire on `infer/4` gains
+  `{erllama_token, Ref, {tool_call_delta, Bin}}` per chunk and a
+  single `{erllama_tool_call_end, Ref, Full :: binary()}` per
+  span, with `Full` carrying every emitted delta concatenated so
+  the downstream's exact-replay map stores them verbatim without
+  re-buffering (#39).
+- `erllama:prefill_only/3` accepting `Opts` with `parent_key`.
+  When passed a prior turn's `finish_key`, the call warm-restores
+  from that row and prefills only the new suffix before firing the
+  finish save — useful for chaining cache-warming calls across
+  turns (#40).
+- `session_id => term()` on `infer/4` Params and
+  `complete/3` / `prefill_only/3` Opts. Pins the underlying seq_id
+  to that session across requests so the next turn whose prompt
+  continues the stored tokens truncates-and-prefills in place on
+  the already-live KV cells (`cache_hit_kind => sticky`).
+  Concurrent admits on the same `session_id` return `{error,
+  sticky_busy}`. Release with `erllama:end_session/2` (#41).
+- Per-request greedy sampler swap on tool-call syntax tokens.
+  Models with `tool_call_markers` build a second sampler chain
+  (`temperature => 0`) at admission; the scheduler routes syntax
+  tokens through it so a tool call is byte-deterministic from a
+  fixed prefix. Optional payload markers flip back to the request's
+  normal sampler for caller-supplied string contents so they stay
+  diverse (#42).
+
+### Changed
+
+- `step_result()` on `erllama_model_backend` gains four variants
+  (`{tool_call_token, _}`, `tool_call_end`, `{tool_call_payload_open,
+  _}`, `{tool_call_payload_close, _}`). Backends without
+  tool-call markers emit none of them.
+- `erllama_model_stub` phase machine re-keyed from sampler ref onto
+  seq_id so mid-request sampler swaps (the new greedy-on-syntax
+  path) don't reset state across ticks. `seq_rm` now cleans the
+  per-seq phase entry.
+
 ## [0.4.0] - 2026-05-16
 
 Anthropic-Messages compatibility follow-ups: per-request cache
