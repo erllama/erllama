@@ -63,25 +63,6 @@ after verify. A v2 path that snapshots and restores
 `decode_ready` is straightforward but waits for a concrete
 caller need.
 
-## Deferred from 0.1 to 0.2
-
-### Concurrent multi-sequence decoding
-
-Today the model gen_statem serves one request at a time; a second
-`complete/3` or `infer/4` arriving while one is in flight queues
-behind it (Phase 4 scoped, 0.1) and waits for the previous to
-finish.
-
-For real concurrency we need to drive multiple `seq_id`s through one
-`llama_decode` call: per-request `#req{}` records (extracted from
-`#data{}`), a `seq_id` allocator pool, a per-request sampler
-resource (already shipping in 0.1 as `erllama_sampler_t`), and a
-new `nif_decode_and_sample_batch/2` primitive.
-
-Verification: PropEr property running N concurrent completions on
-one model; cancellation evicts the right `seq_id`; counters show
-batched decode steps.
-
 ## Backlog (no fixed milestone)
 
 ### Speculative decoding
@@ -112,12 +93,27 @@ these natively, so the path is either a converter step at
 `fetch`-time (the `erllama_server` repo handles fetch) or a second
 backend that targets a different runtime.
 
-### Stop-sequence support
+### Thinking-aware sampler
 
-`infer_params()` already lists `stop :: [binary()]`; the model
-ignores it. Implementation needs a small stop-state machine over
-emitted tokens, plus de-tokenisation of the stop strings against
-the live vocab.
+0.3 ships the message-shape surface for extended thinking
+(`{thinking_delta, _}` / `{erllama_thinking_end, _, _}`) and a
+stub-backed signature; the real backend still has no thinking
+sampler. Needed: a `llama_model_backend` implementation that
+recognises model-emitted thinking-start / thinking-end markers
+(template-defined), tracks the per-block thinking text on the
+backend side, and returns a real HMAC-style signature from
+`thinking_signature/2`. Caller-side budget clipping
+(`thinking.budget_tokens` from the Anthropic spec) lands here too.
+
+### Cache delta accounting
+
+The downstream `erllama_server` HTTP front end emits coarse
+whole-prompt approximations for Anthropic's `cache_creation_input_tokens`
+and `cache_read_input_tokens` because the cache layer doesn't
+surface per-request deltas yet. Plumb a `cache_delta` map (created
+/ read tokens, optionally per-cache-block) through the
+`completion_result()` map and the streaming `Stats` so the
+downstream can report accurate values.
 
 ### Stateful streaming with bit-exact KV resume
 
