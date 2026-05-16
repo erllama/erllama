@@ -136,6 +136,7 @@ concurrently through one decode call per tick.
     prefill_only/3,
     infer/4,
     cancel/1,
+    end_session/2,
     status/1,
     evict/1,
     shutdown/1,
@@ -194,7 +195,7 @@ concurrently through one decode call per tick.
     vram_estimate_b := non_neg_integer()
 }.
 
--type cache_hit_kind() :: exact | partial | cold.
+-type cache_hit_kind() :: exact | partial | cold | sticky.
 
 -type pending_request() ::
     {complete, gen_statem:from(), binary(), map()}
@@ -313,6 +314,15 @@ concurrently through one decode call per tick.
     %% progresses. Non-positive values and a missing key both mean
     %% "no cap". Only meaningful with `thinking => enabled`.
     thinking_budget_tokens => pos_integer(),
+    %% Sticky-seq opt-in. Any term identifies a conversation; the
+    %% same value on successive `complete/3` / `infer/4` /
+    %% `prefill_only/3` requests pins the underlying `seq_id`'s KV
+    %% cells across requests so the next turn truncates-and-
+    %% prefills in place instead of warm-restoring from disk. End
+    %% the session explicitly with `end_session/2` (or let the
+    %% gen_statem terminate). The HTTP server's conversation id is
+    %% the natural value; nothing here is HTTP-specific.
+    session_id => term(),
     _ => _
 }.
 
@@ -420,6 +430,12 @@ concurrently through one decode call per tick.
     %% span closes, then reset for any subsequent span on the same
     %% request.
     tool_call_bytes = <<>> :: binary(),
+    %% Sticky-seq session identifier. When set, `finish_req` skips
+    %% the usual `release_seq` so the seq_id's KV cells stay live
+    %% for the next request on the same session. `undefined` means
+    %% the request is one-shot; the seq returns to the idle pool
+    %% on finish as before.
+    session_id = undefined :: term() | undefined,
     %% Caller-side thinking-phase cap (`undefined` means no cap).
     %% Counted in delivered `{thinking_delta, _}` payloads, not raw
     %% thinking_token step results, so an empty detokenisation does
@@ -496,7 +512,19 @@ concurrently through one decode call per tick.
     %%   {complete, From, Prompt, Opts}
     %%   {prefill_only, From, PromptTokens, Opts}
     %%   {infer, From, Tokens, Params, CallerPid}
-    pending = [] :: [pending_request()]
+    pending = [] :: [pending_request()],
+    %% Sticky-seq map: when a request carries `session_id` (any term),
+    %% its seq_id is pinned to the session across requests so the
+    %% KV cells stay live. Value carries the seq_id and the post-
+    %% finish context tokens, used on the next admission to decide
+    %% whether the new prompt extends the stored prefix (truncate-
+    %% and-prefill the suffix in place) or replaces it (evict the
+    %% sticky seq and fall back to normal admission). Sessions
+    %% persist until the caller calls `end_session/2` or the
+    %% gen_statem terminates.
+    session_seq = #{} :: #{
+        term() => {SeqId :: non_neg_integer(), StoredTokens :: [non_neg_integer()]}
+    }
 }).
 
 %% =============================================================================
@@ -594,6 +622,10 @@ cancel(Ref) when is_reference(Ref) ->
         {error, not_found} ->
             ok
     end.
+
+-spec end_session(model(), term()) -> ok.
+end_session(Model, SessionId) ->
+    gen_statem:call(via(Model), {end_session, SessionId}, infinity).
 
 -spec status(model()) -> idle | prefilling | generating.
 status(Model) ->
@@ -893,6 +925,9 @@ idle({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
     admit({infer, From, Tokens, Params, CallerPid}, Data);
 idle({call, From}, status, Data) ->
     {keep_state, Data, [{reply, From, idle}]};
+idle({call, From}, {end_session, SessionId}, Data) ->
+    NewData = drop_session(SessionId, Data),
+    {keep_state, NewData, [{reply, From, ok}]};
 idle({call, From}, {verify, PrefixTokens, Candidates, K}, Data) ->
     Reply = run_verify(PrefixTokens, Candidates, K, Data),
     case Reply of
@@ -921,6 +956,9 @@ running({call, From}, status, Data) ->
     %% `generating`. Empty req_table only happens between ticks.
     Phase = dominant_phase(Data),
     {keep_state, Data, [{reply, From, Phase}]};
+running({call, From}, {end_session, SessionId}, Data) ->
+    NewData = drop_session(SessionId, Data),
+    {keep_state, NewData, [{reply, From, ok}]};
 running({call, From}, {verify, _, _, _}, Data) ->
     %% Verify mutates the live context; refuse while any seq is in
     %% flight to keep the snapshot/restore invariant intact.
@@ -942,11 +980,27 @@ run_verify(PrefixTokens, Candidates, K, Data) ->
 public_verify_reply({ok, Accepted, NextToken, _NewBState}) ->
     {ok, Accepted, NextToken}.
 
-%% Admit one pending_request(). Pops a seq_id from idle_seq_ids and
-%% kicks the request off; if no seq_ids are free, queues in
-%% `pending` (the caller's gen_statem:call still blocks since we do
-%% not reply until the queued request is eventually started).
-admit(Item, Data = #data{idle_seq_ids = []}) ->
+%% Admit one pending_request(). Resolves which seq_id to use given
+%% the request's optional `session_id`: if a prior request on the
+%% same session left its KV cells live, we reuse that seq_id and
+%% truncate-and-prefill in place. Otherwise pop from idle_seq_ids
+%% as before, queueing in `pending` when none are free.
+admit(Item, Data) ->
+    case resolve_admission_seq(Item, Data) of
+        {sticky, SeqId, StoredTokens, NewData} ->
+            start_admission(Item, SeqId, {sticky, StoredTokens}, NewData);
+        {normal, NewData} ->
+            admit_normal(Item, NewData);
+        {sticky_busy, _SessionId} ->
+            From = caller_from_of(Item),
+            {keep_state, Data, [{reply, From, {error, sticky_busy}}]}
+    end.
+
+caller_from_of({complete, From, _, _}) -> From;
+caller_from_of({prefill_only, From, _, _}) -> From;
+caller_from_of({infer, From, _, _, _}) -> From.
+
+admit_normal(Item, Data = #data{idle_seq_ids = []}) ->
     %% No seq_ids available — queue. The caller stays blocked on
     %% gen_statem:call until step_tick frees a slot and the
     %% dispatch path runs this admit. For streaming infer/4 the
@@ -956,23 +1010,140 @@ admit(Item, Data = #data{idle_seq_ids = []}) ->
         Empty when map_size(Empty) =:= 0 -> {next_state, idle, NewData};
         _ -> {keep_state, NewData}
     end;
-admit(Item, Data = #data{idle_seq_ids = [SeqId | Rest]}) ->
-    case start_request(Item, SeqId, Data#data{idle_seq_ids = Rest}) of
+admit_normal(Item, Data = #data{idle_seq_ids = [SeqId | Rest]}) ->
+    start_admission(Item, SeqId, normal, Data#data{idle_seq_ids = Rest}).
+
+start_admission(Item, SeqId, Mode, Data) ->
+    case start_request(Item, SeqId, Mode, Data) of
         {ok, NewData, Actions} ->
             schedule_tick(),
             {next_state, running, NewData, Actions};
         {error, Reason, From} ->
             %% Sampler build or pre-validation failed. Return the
             %% seq_id to the free list and reply to the caller.
-            Data1 = Data#data{idle_seq_ids = [SeqId | Rest]},
+            %% Sticky seqs don't need to return to the idle pool —
+            %% they're still owned by their session.
+            Data1 =
+                case Mode of
+                    {sticky, _} -> Data;
+                    normal -> Data#data{idle_seq_ids = [SeqId | Data#data.idle_seq_ids]}
+                end,
             {keep_state, Data1, [{reply, From, {error, Reason}}]}
     end.
+
+%% Resolve the session_id (if any) to a seq_id and the stored tokens
+%% from the prior request. Returns one of:
+%%   {sticky, SeqId, StoredTokens, NewData}
+%%     the session has a live seq and the new prompt continues the
+%%     stored tokens (or matches them exactly); admit using SeqId
+%%     and skip the kv_unpack step.
+%%   {normal, NewData}
+%%     no session_id, unknown session, or stored tokens diverge
+%%     from the new prompt. In the diverge case the sticky seq is
+%%     freed and returned to the idle pool; the caller's normal
+%%     admission can pop it.
+resolve_admission_seq(Item, Data) ->
+    case session_id_of(Item) of
+        undefined ->
+            {normal, Data};
+        SessionId ->
+            case maps:find(SessionId, Data#data.session_seq) of
+                error ->
+                    {normal, Data};
+                {ok, {SeqId, StoredTokens}} ->
+                    case maps:is_key(SeqId, Data#data.req_table) of
+                        true ->
+                            %% Session's seq is currently in flight with
+                            %% an earlier request. Concurrent admits on
+                            %% the same session_id are out of scope;
+                            %% callers are expected to serialise.
+                            {sticky_busy, SessionId};
+                        false ->
+                            resolve_sticky_continuation(
+                                SessionId, SeqId, StoredTokens, Item, Data
+                            )
+                    end
+            end
+    end.
+
+resolve_sticky_continuation(SessionId, SeqId, StoredTokens, Item, Data) ->
+    {ok, Prompt} = prompt_tokens_of(Item, Data),
+    case is_strict_prefix_or_equal(StoredTokens, Prompt) of
+        true ->
+            {sticky, SeqId, StoredTokens, Data};
+        false ->
+            %% Divergence: drop the sticky mapping, free the seq's
+            %% live KV, return the seq to the idle pool. The
+            %% caller's normal admission picks it back up.
+            backend_seq_clear_for(SeqId, Data),
+            NewData = Data#data{
+                session_seq = maps:remove(SessionId, Data#data.session_seq),
+                idle_seq_ids = [SeqId | Data#data.idle_seq_ids]
+            },
+            {normal, NewData}
+    end.
+
+backend_seq_clear_for(SeqId, #data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, seq_rm, 2) of
+        true -> Mod:seq_rm(S, SeqId);
+        false -> ok
+    end.
+
+%% Public end_session handler: drop the session's sticky mapping,
+%% free the seq's KV cells, and return the seq to the idle pool.
+%% Idempotent — unknown sessions and busy seqs are both no-ops
+%% (a busy seq finishes through the normal release path; the
+%% caller can re-call end_session after that).
+drop_session(SessionId, Data) ->
+    case maps:find(SessionId, Data#data.session_seq) of
+        error ->
+            Data;
+        {ok, {SeqId, _StoredTokens}} ->
+            case maps:is_key(SeqId, Data#data.req_table) of
+                true ->
+                    %% In-flight on this seq; leave the mapping
+                    %% alone so the in-flight request finishes
+                    %% sanely. Caller can retry end_session later.
+                    Data;
+                false ->
+                    backend_seq_clear_for(SeqId, Data),
+                    Data#data{
+                        session_seq = maps:remove(SessionId, Data#data.session_seq),
+                        idle_seq_ids = [SeqId | Data#data.idle_seq_ids]
+                    }
+            end
+    end.
+
+is_strict_prefix_or_equal([], _Prompt) -> true;
+is_strict_prefix_or_equal([T | StRest], [T | PrRest]) -> is_strict_prefix_or_equal(StRest, PrRest);
+is_strict_prefix_or_equal(_, _) -> false.
+
+session_id_of({complete, _From, _Prompt, Opts}) ->
+    maps:get(session_id, Opts, undefined);
+session_id_of({prefill_only, _From, _PromptTokens, Opts}) ->
+    maps:get(session_id, Opts, undefined);
+session_id_of({infer, _From, _Tokens, Params, _CallerPid}) ->
+    maps:get(session_id, Params, undefined).
+
+prompt_tokens_of({complete, _From, Prompt, _Opts}, Data) ->
+    {ok, backend_call(Data, tokenize, [Prompt])};
+prompt_tokens_of({prefill_only, _From, Tokens, _Opts}, _Data) ->
+    {ok, Tokens};
+prompt_tokens_of({infer, _From, Tokens, _Params, _CallerPid}, _Data) ->
+    {ok, Tokens}.
 
 %% Build a #req for `Item`, run the cache lookup, install in
 %% req_table. Returns {ok, NewData, ReplyActions} on success or
 %% {error, Reason, From} on a synchronous-rejection path (e.g.
 %% sampler_new failed).
-start_request({complete, From, Prompt, Opts}, SeqId, Data) ->
+%%
+%% `Mode` is `normal` for fresh admissions or `{sticky, StoredTokens}`
+%% when the seq_id is being reused for a continuing session. In the
+%% sticky case the kv_unpack and cache-lookup steps are skipped:
+%% the seq's KV cells already hold `StoredTokens` and the new
+%% prompt is `StoredTokens ++ Suffix` — we just prefill the suffix
+%% in place.
+start_request({complete, From, Prompt, Opts}, SeqId, Mode, Data) ->
     case sampler_for(Opts, Data) of
         {ok, SamplerRef, SamplerCfg, Data0} ->
             PromptTokens = backend_call(Data0, tokenize, [Prompt]),
@@ -994,16 +1165,16 @@ start_request({complete, From, Prompt, Opts}, SeqId, Data) ->
                 stop_pattern = StopPat,
                 stop_max_len = StopMax,
                 thinking = thinking_from(Opts),
-                thinking_budget = thinking_budget_from(Opts)
+                thinking_budget = thinking_budget_from(Opts),
+                session_id = maps:get(session_id, Opts, undefined)
             },
-            ParentKey = maps:get(parent_key, Opts, undefined),
-            Req1 = setup_lookup(Req, ParentKey, Data0),
+            Req1 = setup_admission_path(Req, Mode, PromptTokens, Opts, Data0),
             Data1 = put_req(Data0, Req1),
             {ok, snapshot_admission(Data1, Req1), []};
         {error, Reason} ->
             {error, Reason, From}
     end;
-start_request({prefill_only, From, PromptTokens, Opts}, SeqId, Data) ->
+start_request({prefill_only, From, PromptTokens, Opts}, SeqId, Mode, Data) ->
     Req = #req{
         seq_id = SeqId,
         mode = prefill_only,
@@ -1016,16 +1187,16 @@ start_request({prefill_only, From, PromptTokens, Opts}, SeqId, Data) ->
         request_fp = Data#data.effective_fp,
         sampler_ref = undefined,
         last_sampler_cfg = undefined,
-        prefill_started_at = erlang:monotonic_time(millisecond)
+        prefill_started_at = erlang:monotonic_time(millisecond),
+        session_id = maps:get(session_id, Opts, undefined)
     },
-    ParentKey = maps:get(parent_key, Opts, undefined),
-    Req1 = setup_lookup(Req, ParentKey, Data),
+    Req1 = setup_admission_path(Req, Mode, PromptTokens, Opts, Data),
     Data1 = put_req(Data, Req1),
     %% sampler_ref reset on the data-level holdover so
     %% get_request_sampler_ref reflects current state.
     Data2 = Data1#data{last_sampler_ref = undefined},
     {ok, snapshot_admission(Data2, Req1), []};
-start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Data) ->
+start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Mode, Data) ->
     case sampler_for(Params, Data) of
         {ok, SamplerRef, SamplerCfg, Data0} ->
             Ref = make_ref(),
@@ -1049,15 +1220,35 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Data) ->
                 stop_pattern = StopPat,
                 stop_max_len = StopMax,
                 thinking = thinking_from(Params),
-                thinking_budget = thinking_budget_from(Params)
+                thinking_budget = thinking_budget_from(Params),
+                session_id = maps:get(session_id, Params, undefined)
             },
-            ParentKey = maps:get(parent_key, Params, undefined),
-            Req1 = setup_lookup(Req, ParentKey, Data0),
+            Req1 = setup_admission_path(Req, Mode, Tokens, Params, Data0),
             Data1 = put_req(Data0, Req1),
             {ok, snapshot_admission(Data1, Req1), [{reply, From, {ok, Ref}}]};
         {error, Reason} ->
             {error, Reason, From}
     end.
+
+%% Dispatch on admission mode: the normal path runs the cache lookup
+%% to decide warm vs cold; the sticky path skips the lookup entirely
+%% and queues the new suffix tokens for prefill on the already-live
+%% KV cells.
+setup_admission_path(Req, normal, _Prompt, OptsOrParams, Data) ->
+    ParentKey = maps:get(parent_key, OptsOrParams, undefined),
+    setup_lookup(Req, ParentKey, Data);
+setup_admission_path(Req, {sticky, StoredTokens}, Prompt, _OptsOrParams, _Data) ->
+    Suffix = lists:nthtail(length(StoredTokens), Prompt),
+    Req#req{
+        prefill_cursor =
+            case Suffix of
+                [] -> undefined;
+                _ -> Suffix
+            end,
+        context_tokens = StoredTokens,
+        cache_hit_kind = sticky,
+        cache_hit_prefix_len = length(StoredTokens)
+    }.
 
 %% Run the cache lookup for this request's prompt and set up the
 %% #req's `prefill_cursor` and `context_tokens` accordingly. The
@@ -2071,14 +2262,28 @@ finish_req(Req, FinishReason, Data, Actions) ->
         FinishReason, Req1#req.cancel_pending, FinishKey, Req1
     ),
     Action = finish_action(Req1, FinishReason, FinishKey, Stats, Data),
-    %% Release the sampler and free the seq's KV before returning
-    %% the seq_id to the pool. The gen_statem holds the context
-    %% mutex so no concurrent reader of this seq_id is possible.
+    %% Release the sampler. The seq_id's KV cells either return to
+    %% the idle pool (one-shot request) or stay live for the next
+    %% turn (sticky session); session_seq is updated to point at
+    %% the post-finish context tokens so the next admission can
+    %% prefix-match.
     _ = release_sampler(Req1, Data),
-    _ = release_seq(Req1#req.seq_id, Data),
     Data1 = remove_req(Data, Req1#req.seq_id),
-    Data2 = Data1#data{idle_seq_ids = [Req1#req.seq_id | Data1#data.idle_seq_ids]},
+    Data2 = release_or_pin_seq(Req1, Data1),
     {Data2, Actions ++ Action}.
+
+release_or_pin_seq(#req{session_id = undefined, seq_id = SeqId}, Data) ->
+    _ = release_seq(SeqId, Data),
+    Data#data{idle_seq_ids = [SeqId | Data#data.idle_seq_ids]};
+release_or_pin_seq(
+    #req{session_id = SessionId, seq_id = SeqId, context_tokens = Tokens} = _Req,
+    Data
+) ->
+    %% Sticky: keep the seq's KV cells alive and update the session
+    %% map. No call to release_seq/2.
+    Data#data{
+        session_seq = (Data#data.session_seq)#{SessionId => {SeqId, Tokens}}
+    }.
 
 finish_action(#req{mode = standard, caller = From} = Req, FinishReason, FinishKey, Stats, Data) ->
     Reply0 = backend_call(Data, detokenize, [Req#req.generated]),
@@ -2190,7 +2395,11 @@ dispatch_pending_admits(Data, Actions) ->
                 idle_seq_ids = RestIds,
                 pending = RestPend
             },
-            case start_request(Head, SeqId, Data1) of
+            %% Queued requests are always non-sticky: a sticky
+            %% admission either took the session's pinned seq
+            %% directly or was rejected with sticky_busy. Pass
+            %% Mode = normal here.
+            case start_request(Head, SeqId, normal, Data1) of
                 {ok, Data2, MoreActions} ->
                     dispatch_pending_admits(Data2, Actions ++ MoreActions);
                 {error, Reason, From} ->

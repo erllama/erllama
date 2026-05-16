@@ -576,6 +576,68 @@ prefill_only_with_parent_key_chains_warm_contexts_test() ->
     end).
 
 %% =============================================================================
+%% sticky-seq (session_id) admission
+%% =============================================================================
+
+sticky_seq_continues_on_same_session_test() ->
+    %% Two requests with the same session_id. The second sees
+    %% cache_hit_kind = sticky: the stored prefix is taken from
+    %% live KV (no warm-restore) and only the new suffix runs
+    %% through the prefill pipeline.
+    SessionId = make_ref(),
+    with_model(#{}, fun(_Cfg) ->
+        {ok, #{generated := Gen1}} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 3, session_id => SessionId}
+        ),
+        Turn1Tokens = prompt_tokens(long_prompt()) ++ Gen1,
+        NewSuffix = prompt_tokens(<<"continue please">>),
+        FullTokens = Turn1Tokens ++ NewSuffix,
+        {ok, Ref} = erllama_model:infer(
+            <<"test_model">>,
+            FullTokens,
+            #{response_tokens => 2, session_id => SessionId},
+            self()
+        ),
+        Stats = drain_done(Ref, 5000),
+        ?assertEqual(sticky, maps:get(cache_hit_kind, Stats)),
+        Delta = maps:get(cache_delta, Stats),
+        ?assertEqual(length(Turn1Tokens), maps:get(read, Delta)),
+        ?assert(maps:get(created, Delta) >= length(NewSuffix)),
+        ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId)),
+        %% Idempotent: a second end_session on the same id is a no-op.
+        ?assertEqual(ok, erllama:end_session(<<"test_model">>, SessionId))
+    end).
+
+sticky_seq_does_not_affect_non_session_callers_test() ->
+    %% Sessions only kick in when session_id is set; callers that
+    %% omit it see the existing one-shot path bit-identically.
+    with_model(#{}, fun(_Cfg) ->
+        {ok, #{cache_hit_kind := HitKind1}} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+        ),
+        ?assert(HitKind1 =:= cold orelse HitKind1 =:= exact)
+    end).
+
+end_session_unknown_is_noop_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        ?assertEqual(ok, erllama:end_session(<<"test_model">>, make_ref()))
+    end).
+
+%% Drain streaming until the done message and return its Stats map.
+drain_done(Ref, TimeoutMs) ->
+    receive
+        {erllama_done, Ref, Stats} -> Stats;
+        {erllama_token, Ref, _} -> drain_done(Ref, TimeoutMs);
+        {erllama_token_id, Ref, _} -> drain_done(Ref, TimeoutMs);
+        {erllama_thinking_end, Ref, _} -> drain_done(Ref, TimeoutMs);
+        {erllama_tool_call_end, Ref, _} -> drain_done(Ref, TimeoutMs)
+    after TimeoutMs ->
+        erlang:error({timeout, drain_done})
+    end.
+
+%% =============================================================================
 %% PR2: per-model observability snapshot (phase / pending_len /
 %% last_cache_hit) readable lock-free from outside the gen_statem
 %% =============================================================================
