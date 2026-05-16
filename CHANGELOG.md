@@ -6,6 +6,39 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-17
+
+Documentation-only patch on top of 0.5.0.
+
+### Added
+
+- `## Tool-call handling` section in the README describing what
+  erllama exposes (per-model `tool_call_markers`, the
+  `{tool_call_delta, _}` / `{erllama_tool_call_end, _, Full}`
+  streaming wire, and the automatic greedy-on-syntax sampler
+  swap) and what it deliberately leaves to the HTTP layer (tool
+  id minting, JSON parsing, canonicalisation).
+- New `guides/tool-calls.md` companion to the README section,
+  linked from the documentation table.
+- New `internals/request-lifecycle.md` describing the per-model
+  `gen_statem` admission, cache resolution, decode, and save
+  pipeline.
+- `internals/c-safety-audit.md` added to the HexDocs navigation.
+
+### Changed
+
+- README rewritten for sharper top-of-funnel: tighter "Why" list,
+  cleaner Quick taste, Common patterns block replacing the old
+  long example.
+- Architecture diagram corrected — `erllama_cache_ramfile_srv`
+  and `erllama_cache_disk_srv` are operator-started standalone
+  servers, not children of `erllama_cache_sup`. Added
+  `erllama_registry` and `erllama_inflight` which were missing.
+- "Inside a request" lifecycle updated for the multi-seq
+  scheduler: two states (idle/running) instead of the v0.1
+  three-phase model, with co-batched `nif_step` and inline
+  thinking/tool-call marker recognition.
+
 ## [0.5.0] - 2026-05-16
 
 Tool-call exact-replay scaffolding for downstream HTTP front ends.
