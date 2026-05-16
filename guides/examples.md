@@ -358,7 +358,61 @@ still progresses.
 
 Non-positive values and a missing key both mean "no cap".
 
-## 11. Warm a session without sampling (`prefill_only/2`)
+## 11. Tool-call streaming (`tool_call_markers`)
+
+Models whose chat template emits structured tool-call markers
+(qwen3 with `<tool_call>...</tool_call>`, DSML, OpenAI-style XML,
+etc.) can surface those boundaries on the streaming wire so an
+HTTP front end can capture the exact bytes the model produced
+under a tool id, and splice them back verbatim on the next turn.
+
+Declare the markers per model:
+
+```erlang
+erllama:load_model(<<"qwen3-tool">>, #{
+    backend => erllama_model_llama,
+    model_path => "/models/qwen3-7b.gguf",
+    tool_call_markers => #{
+        start => <<"<tool_call>">>,
+        end   => <<"</tool_call>">>
+    }
+}).
+```
+
+A streaming `infer/4` against this model receives:
+
+```erlang
+{erllama_token, Ref, {tool_call_delta, Bin}}    %% one per chunk of the call body
+{erllama_tool_call_end, Ref, FullBin :: binary()} %% concatenated bytes of every delta
+```
+
+`FullBin` is what to persist under a minted tool id — no need to
+re-buffer the deltas yourself.
+
+When the template also delimits string-typed argument bodies
+(DSML's `string=true ... string=false`, XML's `<arg>...</arg>`),
+declare payload markers too:
+
+```erlang
+tool_call_markers => #{
+    start         => <<"<tool_call>">>,
+    end           => <<"</tool_call>">>,
+    payload_start => <<"<arg>">>,
+    payload_end   => <<"</arg>">>
+}
+```
+
+With payload markers set, erllama swaps to a greedy
+(`temperature=0`) sampler for tool-call syntax tokens so the
+syntax stays byte-deterministic, then back to the request's normal
+sampler for payload bytes so long string arguments stay diverse.
+Without payload markers the entire tool-call span uses the greedy
+sampler.
+
+Models loaded without `tool_call_markers` behave identically to
+v0.4: no tool-call messages, no sampler swap.
+
+## 12. Warm a session without sampling (`prefill_only/2,3`)
 
 Useful for priming the cache before a burst of short follow-ups,
 or for holding a warm session across long pauses without consuming
@@ -385,7 +439,70 @@ generation budget.
 `finish_key` is `undefined` if the prompt was shorter than
 `min_tokens` and the finish save was suppressed.
 
-## 12. Multi-tenant concurrent decoding (`n_seq_max`)
+`prefill_only/3` accepts `Opts` with `parent_key`, useful when
+chaining cache-warming calls across turns deterministically rather
+than relying on the implicit longest-prefix walk:
+
+```erlang
+%% Materialise turn-1 bytes into cache.
+{ok, #{finish_key := K1}} = erllama:prefill_only(ModelId, Turn1Tokens),
+
+%% Extend the same prefix with turn 2's tokens; only the suffix
+%% runs through prefill, returning K2 for the longer prompt.
+{ok, #{finish_key := K2,
+       cache_hit_kind := partial,
+       cache_delta := #{read := R, created := C}}} =
+    erllama:prefill_only(ModelId,
+                         Turn1Tokens ++ Turn2Tokens,
+                         #{parent_key => K1}).
+```
+
+## 13. Sticky sessions (`session_id` + `end_session/2`)
+
+A `session_id` (any term) pins the request's seq_id across turns
+so the next turn whose prompt continues the stored tokens
+truncates-and-prefills in place on the already-live KV cells —
+no `kv_unpack` from disk. The HTTP server's conversation id is
+the natural value; nothing here is HTTP-specific.
+
+```erlang
+SessionId = ConvId,  %% your auth layer's conversation identifier
+
+%% Turn 1: cold or partial via longest-prefix; on finish the
+%% seq_id stays pinned to SessionId.
+{ok, #{generated := Gen1}} =
+    erllama:complete(ModelId, Turn1Prompt,
+                     #{session_id => SessionId,
+                       response_tokens => 32}),
+
+%% Turn 2: the prompt extends the stored prefix (prior prompt +
+%% generated). cache_hit_kind comes back as `sticky`: no disk
+%% read, just suffix prefill on the live cells.
+{ok, #{cache_hit_kind := sticky}} =
+    erllama:complete(ModelId, Turn2Prompt,
+                     #{session_id => SessionId,
+                       response_tokens => 32}),
+
+%% End the conversation explicitly when the user logs out / TTL
+%% expires. Idempotent; unknown ids are a no-op.
+ok = erllama:end_session(ModelId, SessionId).
+```
+
+Constraints:
+
+- Concurrent admits on the same `session_id` return `{error,
+  sticky_busy}`; serialise per session (typical HTTP per-user
+  request pipelines do this naturally).
+- A new prompt that *diverges* from the stored tokens evicts the
+  sticky seq (KV cleared, seq returned to idle) and falls back to
+  the normal cold/warm path — useful when a user starts a fresh
+  conversation while a prior one was still active.
+- The sticky map is bounded by `n_seq_max`. Sessions that overrun
+  the pool will see `{error, sticky_busy}` until older sessions
+  end (or you can pre-`end_session` LRU ones from your own
+  scheduler).
+
+## 14. Multi-tenant concurrent decoding (`n_seq_max`)
 
 Default is single-tenant. Opt in with `context_opts.n_seq_max > 1`
 and up to N requests prefill and decode concurrently through one
@@ -418,7 +535,7 @@ Long prompts are sliced by `prefill_chunk_size` (default
 monopolise the batch. See [caching](caching.md) for warm-prefix
 behaviour across concurrent workers.
 
-## 13. Lock-free observability for routers
+## 15. Lock-free observability for routers
 
 A cluster router that bin-packs requests onto the least-loaded node
 should not serialise behind the work it is probing. These accessors
@@ -444,7 +561,7 @@ the model has not admitted any request yet. All four are O(1) ETS
 reads and safe to call from a hot path or via `erpc` from another
 node.
 
-## 14. Per-request cache delta (`cache_creation_input_tokens` / `cache_read_input_tokens`)
+## 16. Per-request cache delta (`cache_creation_input_tokens` / `cache_read_input_tokens`)
 
 Every result and `Stats` map carries `cache_delta => #{read := N,
 created := N}`. `read` counts tokens served from the warm prefix
@@ -473,7 +590,7 @@ Streaming consumers read the same map from the final
 `{erllama_done, Ref, Stats}` message; `prefill_only/2` exposes it
 on its result map too.
 
-## 15. Inspecting cache state
+## 17. Inspecting cache state
 
 ```erlang
 %% Hit/miss/save counters and per-path latency totals.
@@ -495,7 +612,7 @@ erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 erllama_cache:gc().
 ```
 
-## 16. Memory-pressure-driven eviction (in `sys.config`)
+## 18. Memory-pressure-driven eviction (in `sys.config`)
 
 ```erlang
 {erllama, [
@@ -514,7 +631,7 @@ Sources shipped: `noop`, `system`, `nvidia_smi`, `{module, M}`. Roll
 your own with `-behaviour(erllama_pressure)` and pass
 `{module, M}` as the source.
 
-## 17. Cache-only tests (no model required)
+## 19. Cache-only tests (no model required)
 
 The cache subsystem is independently usable. eunit tests that
 exercise save/load round-trips never touch llama.cpp:
@@ -557,7 +674,7 @@ round_trip_test() ->
 The lazy `llama_backend_init` means cache-only tests never trigger
 `ggml_backend_load_all` — no Metal/CUDA discovery cost.
 
-## 18. End-to-end against a real GGUF
+## 20. End-to-end against a real GGUF
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.Q4_K_M.gguf \
@@ -569,7 +686,7 @@ parent-key resume, longest-prefix walk, eviction, and a multi-model
 concurrent run. Without the env var it skips so default
 `rebar3 ct` stays green.
 
-## 19. Microbench: cold vs. warm
+## 21. Microbench: cold vs. warm
 
 ```bash
 bench/run.sh tiny    # TinyLlama 1.1B Q4_K_M

@@ -4,7 +4,7 @@
 {application, erllama, [
     {description,
         "Native Erlang/OTP wrapper around llama.cpp with token-exact tiered KV cache; cache more warm state than fits in RAM"},
-    {vsn, "0.4.0"},
+    {vsn, "0.5.0"},
     {registered, [erllama_sup, erllama_cache_sup, erllama_cache_meta_srv]},
     {mod, {erllama_app, []}},
     {applications, [
