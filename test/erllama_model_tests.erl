@@ -539,6 +539,42 @@ prefill_only_returns_finish_key_and_warm_resumes_test() ->
             )
     end).
 
+prefill_only_with_parent_key_chains_warm_contexts_test() ->
+    %% Warm a prefix via prefill_only/2, then extend it via
+    %% prefill_only/3 with parent_key. The second call must take the
+    %% exact warm path (cache_hit_kind = exact), prefill only the
+    %% suffix tokens, and surface a fresh finish_key for the new
+    %% prefix-plus-suffix row.
+    with_model(#{}, fun(Cfg) ->
+        Prefix = prompt_tokens(long_prompt()),
+        Suffix = prompt_tokens(short_prompt()),
+        Extended = Prefix ++ Suffix,
+        {ok, #{finish_key := PrefixKey}} =
+            erllama_model:prefill_only(<<"test_model">>, Prefix),
+        ?assertEqual(key_for_tokens(Prefix, Cfg), PrefixKey),
+        {ok, _} = wait_for_key(PrefixKey, 1000),
+        {ok, #{
+            cache_hit_kind := Kind,
+            context_tokens := ExtCtx,
+            committed_tokens := ExtN,
+            finish_key := ExtendedKey,
+            cache_delta := #{read := Read, created := Created}
+        }} = erllama_model:prefill_only(
+            <<"test_model">>, Extended, #{parent_key => PrefixKey}
+        ),
+        %% Session resume from parent_key is reported as `partial`
+        %% (only a prefix of the prompt was in cache); only an
+        %% identical prompt produces `exact`.
+        ?assertEqual(partial, Kind),
+        ?assertEqual(Extended, ExtCtx),
+        ?assertEqual(length(Extended), ExtN),
+        ?assertEqual(key_for_tokens(Extended, Cfg), ExtendedKey),
+        %% Read = prefix length restored from cache; Created = the
+        %% suffix tokens added by this call.
+        ?assertEqual(length(Prefix), Read),
+        ?assertEqual(length(Suffix), Created)
+    end).
+
 %% =============================================================================
 %% PR2: per-model observability snapshot (phase / pending_len /
 %% last_cache_hit) readable lock-free from outside the gen_statem

@@ -133,6 +133,7 @@ concurrently through one decode call per tick.
     complete/2,
     complete/3,
     prefill_only/2,
+    prefill_only/3,
     infer/4,
     cancel/1,
     status/1,
@@ -197,7 +198,7 @@ concurrently through one decode call per tick.
 
 -type pending_request() ::
     {complete, gen_statem:from(), binary(), map()}
-    | {prefill_only, gen_statem:from(), [non_neg_integer()]}
+    | {prefill_only, gen_statem:from(), [non_neg_integer()], map()}
     | {infer, gen_statem:from(), [non_neg_integer()], map(), pid()}.
 -type finish_reason() :: stop | length | cancelled.
 -type stats() :: #{
@@ -493,7 +494,7 @@ concurrently through one decode call per tick.
     %% FIFO queue of admits that arrived while idle_seq_ids was
     %% empty. Each entry is one of:
     %%   {complete, From, Prompt, Opts}
-    %%   {prefill_only, From, PromptTokens}
+    %%   {prefill_only, From, PromptTokens, Opts}
     %%   {infer, From, Tokens, Params, CallerPid}
     pending = [] :: [pending_request()]
 }).
@@ -540,7 +541,12 @@ because the token count is below the configured `min_tokens`.
 -spec prefill_only(model(), [non_neg_integer()]) ->
     {ok, prefill_result()} | {error, term()}.
 prefill_only(Model, PromptTokens) when is_list(PromptTokens) ->
-    gen_statem:call(via(Model), {prefill_only, PromptTokens}, infinity).
+    prefill_only(Model, PromptTokens, #{}).
+
+-spec prefill_only(model(), [non_neg_integer()], map()) ->
+    {ok, prefill_result()} | {error, term()}.
+prefill_only(Model, PromptTokens, Opts) when is_list(PromptTokens), is_map(Opts) ->
+    gen_statem:call(via(Model), {prefill_only, PromptTokens, Opts}, infinity).
 
 -doc """
 Streaming inference. Admits a request and immediately returns a
@@ -881,8 +887,8 @@ default_ctx_params_hash() ->
 
 idle({call, From}, {complete, Prompt, Opts}, Data) ->
     admit({complete, From, Prompt, Opts}, Data);
-idle({call, From}, {prefill_only, PromptTokens}, Data) ->
-    admit({prefill_only, From, PromptTokens}, Data);
+idle({call, From}, {prefill_only, PromptTokens, Opts}, Data) ->
+    admit({prefill_only, From, PromptTokens, Opts}, Data);
 idle({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
     admit({infer, From, Tokens, Params, CallerPid}, Data);
 idle({call, From}, status, Data) ->
@@ -905,8 +911,8 @@ idle(EventType, EventContent, Data) ->
 
 running({call, From}, {complete, Prompt, Opts}, Data) ->
     admit({complete, From, Prompt, Opts}, Data);
-running({call, From}, {prefill_only, PromptTokens}, Data) ->
-    admit({prefill_only, From, PromptTokens}, Data);
+running({call, From}, {prefill_only, PromptTokens, Opts}, Data) ->
+    admit({prefill_only, From, PromptTokens, Opts}, Data);
 running({call, From}, {infer, Tokens, Params, CallerPid}, Data) ->
     admit({infer, From, Tokens, Params, CallerPid}, Data);
 running({call, From}, status, Data) ->
@@ -997,7 +1003,7 @@ start_request({complete, From, Prompt, Opts}, SeqId, Data) ->
         {error, Reason} ->
             {error, Reason, From}
     end;
-start_request({prefill_only, From, PromptTokens}, SeqId, Data) ->
+start_request({prefill_only, From, PromptTokens, Opts}, SeqId, Data) ->
     Req = #req{
         seq_id = SeqId,
         mode = prefill_only,
@@ -1012,7 +1018,8 @@ start_request({prefill_only, From, PromptTokens}, SeqId, Data) ->
         last_sampler_cfg = undefined,
         prefill_started_at = erlang:monotonic_time(millisecond)
     },
-    Req1 = setup_lookup(Req, undefined, Data),
+    ParentKey = maps:get(parent_key, Opts, undefined),
+    Req1 = setup_lookup(Req, ParentKey, Data),
     Data1 = put_req(Data, Req1),
     %% sampler_ref reset on the data-level holdover so
     %% get_request_sampler_ref reflects current state.
