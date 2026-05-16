@@ -6,6 +6,21 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+### Added
+
+- `thinking => enabled | disabled` on `infer/4` `Params` (default
+  `disabled`). When `enabled` against a thinking-capable backend,
+  streaming requests receive `{erllama_token, Ref, {thinking_delta,
+  Bin}}` fragments and a single `{erllama_thinking_end, Ref, Sig}`
+  close marker before any subsequent token. `Sig` is an opaque
+  integrity signature the downstream forwards verbatim into the
+  Anthropic `signature_delta` SSE event, or `<<>>` when no
+  signature is available. The `step_result()` type on
+  `erllama_model_backend` gains `{thinking_token, _}` and
+  `thinking_end` variants and a new optional
+  `thinking_signature/2` callback; backends without thinking
+  support emit neither and require no changes.
+
 ## [0.2.0] - 2026-05-15
 
 Multi-sequence batched scheduling, map-shaped completion results,

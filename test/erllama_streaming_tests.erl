@@ -50,12 +50,16 @@ minimal_config(DiskSrv) ->
     }.
 
 with_model(Body) ->
+    with_model(#{}, Body).
+
+with_model(ConfigOverrides, Body) ->
     with_app(fun(DiskSrv) ->
         Id = iolist_to_binary([
             "stream_",
             integer_to_binary(erlang:unique_integer([positive]))
         ]),
-        {ok, _} = erllama:load_model(Id, minimal_config(DiskSrv)),
+        Cfg = maps:merge(minimal_config(DiskSrv), ConfigOverrides),
+        {ok, _} = erllama:load_model(Id, Cfg),
         try
             Body(Id)
         after
@@ -231,6 +235,105 @@ stop_sequence_trimmed_from_stream_test() ->
         Streamed = iolist_to_binary(Out),
         ?assertEqual(nomatch, binary:match(Streamed, Match))
     end).
+
+%% =============================================================================
+%% thinking
+%% =============================================================================
+
+%% Drain in arrival order. Returns a list of {kind, Payload} tuples
+%% terminated by {done, Stats} or {error, Reason}.
+collect_all(Ref, TimeoutMs) ->
+    collect_all(Ref, TimeoutMs, []).
+
+collect_all(Ref, TimeoutMs, Acc) ->
+    receive
+        {erllama_token, Ref, {thinking_delta, Bin}} ->
+            collect_all(Ref, TimeoutMs, [{thinking_delta, Bin} | Acc]);
+        {erllama_token, Ref, Bin} when is_binary(Bin) ->
+            collect_all(Ref, TimeoutMs, [{token, Bin} | Acc]);
+        {erllama_thinking_end, Ref, Sig} ->
+            collect_all(Ref, TimeoutMs, [{thinking_end, Sig} | Acc]);
+        {erllama_done, Ref, Stats} ->
+            lists:reverse([{done, Stats} | Acc]);
+        {erllama_error, Ref, Reason} ->
+            lists:reverse([{error, Reason} | Acc])
+    after TimeoutMs ->
+        lists:reverse([{timeout, TimeoutMs} | Acc])
+    end.
+
+thinking_capable_stub_emits_delta_end_then_tokens_test() ->
+    with_model(#{thinking_capable => true}, fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        {ok, Ref} = erllama:infer(
+            Id, Tokens, #{response_tokens => 3, thinking => enabled}, self()
+        ),
+        Events = collect_all(Ref, 5000),
+        Kinds = [K || {K, _} <- Events],
+        %% Expect: thinking_delta+, thinking_end, token+, done.
+        ?assert(lists:member(thinking_delta, Kinds)),
+        ?assertEqual(1, length([1 || thinking_end <- Kinds])),
+        ?assert(lists:member(token, Kinds)),
+        ?assertEqual(done, lists:last(Kinds)),
+        %% Order: every thinking_delta precedes the thinking_end,
+        %% which precedes every token.
+        EndIdx = idx_of(thinking_end, Kinds),
+        ?assert(
+            lists:all(
+                fun({K, I}) -> K =/= thinking_delta orelse I < EndIdx end,
+                indexed(Kinds)
+            )
+        ),
+        ?assert(
+            lists:all(
+                fun({K, I}) -> K =/= token orelse I > EndIdx end,
+                indexed(Kinds)
+            )
+        ),
+        %% Signature: non-empty binary, exactly 32 bytes (sha256).
+        Sig = sig_from(Events),
+        ?assert(is_binary(Sig)),
+        ?assertEqual(32, byte_size(Sig))
+    end).
+
+thinking_capable_stub_with_thinking_disabled_fails_test() ->
+    %% Stub still emits thinking_token but the caller didn't opt in.
+    %% The scheduler treats this as a backend bug and surfaces a
+    %% clean erllama_error tagged thinking_not_enabled.
+    with_model(#{thinking_capable => true}, fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 3}, self()),
+        Events = collect_all(Ref, 5000),
+        ?assertEqual({error, thinking_not_enabled}, lists:last(Events))
+    end).
+
+non_thinking_stub_with_thinking_enabled_is_normal_stream_test() ->
+    %% Default stub (no thinking_capable). Caller may freely set
+    %% thinking => enabled; no thinking messages should arrive.
+    with_model(fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        {ok, Ref} = erllama:infer(
+            Id, Tokens, #{response_tokens => 2, thinking => enabled}, self()
+        ),
+        Events = collect_all(Ref, 5000),
+        Kinds = [K || {K, _} <- Events],
+        ?assertEqual([], [K || K <- Kinds, K =:= thinking_delta]),
+        ?assertEqual([], [K || K <- Kinds, K =:= thinking_end]),
+        ?assertEqual(done, lists:last(Kinds))
+    end).
+
+%% Helpers for the thinking tests.
+indexed(L) ->
+    lists:zip(L, lists:seq(1, length(L))).
+
+idx_of(Target, L) ->
+    case lists:keyfind(Target, 1, indexed(L)) of
+        {Target, I} -> I;
+        false -> 0
+    end.
+
+sig_from([{thinking_end, S} | _]) -> S;
+sig_from([_ | T]) -> sig_from(T);
+sig_from([]) -> <<>>.
 
 %% =============================================================================
 %% Concurrency / busy

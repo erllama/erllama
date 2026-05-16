@@ -275,6 +275,15 @@ concurrently through one decode call per tick.
     seed => non_neg_integer(),
     stop_sequences => [binary()],
     grammar => binary(),
+    %% Opt-in extended thinking. When `enabled`, a thinking-capable
+    %% backend may emit `{thinking_token, _}` step results that the
+    %% scheduler forwards to the streaming caller as
+    %% `{erllama_token, Ref, {thinking_delta, Bin}}`. When the
+    %% thinking phase closes the scheduler emits a single
+    %% `{erllama_thinking_end, Ref, Sig}` before any non-thinking
+    %% token. Defaults to `disabled`; backends without thinking
+    %% support ignore the flag entirely.
+    thinking => enabled | disabled,
     _ => _
 }.
 
@@ -352,7 +361,24 @@ concurrently through one decode call per tick.
     %% Matched stop string once a hit fires; `undefined` otherwise.
     %% Drives the finish_reason classifier and the `stop_sequence`
     %% key on the result / stats map.
-    matched_stop = undefined :: binary() | undefined
+    matched_stop = undefined :: binary() | undefined,
+    %% Per-request thinking opt-in. The scheduler treats any
+    %% `{thinking_token, _}` step result on a request with
+    %% `thinking = disabled` as a backend bug (stray thinking
+    %% output not opted in by the caller).
+    thinking = disabled :: enabled | disabled,
+    %% Running concat of detokenized thinking-phase bytes. The
+    %% scheduler uses it to spot the open/close transitions and to
+    %% feed a fallback signature derivation for backends that don't
+    %% export thinking_signature/2. Reset to <<>> on each
+    %% thinking_end so a second thinking block on the same request
+    %% gets its own signature input.
+    thinking_bytes = <<>> :: binary(),
+    %% Set when the request was already failed with an
+    %% `erllama_error` (e.g. backend contract violation). The
+    %% finish path skips the `erllama_done` send in that case so
+    %% the caller doesn't see both.
+    errored = undefined :: term() | undefined
 }).
 
 -record(data, {
@@ -905,7 +931,8 @@ start_request({complete, From, Prompt, Opts}, SeqId, Data) ->
                 prefill_started_at = erlang:monotonic_time(millisecond),
                 stop_sequences = Stops,
                 stop_pattern = StopPat,
-                stop_max_len = StopMax
+                stop_max_len = StopMax,
+                thinking = thinking_from(Opts)
             },
             ParentKey = maps:get(parent_key, Opts, undefined),
             Req1 = setup_lookup(Req, ParentKey, Data0),
@@ -957,7 +984,8 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Data) ->
                 prefill_started_at = erlang:monotonic_time(millisecond),
                 stop_sequences = Stops,
                 stop_pattern = StopPat,
-                stop_max_len = StopMax
+                stop_max_len = StopMax,
+                thinking = thinking_from(Params)
             },
             ParentKey = maps:get(parent_key, Params, undefined),
             Req1 = setup_lookup(Req, ParentKey, Data0),
@@ -1613,7 +1641,20 @@ apply_step_results([{{SeqId, {decode, _}}, {token, Tok, EogFlag}} | T], Data) ->
             true -> Req2#req{finishing = true};
             false -> maybe_fire_continued_for_req(Req2, Data)
         end,
-    apply_step_results(T, put_req(Data, Req3)).
+    apply_step_results(T, put_req(Data, Req3));
+apply_step_results([{{SeqId, {decode, _}}, {thinking_token, Tok}} | T], Data) ->
+    Req = maps:get(SeqId, Data#data.req_table),
+    %% Thinking tokens are NOT appended to generated/context_tokens:
+    %% they belong to a separate content track and the cache is
+    %% keyed on the post-thinking output. The backend is responsible
+    %% for any internal bookkeeping needed to keep its KV state
+    %% consistent.
+    Req1 = req_thinking_emit(Req, Tok, Data),
+    apply_step_results(T, put_req(Data, Req1));
+apply_step_results([{{SeqId, {decode, _}}, thinking_end} | T], Data) ->
+    Req = maps:get(SeqId, Data#data.req_table),
+    Req1 = req_thinking_end(Req, Data),
+    apply_step_results(T, put_req(Data, Req1)).
 
 %% Append the token to both context_tokens and generated.
 req_append_token(Req, Token) ->
@@ -1681,6 +1722,84 @@ maybe_emit_stream(
     Pid ! {erllama_token_id, Ref, Token},
     ok;
 maybe_emit_stream(_Req, _Text, _Token) ->
+    ok.
+
+%% Thinking-phase token. Detokenises the new id and forwards it as
+%% {erllama_token, Ref, {thinking_delta, Bin}} to streaming callers
+%% that opted in via `thinking = enabled`. The bytes are also kept
+%% on the #req so the backend's thinking_signature/2 fallback can
+%% be derived from the accumulated text. A thinking_token arriving
+%% on a non-streaming or thinking-disabled request is treated as a
+%% backend bug -- the request is failed via erllama_error.
+req_thinking_emit(#req{thinking = disabled} = Req, _Token, _Data) ->
+    fail_thinking_disabled(Req),
+    Req#req{finishing = true, errored = thinking_not_enabled};
+req_thinking_emit(
+    #req{mode = streaming, caller_pid = Pid, request_ref = Ref} = Req,
+    Token,
+    Data
+) when
+    is_pid(Pid), is_reference(Ref)
+->
+    Bin =
+        case backend_call(Data, detokenize, [[Token]]) of
+            B when is_binary(B) -> B;
+            _ -> <<>>
+        end,
+    case Bin of
+        <<>> -> ok;
+        _ -> Pid ! {erllama_token, Ref, {thinking_delta, Bin}}
+    end,
+    Req#req{thinking_bytes = <<(Req#req.thinking_bytes)/binary, Bin/binary>>};
+req_thinking_emit(Req, _Token, _Data) ->
+    %% Non-streaming caller with thinking_token in flight: drop the
+    %% delta but keep the bytes for the eventual signature so
+    %% downstream consumers that just want stats still see a
+    %% coherent thinking_end. Mostly a defensive branch.
+    Req.
+
+req_thinking_end(
+    #req{mode = streaming, caller_pid = Pid, request_ref = Ref} = Req,
+    Data
+) when
+    is_pid(Pid), is_reference(Ref)
+->
+    Sig = thinking_signature(Req, Data),
+    Pid ! {erllama_thinking_end, Ref, Sig},
+    Req#req{thinking_bytes = <<>>};
+req_thinking_end(Req, _Data) ->
+    Req#req{thinking_bytes = <<>>}.
+
+%% Resolve the integrity signature for the just-closed thinking
+%% block. Calls the backend's optional `thinking_signature/2` if
+%% exported; otherwise falls back to `<<>>` so the downstream omits
+%% `signature_delta` from its SSE output.
+thinking_signature(#req{seq_id = SeqId}, #data{backend = Mod, backend_state = S}) ->
+    case erlang:function_exported(Mod, thinking_signature, 2) of
+        true ->
+            case Mod:thinking_signature(S, SeqId) of
+                Bin when is_binary(Bin) -> Bin;
+                _ -> <<>>
+            end;
+        false ->
+            <<>>
+    end.
+
+%% Surface the contract violation to the caller and shut the
+%% request down. A thinking_token arriving on a request that did not
+%% set `thinking = enabled` indicates a backend that's ignoring the
+%% per-request flag.
+fail_thinking_disabled(#req{
+    mode = streaming,
+    caller_pid = Pid,
+    request_ref = Ref
+}) when
+    is_pid(Pid), is_reference(Ref)
+->
+    erllama_inflight:unregister(Ref),
+    Pid ! {erllama_error, Ref, thinking_not_enabled},
+    ok;
+fail_thinking_disabled(_Req) ->
     ok.
 
 %% Mark any req whose generated count >= response_target as
@@ -1804,9 +1923,16 @@ finish_action(#req{mode = standard, caller = From} = Req, FinishReason, FinishKe
     },
     Result = maybe_add_stop_sequence(Result0, Req#req.matched_stop),
     [{reply, From, {ok, Result}}];
-finish_action(#req{mode = streaming} = Req, _FinishReason, _FinishKey, Stats, _Data) ->
-    flush_pending_text(Req),
-    send_done_for_req(Req, Stats),
+finish_action(#req{mode = streaming, errored = E} = Req, _FinishReason, _FinishKey, Stats, _Data) ->
+    case E of
+        undefined ->
+            flush_pending_text(Req),
+            send_done_for_req(Req, Stats);
+        _ ->
+            %% Error was already surfaced; skip the done message so
+            %% the caller doesn't observe both for the same request.
+            ok
+    end,
     [];
 finish_action(
     #req{mode = prefill_only, caller = From} = Req, _FinishReason, FinishKey, _Stats, _Data
@@ -1974,6 +2100,15 @@ stop_sequences_from(Opts) ->
             Pat = binary:compile_pattern(Stops),
             Max = lists:max([byte_size(S) || S <- Stops]),
             {Stops, Pat, Max}
+    end.
+
+%% Caller's thinking opt-in. Anything other than the atom `enabled`
+%% (including a missing key, `false`, or the atom `disabled`) keeps
+%% the request out of the thinking pipeline.
+thinking_from(Opts) ->
+    case maps:get(thinking, Opts, disabled) of
+        enabled -> enabled;
+        _ -> disabled
     end.
 
 %% Per-#req stats. Mirrors the v0.2 build_stats/4 but reads from the

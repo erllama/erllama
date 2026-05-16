@@ -36,6 +36,7 @@
     load_adapter/2,
     unload_adapter/2,
     apply_adapters/2,
+    thinking_signature/2,
     %% Test helpers: read back what the most recent configure_sampler
     %% / clear_sampler / apply_adapters call saw.
     last_sampler_cfg/1,
@@ -57,11 +58,22 @@
     %% Most recently applied adapter set, as the {Ref, Scale} list the
     %% model layer passed to apply_adapters/2. Tests read this back to
     %% assert the snapshot rules.
-    applied = [] :: [{reference(), float()}]
+    applied = [] :: [{reference(), float()}],
+    %% Opt-in: when true, the first two decode ops per sampler emit
+    %% `{thinking_token, _}`, the third emits `thinking_end`, and
+    %% subsequent ops emit normal `{token, _, 0}`. Per-sampler phase
+    %% is tracked via the process dictionary because step/2 takes no
+    %% mutable state argument.
+    thinking_capable = false :: boolean()
 }).
 
-init(_Config) ->
-    {ok, #stub{}}.
+init(Config) ->
+    Thinking =
+        case maps:get(thinking_capable, Config, false) of
+            true -> true;
+            _ -> false
+        end,
+    {ok, #stub{thinking_capable = Thinking}}.
 
 terminate(_S) ->
     ok.
@@ -109,25 +121,57 @@ seq_rm(_S, _SeqId) ->
 %% different prompts produce different streams and the same seq fed
 %% the same sampler keeps producing the same token (matching the
 %% prior single-seq stub semantics for cache-integration tests).
-step(_S, Ops) ->
-    Results = [stub_step_op(Op) || Op <- Ops],
+step(S, Ops) ->
+    Results = [stub_step_op(Op, S) || Op <- Ops],
     {ok, Results}.
 
-stub_step_op({SeqId, {prefill, _Tokens}}) ->
+stub_step_op({SeqId, {prefill, _Tokens}}, _S) ->
     {SeqId, prefilled};
-stub_step_op({SeqId, {decode, Sampler}}) ->
+stub_step_op({SeqId, {decode, Sampler}}, #stub{thinking_capable = false}) ->
     %% The token is bound to the sampler ref AND the seq_id so a
     %% scheduler bug that swaps samplers between seqs would change
     %% one seq's output stream and be visible in tests. The mock
     %% never produces eog.
+    decode_token(SeqId, Sampler);
+stub_step_op({SeqId, {decode, Sampler}}, #stub{thinking_capable = true}) ->
+    Phase =
+        case erlang:get({stub_think, Sampler}) of
+            undefined -> 0;
+            P -> P
+        end,
+    case Phase of
+        0 ->
+            erlang:put({stub_think, Sampler}, 1),
+            T = erlang:phash2({thinking_step_stub, SeqId, Sampler, 0}) rem (1 bsl 32),
+            {SeqId, {thinking_token, T}};
+        1 ->
+            erlang:put({stub_think, Sampler}, 2),
+            T = erlang:phash2({thinking_step_stub, SeqId, Sampler, 1}) rem (1 bsl 32),
+            {SeqId, {thinking_token, T}};
+        2 ->
+            erlang:put({stub_think, Sampler}, 3),
+            {SeqId, thinking_end};
+        _ ->
+            decode_token(SeqId, Sampler)
+    end.
+
+decode_token(SeqId, Sampler) ->
     T = erlang:phash2({decode_step_stub, SeqId, Sampler}) rem (1 bsl 32),
     {SeqId, {token, T, 0}}.
 
-%% Sampler refs are opaque references; sampler_free is a no-op.
+%% Deterministic per-seq stub signature. Real backends would return
+%% an HMAC over the model's thinking state; the stub just hashes the
+%% seq_id so tests can assert a non-empty 32-byte value.
+thinking_signature(_S, SeqId) ->
+    crypto:hash(sha256, <<"stub-thinking-sig-", (integer_to_binary(SeqId))/binary>>).
+
+%% Sampler refs are opaque references. Free drops the per-sampler
+%% thinking phase counter (a no-op when thinking_capable=false).
 sampler_new(_S, _Cfg) ->
     {ok, make_ref()}.
 
-sampler_free(_Sampler) ->
+sampler_free(Sampler) ->
+    erlang:erase({stub_think, Sampler}),
     ok.
 
 %% Render a chat request as `system\nrole: content\nrole: content\n`
