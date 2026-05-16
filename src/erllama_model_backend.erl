@@ -236,7 +236,19 @@ inference, etc.) can plug in via this same surface.
     %% carrying the concatenated bytes of every {tool_call_delta, _}
     %% it sent for this span, so the downstream does not have to
     %% buffer chunks itself.
-    | tool_call_end.
+    | tool_call_end
+    %% Optional inner markers within a tool-call span. When the
+    %% backend has `tool_call_markers.payload_start` / `payload_end`
+    %% configured these mark the boundaries of string-payload
+    %% regions: the scheduler switches the request's sampler from
+    %% the greedy variant (used for tool-call syntax) back to the
+    %% request's normal sampler for payload bytes, then back to
+    %% greedy on payload_close. The token id is included so the
+    %% marker's bytes still land in the captured tool_call_delta
+    %% stream (the downstream's exact-replay map needs them).
+    %% Backends without payload markers never emit these variants.
+    | {tool_call_payload_open, erllama_nif:token_id()}
+    | {tool_call_payload_close, erllama_nif:token_id()}.
 
 -export_type([sampler_opts/0, seq_id/0, sampler_ref/0, step_op/0, step_result/0]).
 

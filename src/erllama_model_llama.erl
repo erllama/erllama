@@ -78,40 +78,53 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     %% recognition; the backend then behaves identically to a
     %% non-tool-call backend.
     tool_call_start_ids = [] :: [erllama_nif:token_id()],
-    tool_call_end_ids = [] :: [erllama_nif:token_id()]
+    tool_call_end_ids = [] :: [erllama_nif:token_id()],
+    %% Inner payload markers inside a tool-call span. When set the
+    %% scheduler switches the request's sampler off the greedy
+    %% variant for tokens between them, so caller-supplied string
+    %% arguments stay diverse while syntax stays byte-deterministic.
+    %% Empty lists leave the whole span on the greedy sampler.
+    tool_call_payload_start_ids = [] :: [erllama_nif:token_id()],
+    tool_call_payload_end_ids = [] :: [erllama_nif:token_id()]
 }).
 
 init(Config) ->
     Path = maps:get(model_path, Config),
     MOpts = maps:get(model_opts, Config, #{}),
-    COpts = maps:get(context_opts, Config, #{}),
-    NGpuLayers = maps:get(n_gpu_layers, MOpts, 0),
-    ThinkingMarkers = maps:get(thinking_markers, Config, #{}),
-    ToolCallMarkers = maps:get(tool_call_markers, Config, #{}),
     case erllama_nif:load_model(Path, MOpts) of
-        {ok, Model} ->
-            case erllama_nif:new_context(Model, COpts) of
-                {ok, Ctx} ->
-                    {ThinkStart, ThinkEnd} = tokenize_markers(Model, ThinkingMarkers),
-                    {ToolStart, ToolEnd} = tokenize_markers(Model, ToolCallMarkers),
-                    {ok, #s{
-                        model = Model,
-                        ctx = Ctx,
-                        model_size_bytes = safe_uint(erllama_nif:model_size(Model)),
-                        total_layers = safe_uint(erllama_nif:model_n_layer(Model)),
-                        n_gpu_layers = NGpuLayers,
-                        thinking_start_ids = ThinkStart,
-                        thinking_end_ids = ThinkEnd,
-                        tool_call_start_ids = ToolStart,
-                        tool_call_end_ids = ToolEnd
-                    }};
-                {error, _} = E ->
-                    erllama_nif:free_model(Model),
-                    E
-            end;
+        {ok, Model} -> open_context(Model, Config, MOpts);
+        {error, _} = E -> E
+    end.
+
+open_context(Model, Config, MOpts) ->
+    COpts = maps:get(context_opts, Config, #{}),
+    case erllama_nif:new_context(Model, COpts) of
+        {ok, Ctx} ->
+            {ok, build_state(Model, Ctx, Config, MOpts)};
         {error, _} = E ->
+            erllama_nif:free_model(Model),
             E
     end.
+
+build_state(Model, Ctx, Config, MOpts) ->
+    ThinkingMarkers = maps:get(thinking_markers, Config, #{}),
+    ToolCallMarkers = maps:get(tool_call_markers, Config, #{}),
+    {ThinkStart, ThinkEnd} = tokenize_markers(Model, ThinkingMarkers),
+    {ToolStart, ToolEnd} = tokenize_markers(Model, ToolCallMarkers),
+    {PayStart, PayEnd} = tokenize_payload_markers(Model, ToolCallMarkers),
+    #s{
+        model = Model,
+        ctx = Ctx,
+        model_size_bytes = safe_uint(erllama_nif:model_size(Model)),
+        total_layers = safe_uint(erllama_nif:model_n_layer(Model)),
+        n_gpu_layers = maps:get(n_gpu_layers, MOpts, 0),
+        thinking_start_ids = ThinkStart,
+        thinking_end_ids = ThinkEnd,
+        tool_call_start_ids = ToolStart,
+        tool_call_end_ids = ToolEnd,
+        tool_call_payload_start_ids = PayStart,
+        tool_call_payload_end_ids = PayEnd
+    }.
 
 safe_uint(N) when is_integer(N), N >= 0 -> N;
 safe_uint(_) -> 0.
@@ -139,6 +152,18 @@ tokenize_marker(Model, Bin) when is_binary(Bin) ->
         Tokens when is_list(Tokens) -> Tokens;
         _ -> []
     end.
+
+%% Tool-call payload markers live under the same `tool_call_markers`
+%% map but are optional. When both are absent the whole tool-call
+%% span stays on the greedy sampler.
+tokenize_payload_markers(_Model, Markers) when map_size(Markers) =:= 0 ->
+    {[], []};
+tokenize_payload_markers(Model, Markers) when is_map(Markers) ->
+    Start = tokenize_marker(Model, maps:get(payload_start, Markers, undefined)),
+    End = tokenize_marker(Model, maps:get(payload_end, Markers, undefined)),
+    {Start, End};
+tokenize_payload_markers(_Model, _Other) ->
+    {[], []}.
 
 terminate(#s{ctx = Ctx, model = Model}) ->
     erllama_nif:free_context(Ctx),
@@ -201,40 +226,55 @@ seq_clear(#s{ctx = C}) ->
 %% identity and the return shape is exactly what the NIF produced.
 %% Thinking checks come first so a token id that is in both sets
 %% routes to thinking.
-step(
-    #s{
-        ctx = C,
-        thinking_start_ids = TSI,
-        thinking_end_ids = TEI,
-        tool_call_start_ids = USI,
-        tool_call_end_ids = UEI
-    },
-    Ops
-) ->
+step(#s{ctx = C} = S, Ops) ->
     case erllama_nif:step(C, Ops) of
-        {ok, Results} when TSI =:= [], TEI =:= [], USI =:= [], UEI =:= [] ->
-            {ok, Results};
         {ok, Results} ->
-            {ok, [map_marker(R, TSI, TEI, USI, UEI) || R <- Results]};
+            case all_markers_empty(S) of
+                true -> {ok, Results};
+                false -> {ok, [map_marker(R, S) || R <- Results]}
+            end;
         Other ->
             Other
     end.
 
-map_marker({SeqId, {token, Tok, _Eog}} = R, TSI, TEI, USI, UEI) ->
+all_markers_empty(#s{
+    thinking_start_ids = [],
+    thinking_end_ids = [],
+    tool_call_start_ids = [],
+    tool_call_end_ids = [],
+    tool_call_payload_start_ids = [],
+    tool_call_payload_end_ids = []
+}) ->
+    true;
+all_markers_empty(_) ->
+    false.
+
+map_marker({SeqId, {token, Tok, _Eog}} = R, #s{
+    thinking_start_ids = TSI,
+    thinking_end_ids = TEI,
+    tool_call_start_ids = USI,
+    tool_call_end_ids = UEI,
+    tool_call_payload_start_ids = PSI,
+    tool_call_payload_end_ids = PEI
+}) ->
     Membership = {
         lists:member(Tok, TSI),
         lists:member(Tok, TEI),
         lists:member(Tok, USI),
-        lists:member(Tok, UEI)
+        lists:member(Tok, UEI),
+        lists:member(Tok, PSI),
+        lists:member(Tok, PEI)
     },
     case Membership of
-        {true, _, _, _} -> {SeqId, {thinking_token, Tok}};
-        {_, true, _, _} -> {SeqId, thinking_end};
-        {_, _, true, _} -> {SeqId, {tool_call_token, Tok}};
-        {_, _, _, true} -> {SeqId, tool_call_end};
+        {true, _, _, _, _, _} -> {SeqId, {thinking_token, Tok}};
+        {_, true, _, _, _, _} -> {SeqId, thinking_end};
+        {_, _, true, _, _, _} -> {SeqId, {tool_call_token, Tok}};
+        {_, _, _, true, _, _} -> {SeqId, tool_call_end};
+        {_, _, _, _, true, _} -> {SeqId, {tool_call_payload_open, Tok}};
+        {_, _, _, _, _, true} -> {SeqId, {tool_call_payload_close, Tok}};
         _ -> R
     end;
-map_marker(R, _TSI, _TEI, _USI, _UEI) ->
+map_marker(R, _S) ->
     R.
 
 %% Build a per-request sampler chain. The opaque sampler_ref is held
