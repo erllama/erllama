@@ -199,6 +199,14 @@ async messages:
   exactly once per closed block before any subsequent
   `{erllama_token, _, _}` message. `Sig` is `<<>>` when no
   signature is available
+- `{erllama_token, Ref, {tool_call_delta, Bin :: binary()}}` —
+  fragment of a tool-call body; emitted between a `tool_call`
+  start marker and an end marker when the model is loaded with
+  `tool_call_markers`
+- `{erllama_tool_call_end, Ref, Full :: binary()}` — close marker
+  for a tool-call span; carries the full concatenated bytes of
+  every `{tool_call_delta, _}` sent for the span so the downstream
+  can store them verbatim for byte-exact replay on later turns
 - `{erllama_done, Ref, Stats}` — normal completion
 - `{erllama_error, Ref, Reason}` — failure
 

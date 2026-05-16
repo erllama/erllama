@@ -249,10 +249,14 @@ collect_all(Ref, TimeoutMs, Acc) ->
     receive
         {erllama_token, Ref, {thinking_delta, Bin}} ->
             collect_all(Ref, TimeoutMs, [{thinking_delta, Bin} | Acc]);
+        {erllama_token, Ref, {tool_call_delta, Bin}} ->
+            collect_all(Ref, TimeoutMs, [{tool_call_delta, Bin} | Acc]);
         {erllama_token, Ref, Bin} when is_binary(Bin) ->
             collect_all(Ref, TimeoutMs, [{token, Bin} | Acc]);
         {erllama_thinking_end, Ref, Sig} ->
             collect_all(Ref, TimeoutMs, [{thinking_end, Sig} | Acc]);
+        {erllama_tool_call_end, Ref, Full} ->
+            collect_all(Ref, TimeoutMs, [{tool_call_end, Full} | Acc]);
         {erllama_done, Ref, Stats} ->
             lists:reverse([{done, Stats} | Acc]);
         {erllama_error, Ref, Reason} ->
@@ -385,6 +389,91 @@ idx_of(Target, L) ->
 sig_from([{thinking_end, S} | _]) -> S;
 sig_from([_ | T]) -> sig_from(T);
 sig_from([]) -> <<>>.
+
+%% =============================================================================
+%% tool calls
+%% =============================================================================
+
+tool_call_capable_stub_emits_delta_end_then_tokens_test() ->
+    with_model(#{tool_call_capable => true}, fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        {ok, Ref} = erllama:infer(
+            Id, Tokens, #{response_tokens => 3}, self()
+        ),
+        Events = collect_all(Ref, 5000),
+        Kinds = [K || {K, _} <- Events],
+        %% Expect: tool_call_delta+, tool_call_end, token+, done.
+        ?assert(lists:member(tool_call_delta, Kinds)),
+        ?assertEqual(1, length([1 || tool_call_end <- Kinds])),
+        ?assert(lists:member(token, Kinds)),
+        ?assertEqual(done, lists:last(Kinds)),
+        %% Every tool_call_delta precedes the tool_call_end, which
+        %% precedes every normal token.
+        EndIdx = idx_of(tool_call_end, Kinds),
+        ?assert(
+            lists:all(
+                fun({K, I}) -> K =/= tool_call_delta orelse I < EndIdx end,
+                indexed(Kinds)
+            )
+        ),
+        ?assert(
+            lists:all(
+                fun({K, I}) -> K =/= token orelse I > EndIdx end,
+                indexed(Kinds)
+            )
+        )
+    end).
+
+tool_call_end_carries_full_concatenated_bytes_test() ->
+    %% The close message carries the bytes of every tool_call_delta
+    %% the request emitted so downstream consumers don't need to
+    %% buffer chunks themselves.
+    with_model(#{tool_call_capable => true}, fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        {ok, Ref} = erllama:infer(
+            Id, Tokens, #{response_tokens => 2}, self()
+        ),
+        Events = collect_all(Ref, 5000),
+        Deltas = [B || {tool_call_delta, B} <- Events],
+        [{tool_call_end, Full}] = [E || {tool_call_end, _} = E <- Events],
+        ?assertEqual(iolist_to_binary(Deltas), Full)
+    end).
+
+non_tool_call_stub_emits_no_tool_messages_test() ->
+    %% Default stub: no tool_call_capable. No tool_call messages
+    %% should arrive even if downstream code expects to handle them.
+    with_model(fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        {ok, Ref} = erllama:infer(
+            Id, Tokens, #{response_tokens => 2}, self()
+        ),
+        Events = collect_all(Ref, 5000),
+        Kinds = [K || {K, _} <- Events],
+        ?assertEqual([], [K || K <- Kinds, K =:= tool_call_delta]),
+        ?assertEqual([], [K || K <- Kinds, K =:= tool_call_end]),
+        ?assertEqual(done, lists:last(Kinds))
+    end).
+
+thinking_and_tool_call_capable_stub_emits_both_phases_test() ->
+    %% When both phases are enabled the stub walks thinking first,
+    %% then tool calls, then normal tokens. Asserting ordering keeps
+    %% the two state machines independent.
+    with_model(
+        #{thinking_capable => true, tool_call_capable => true},
+        fun(Id) ->
+            {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+            {ok, Ref} = erllama:infer(
+                Id, Tokens, #{response_tokens => 2, thinking => enabled}, self()
+            ),
+            Events = collect_all(Ref, 5000),
+            Kinds = [K || {K, _} <- Events],
+            ThinkEnd = idx_of(thinking_end, Kinds),
+            ToolEnd = idx_of(tool_call_end, Kinds),
+            ?assert(ThinkEnd > 0),
+            ?assert(ToolEnd > 0),
+            ?assert(ThinkEnd < ToolEnd)
+        end
+    ).
 
 %% =============================================================================
 %% Concurrency / busy

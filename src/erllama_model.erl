@@ -413,6 +413,12 @@ concurrently through one decode call per tick.
     %% read side) it powers the `cache_delta` map surfaced on
     %% `completion_result()`, `stats()`, and `prefill_result()`.
     cache_delta_created = 0 :: non_neg_integer(),
+    %% Running concat of detokenised tool-call bytes for the current
+    %% span. Forwarded verbatim to the streaming caller as the
+    %% `Full` payload of `{erllama_tool_call_end, _, Full}` when the
+    %% span closes, then reset for any subsequent span on the same
+    %% request.
+    tool_call_bytes = <<>> :: binary(),
     %% Caller-side thinking-phase cap (`undefined` means no cap).
     %% Counted in delivered `{thinking_delta, _}` payloads, not raw
     %% thinking_token step results, so an empty detokenisation does
@@ -1716,6 +1722,14 @@ apply_step_results([{{SeqId, {decode, S}}, {thinking_token, Tok}} | T], Data) ->
 apply_step_results([{{SeqId, {decode, _}}, thinking_end} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     Req1 = req_thinking_end(Req, Data),
+    apply_step_results(T, put_req(Data, Req1));
+apply_step_results([{{SeqId, {decode, _}}, {tool_call_token, Tok}} | T], Data) ->
+    Req = maps:get(SeqId, Data#data.req_table),
+    Req1 = req_tool_call_emit(Req, Tok, Data),
+    apply_step_results(T, put_req(Data, Req1));
+apply_step_results([{{SeqId, {decode, _}}, tool_call_end} | T], Data) ->
+    Req = maps:get(SeqId, Data#data.req_table),
+    Req1 = req_tool_call_end(Req, Data),
     apply_step_results(T, put_req(Data, Req1)).
 
 %% Append the token to both context_tokens and generated.
@@ -1867,6 +1881,52 @@ req_thinking_end(
     Req#req{thinking_bytes = <<>>};
 req_thinking_end(Req, _Data) ->
     Req#req{thinking_bytes = <<>>}.
+
+%% Tool-call token: detokenise and forward as
+%% {erllama_token, Ref, {tool_call_delta, Bin}} to streaming
+%% callers. Bytes accumulate on the #req so the closing
+%% `tool_call_end` can deliver the full concatenation. Non-streaming
+%% callers see no message but still accumulate, in case the result
+%% map surface ever exposes tool calls.
+req_tool_call_emit(
+    #req{mode = streaming, caller_pid = Pid, request_ref = Ref} = Req,
+    Token,
+    Data
+) when
+    is_pid(Pid), is_reference(Ref)
+->
+    Bin =
+        case backend_call(Data, detokenize, [[Token]]) of
+            B when is_binary(B) -> B;
+            _ -> <<>>
+        end,
+    case Bin of
+        <<>> -> ok;
+        _ -> Pid ! {erllama_token, Ref, {tool_call_delta, Bin}}
+    end,
+    Req#req{tool_call_bytes = <<(Req#req.tool_call_bytes)/binary, Bin/binary>>};
+req_tool_call_emit(Req, Token, Data) ->
+    Bin =
+        case backend_call(Data, detokenize, [[Token]]) of
+            B when is_binary(B) -> B;
+            _ -> <<>>
+        end,
+    Req#req{tool_call_bytes = <<(Req#req.tool_call_bytes)/binary, Bin/binary>>}.
+
+%% Close the current tool-call span. The full concatenated bytes go
+%% out in one message so the downstream's exact-replay map can store
+%% them without re-buffering chunks. Then reset the buffer for the
+%% next span on this request.
+req_tool_call_end(
+    #req{mode = streaming, caller_pid = Pid, request_ref = Ref} = Req,
+    _Data
+) when
+    is_pid(Pid), is_reference(Ref)
+->
+    Pid ! {erllama_tool_call_end, Ref, Req#req.tool_call_bytes},
+    Req#req{tool_call_bytes = <<>>};
+req_tool_call_end(Req, _Data) ->
+    Req#req{tool_call_bytes = <<>>}.
 
 %% Resolve the integrity signature for the just-closed thinking
 %% block. Calls the backend's optional `thinking_signature/3` with

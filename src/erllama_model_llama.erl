@@ -72,7 +72,13 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     %% the backend then behaves identically to a non-thinking
     %% backend regardless of the per-request thinking flag.
     thinking_start_ids = [] :: [erllama_nif:token_id()],
-    thinking_end_ids = [] :: [erllama_nif:token_id()]
+    thinking_end_ids = [] :: [erllama_nif:token_id()],
+    %% Same shape for tool-call spans. Populated from the optional
+    %% `tool_call_markers` config key. Empty lists disable
+    %% recognition; the backend then behaves identically to a
+    %% non-tool-call backend.
+    tool_call_start_ids = [] :: [erllama_nif:token_id()],
+    tool_call_end_ids = [] :: [erllama_nif:token_id()]
 }).
 
 init(Config) ->
@@ -80,20 +86,24 @@ init(Config) ->
     MOpts = maps:get(model_opts, Config, #{}),
     COpts = maps:get(context_opts, Config, #{}),
     NGpuLayers = maps:get(n_gpu_layers, MOpts, 0),
-    Markers = maps:get(thinking_markers, Config, #{}),
+    ThinkingMarkers = maps:get(thinking_markers, Config, #{}),
+    ToolCallMarkers = maps:get(tool_call_markers, Config, #{}),
     case erllama_nif:load_model(Path, MOpts) of
         {ok, Model} ->
             case erllama_nif:new_context(Model, COpts) of
                 {ok, Ctx} ->
-                    {StartIds, EndIds} = tokenize_markers(Model, Markers),
+                    {ThinkStart, ThinkEnd} = tokenize_markers(Model, ThinkingMarkers),
+                    {ToolStart, ToolEnd} = tokenize_markers(Model, ToolCallMarkers),
                     {ok, #s{
                         model = Model,
                         ctx = Ctx,
                         model_size_bytes = safe_uint(erllama_nif:model_size(Model)),
                         total_layers = safe_uint(erllama_nif:model_n_layer(Model)),
                         n_gpu_layers = NGpuLayers,
-                        thinking_start_ids = StartIds,
-                        thinking_end_ids = EndIds
+                        thinking_start_ids = ThinkStart,
+                        thinking_end_ids = ThinkEnd,
+                        tool_call_start_ids = ToolStart,
+                        tool_call_end_ids = ToolEnd
                     }};
                 {error, _} = E ->
                     erllama_nif:free_model(Model),
@@ -185,31 +195,46 @@ seq_clear(#s{ctx = C}) ->
     erllama_nif:kv_seq_rm(C, 0, 0, -1).
 
 %% Drive one batched-decode tick. Forwards to the NIF and, when
-%% thinking markers are configured, maps any sampled token that
-%% matches one of them into the corresponding thinking step-result
-%% variant. With markers unset the mapping is the identity and the
-%% return shape is exactly what the NIF produced.
-step(#s{ctx = C, thinking_start_ids = SI, thinking_end_ids = EI}, Ops) ->
+%% thinking or tool-call markers are configured, maps any sampled
+%% token that matches one of them into the corresponding step-result
+%% variant. With every marker list empty the mapping is the
+%% identity and the return shape is exactly what the NIF produced.
+%% Thinking checks come first so a token id that is in both sets
+%% routes to thinking.
+step(
+    #s{
+        ctx = C,
+        thinking_start_ids = TSI,
+        thinking_end_ids = TEI,
+        tool_call_start_ids = USI,
+        tool_call_end_ids = UEI
+    },
+    Ops
+) ->
     case erllama_nif:step(C, Ops) of
-        {ok, Results} when SI =:= [], EI =:= [] ->
+        {ok, Results} when TSI =:= [], TEI =:= [], USI =:= [], UEI =:= [] ->
             {ok, Results};
         {ok, Results} ->
-            {ok, [map_thinking_marker(R, SI, EI) || R <- Results]};
+            {ok, [map_marker(R, TSI, TEI, USI, UEI) || R <- Results]};
         Other ->
             Other
     end.
 
-map_thinking_marker({SeqId, {token, Tok, _Eog}} = R, SI, EI) ->
-    case lists:member(Tok, SI) of
-        true ->
-            {SeqId, {thinking_token, Tok}};
-        false ->
-            case lists:member(Tok, EI) of
-                true -> {SeqId, thinking_end};
-                false -> R
-            end
+map_marker({SeqId, {token, Tok, _Eog}} = R, TSI, TEI, USI, UEI) ->
+    Membership = {
+        lists:member(Tok, TSI),
+        lists:member(Tok, TEI),
+        lists:member(Tok, USI),
+        lists:member(Tok, UEI)
+    },
+    case Membership of
+        {true, _, _, _} -> {SeqId, {thinking_token, Tok}};
+        {_, true, _, _} -> {SeqId, thinking_end};
+        {_, _, true, _} -> {SeqId, {tool_call_token, Tok}};
+        {_, _, _, true} -> {SeqId, tool_call_end};
+        _ -> R
     end;
-map_thinking_marker(R, _SI, _EI) ->
+map_marker(R, _TSI, _TEI, _USI, _UEI) ->
     R.
 
 %% Build a per-request sampler chain. The opaque sampler_ref is held

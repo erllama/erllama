@@ -60,20 +60,28 @@
     %% assert the snapshot rules.
     applied = [] :: [{reference(), float()}],
     %% Opt-in: when true, the first two decode ops per sampler emit
-    %% `{thinking_token, _}`, the third emits `thinking_end`, and
-    %% subsequent ops emit normal `{token, _, 0}`. Per-sampler phase
-    %% is tracked via the process dictionary because step/2 takes no
-    %% mutable state argument.
-    thinking_capable = false :: boolean()
+    %% `{thinking_token, _}`, the next emits `thinking_end`. Per-sampler
+    %% phase is tracked via the process dictionary because step/2 takes
+    %% no mutable state argument.
+    thinking_capable = false :: boolean(),
+    %% Opt-in: when true, two `{tool_call_token, _}` decodes followed
+    %% by a `tool_call_end` are emitted after the thinking phase (or
+    %% from the start when `thinking_capable = false`). Same per-sampler
+    %% state machine as the thinking phase.
+    tool_call_capable = false :: boolean()
 }).
 
 init(Config) ->
-    Thinking =
-        case maps:get(thinking_capable, Config, false) of
-            true -> true;
-            _ -> false
-        end,
-    {ok, #stub{thinking_capable = Thinking}}.
+    {ok, #stub{
+        thinking_capable = bool_opt(thinking_capable, Config),
+        tool_call_capable = bool_opt(tool_call_capable, Config)
+    }}.
+
+bool_opt(Key, Config) ->
+    case maps:get(Key, Config, false) of
+        true -> true;
+        _ -> false
+    end.
 
 terminate(_S) ->
     ok.
@@ -127,33 +135,63 @@ step(S, Ops) ->
 
 stub_step_op({SeqId, {prefill, _Tokens}}, _S) ->
     {SeqId, prefilled};
-stub_step_op({SeqId, {decode, Sampler}}, #stub{thinking_capable = false}) ->
+stub_step_op({SeqId, {decode, Sampler}}, #stub{
+    thinking_capable = false,
+    tool_call_capable = false
+}) ->
     %% The token is bound to the sampler ref AND the seq_id so a
     %% scheduler bug that swaps samplers between seqs would change
     %% one seq's output stream and be visible in tests. The mock
     %% never produces eog.
     decode_token(SeqId, Sampler);
-stub_step_op({SeqId, {decode, Sampler}}, #stub{thinking_capable = true}) ->
-    Phase =
-        case erlang:get({stub_think, Sampler}) of
-            undefined -> 0;
-            P -> P
-        end,
-    case Phase of
-        0 ->
-            erlang:put({stub_think, Sampler}, 1),
-            T = erlang:phash2({thinking_step_stub, SeqId, Sampler, 0}) rem (1 bsl 32),
-            {SeqId, {thinking_token, T}};
-        1 ->
-            erlang:put({stub_think, Sampler}, 2),
-            T = erlang:phash2({thinking_step_stub, SeqId, Sampler, 1}) rem (1 bsl 32),
-            {SeqId, {thinking_token, T}};
-        2 ->
-            erlang:put({stub_think, Sampler}, 3),
-            {SeqId, thinking_end};
-        _ ->
-            decode_token(SeqId, Sampler)
+stub_step_op(
+    {SeqId, {decode, Sampler}},
+    #stub{thinking_capable = TC, tool_call_capable = UC}
+) ->
+    Phase = next_phase(Sampler, TC, UC),
+    advance_phase(Sampler, Phase, SeqId).
+
+%% Phases (per-sampler, via process dict) walk in order:
+%%   thinking_emit_0, thinking_emit_1, thinking_done,
+%%   tool_call_emit_0, tool_call_emit_1, tool_call_done,
+%%   normal
+%% Phases for disabled features are skipped, so a stub with only
+%% thinking_capable goes thinking_emit_0 -> thinking_emit_1 ->
+%% thinking_done -> normal.
+next_phase(Sampler, TC, UC) ->
+    case erlang:get({stub_phase, Sampler}) of
+        undefined when TC -> thinking_emit_0;
+        undefined when UC -> tool_call_emit_0;
+        undefined -> normal;
+        thinking_done when UC -> tool_call_emit_0;
+        thinking_done -> normal;
+        Other -> Other
     end.
+
+advance_phase(Sampler, thinking_emit_0, SeqId) ->
+    erlang:put({stub_phase, Sampler}, thinking_emit_1),
+    T = erlang:phash2({thinking_step_stub, SeqId, Sampler, 0}) rem (1 bsl 32),
+    {SeqId, {thinking_token, T}};
+advance_phase(Sampler, thinking_emit_1, SeqId) ->
+    erlang:put({stub_phase, Sampler}, thinking_end_due),
+    T = erlang:phash2({thinking_step_stub, SeqId, Sampler, 1}) rem (1 bsl 32),
+    {SeqId, {thinking_token, T}};
+advance_phase(Sampler, thinking_end_due, SeqId) ->
+    erlang:put({stub_phase, Sampler}, thinking_done),
+    {SeqId, thinking_end};
+advance_phase(Sampler, tool_call_emit_0, SeqId) ->
+    erlang:put({stub_phase, Sampler}, tool_call_emit_1),
+    T = erlang:phash2({tool_call_step_stub, SeqId, Sampler, 0}) rem (1 bsl 32),
+    {SeqId, {tool_call_token, T}};
+advance_phase(Sampler, tool_call_emit_1, SeqId) ->
+    erlang:put({stub_phase, Sampler}, tool_call_end_due),
+    T = erlang:phash2({tool_call_step_stub, SeqId, Sampler, 1}) rem (1 bsl 32),
+    {SeqId, {tool_call_token, T}};
+advance_phase(Sampler, tool_call_end_due, SeqId) ->
+    erlang:put({stub_phase, Sampler}, normal),
+    {SeqId, tool_call_end};
+advance_phase(Sampler, normal, SeqId) ->
+    decode_token(SeqId, Sampler).
 
 decode_token(SeqId, Sampler) ->
     T = erlang:phash2({decode_step_stub, SeqId, Sampler}) rem (1 bsl 32),
@@ -166,12 +204,13 @@ thinking_signature(_S, SeqId, _Bytes) ->
     crypto:hash(sha256, <<"stub-thinking-sig-", (integer_to_binary(SeqId))/binary>>).
 
 %% Sampler refs are opaque references. Free drops the per-sampler
-%% thinking phase counter (a no-op when thinking_capable=false).
+%% per-sampler stub phase (a no-op when neither thinking_capable nor
+%% tool_call_capable is set).
 sampler_new(_S, _Cfg) ->
     {ok, make_ref()}.
 
 sampler_free(Sampler) ->
-    erlang:erase({stub_think, Sampler}),
+    erlang:erase({stub_phase, Sampler}),
     ok.
 
 %% Render a chat request as `system\nrole: content\nrole: content\n`
