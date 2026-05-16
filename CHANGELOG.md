@@ -6,6 +6,48 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-16
+
+Anthropic-Messages compatibility follow-ups: per-request cache
+delta accounting, a real thinking sampler in the llama.cpp
+backend, and caller-side thinking-budget clipping. All three are
+strict additions; existing consumers see no shape change unless
+they opt in.
+
+### Added
+
+- `cache_delta => #{read := N, created := N}` on
+  `completion_result()`, `stats()`, and `prefill_result()` so the
+  downstream Anthropic Messages server can emit accurate
+  `cache_creation_input_tokens` / `cache_read_input_tokens`
+  values. `read` is the warm prefix length restored at admission;
+  `created` is the largest contribution this request added to the
+  cache beyond that prefix (#35).
+- `thinking_markers => #{start := binary(), end := binary()}` on
+  `erllama:load_model/2` Config. The backend tokenises both
+  strings through the model's vocabulary at load time and the
+  `step/2` wrapper maps any sampled token matching a marker into
+  `{thinking_token, _}` or `thinking_end`. Multi-token markers
+  (BPE-split `<think>`) are supported. Omitting the key keeps the
+  backend on the non-thinking path (#36).
+- `thinking_signing_key` application env. When set, the real
+  backend's `thinking_signature/3` HMAC-SHA256s the observed
+  thinking-phase bytes with this key; unset returns `<<>>` so
+  the downstream omits `signature_delta` (#36).
+- `thinking_budget_tokens => pos_integer()` on `infer/4` `Params`.
+  Caps the number of `{thinking_delta, _}` payloads delivered
+  before the scheduler synthesises `{erllama_thinking_end, _, _}`
+  and re-routes further model thinking tokens through the normal
+  post-thinking pipeline (#37).
+
+### Changed
+
+- `thinking_signature/2` callback on `erllama_model_backend`
+  bumped to `/3` (third argument is the accumulated thinking
+  bytes). Backwards-compatible: only `erllama_model_stub`
+  implemented the optional callback in 0.3 and the stub +
+  scheduler + new `erllama_model_llama` move in lockstep (#36).
+
 ## [0.3.0] - 2026-05-16
 
 Anthropic-Messages compatibility additions on top of 0.2.0:

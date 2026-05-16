@@ -93,28 +93,6 @@ these natively, so the path is either a converter step at
 `fetch`-time (the `erllama_server` repo handles fetch) or a second
 backend that targets a different runtime.
 
-### Thinking-aware sampler
-
-0.3 ships the message-shape surface for extended thinking
-(`{thinking_delta, _}` / `{erllama_thinking_end, _, _}`) and a
-stub-backed signature; the real backend still has no thinking
-sampler. Needed: a `llama_model_backend` implementation that
-recognises model-emitted thinking-start / thinking-end markers
-(template-defined), tracks the per-block thinking text on the
-backend side, and returns a real HMAC-style signature from
-`thinking_signature/2`. Caller-side budget clipping
-(`thinking.budget_tokens` from the Anthropic spec) lands here too.
-
-### Cache delta accounting
-
-The downstream `erllama_server` HTTP front end emits coarse
-whole-prompt approximations for Anthropic's `cache_creation_input_tokens`
-and `cache_read_input_tokens` because the cache layer doesn't
-surface per-request deltas yet. Plumb a `cache_delta` map (created
-/ read tokens, optionally per-cache-block) through the
-`completion_result()` map and the streaming `Stats` so the
-downstream can report accurate values.
-
 ### Stateful streaming with bit-exact KV resume
 
 Today's warm restore re-prefills the last KV cell to regenerate
