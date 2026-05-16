@@ -107,6 +107,7 @@ extern int32_t erllama_safe_token_to_piece(const struct llama_vocab *vocab,
 extern int erllama_safe_backend_init(void);
 extern int erllama_safe_backend_init_once(void);
 extern int erllama_safe_backend_free(void);
+extern void erllama_safe_log_unset(void);
 extern struct llama_model *erllama_safe_model_load_from_file(
     const char *path, struct llama_model_params params);
 extern struct llama_model *erllama_safe_model_load_from_file_v2(
@@ -570,10 +571,19 @@ static int load(ErlNifEnv *env, void **priv_data, ERL_NIF_TERM load_info) {
 static void unload(ErlNifEnv *env, void *priv_data) {
     (void) env;
     (void) priv_data;
-    /* If backend_init_once ran, free the global llama state so a
-     * NIF reload (hot upgrade, test runner) doesn't leak. If it
-     * never ran, llama_backend_free is a no-op. */
-    (void) erllama_safe_backend_free();
+    /* Clear the log callback first: llama_log_set is process-global
+     * and points at a function inside this .so. If we left it set,
+     * a post-unload log emission would dispatch into freed memory.
+     *
+     * We intentionally do NOT call llama_backend_free. The
+     * backend init runs once per process behind a pthread_once
+     * guard whose static state lives in the .so; on a hot-upgrade
+     * reload that keeps the .so mapped, the once token would still
+     * read "completed" while the global llama state is gone,
+     * leaving no path to re-init. The only thing backend_free
+     * releases is the ggml quantize table (a small fixed
+     * allocation reclaimed by the OS on process exit). */
+    erllama_safe_log_unset();
 }
 
 /* =========================================================================
