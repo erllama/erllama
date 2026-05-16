@@ -416,6 +416,49 @@ complete_committed_tokens_equals_context_tokens_length_test() ->
         ?assertEqual(length(Ctx), N)
     end).
 
+complete_stop_sequence_trims_reply_and_reports_match_test() ->
+    %% Stub backend's detokenize produces space-separated decimals.
+    %% Stopping on any digit guarantees an early match.
+    AllDigits = [
+        <<"0">>,
+        <<"1">>,
+        <<"2">>,
+        <<"3">>,
+        <<"4">>,
+        <<"5">>,
+        <<"6">>,
+        <<"7">>,
+        <<"8">>,
+        <<"9">>
+    ],
+    with_model(#{}, fun(_Cfg) ->
+        {ok, Result} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 8, stop_sequences => AllDigits}
+        ),
+        Match = maps:get(stop_sequence, Result),
+        ?assert(is_binary(Match)),
+        ?assert(lists:member(Match, AllDigits)),
+        ?assertEqual(stop, maps:get(finish_reason, Result)),
+        ?assertEqual(stop, maps:get(finish_reason, maps:get(stats, Result))),
+        ?assertEqual(Match, maps:get(stop_sequence, maps:get(stats, Result))),
+        %% reply is trimmed at the first occurrence of the matched stop.
+        Reply = maps:get(reply, Result),
+        ?assertEqual(nomatch, binary:match(Reply, Match))
+    end).
+
+complete_stop_sequence_absent_when_no_match_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        {ok, Result} = erllama_model:complete(
+            <<"test_model">>,
+            long_prompt(),
+            #{response_tokens => 1, stop_sequences => [<<"unmatchable-xyz">>]}
+        ),
+        ?assertNot(maps:is_key(stop_sequence, Result)),
+        ?assertNot(maps:is_key(stop_sequence, maps:get(stats, Result)))
+    end).
+
 prefill_only_returns_finish_key_and_warm_resumes_test() ->
     with_model(#{}, fun(Cfg) ->
         Tokens = prompt_tokens(long_prompt()),

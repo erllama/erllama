@@ -215,12 +215,18 @@ concurrently through one decode call per tick.
     %% Length of `context_tokens` at finish (prompt + generated). Equal
     %% to `prompt_tokens + completion_tokens` unless the cache pruned
     %% the live context (not currently possible).
-    committed_tokens := non_neg_integer()
+    committed_tokens := non_neg_integer(),
+    %% Only present when a caller-supplied `stop_sequences` entry
+    %% fired. The value is the binary of the matched stop string.
+    %% Absent on `length`, `cancelled`, or natural end-of-generation
+    %% without a stop-string match.
+    stop_sequence => binary()
 }.
 
 %% Reply shape for `complete/2,3`.
 -type completion_result() :: #{
-    %% Detokenised reply text.
+    %% Detokenised reply text. Trimmed at the first occurrence of a
+    %% matched `stop_sequences` entry when one fired.
     reply := binary(),
     %% Tokens produced by this request (not including the prompt).
     generated := [non_neg_integer()],
@@ -235,7 +241,10 @@ concurrently through one decode call per tick.
     %% How this request resolved against the cache on admission.
     cache_hit_kind := cache_hit_kind(),
     finish_reason := finish_reason(),
-    stats := stats()
+    stats := stats(),
+    %% Only present when a caller-supplied `stop_sequences` entry
+    %% fired. The value is the binary of the matched stop string.
+    stop_sequence => binary()
 }.
 
 %% Reply shape for `prefill_only/2`.
@@ -249,9 +258,12 @@ concurrently through one decode call per tick.
 %% Optional fields the caller may set on `infer/4`. The same fields
 %% are honoured by `complete/3` Opts. The sampler chain is rebuilt
 %% per-request: grammar -> repetition_penalty -> top_k -> top_p ->
-%% min_p -> (temperature > 0 ? temp -> dist(seed) : greedy). `stop`
-%% is reserved for a future stop-sequence implementation; not used
-%% in 0.1.
+%% min_p -> (temperature > 0 ? temp -> dist(seed) : greedy).
+%% `stop_sequences` is a list of binaries; generation halts on the
+%% first occurrence (by list order) of any element in the
+%% accumulated detokenized output. The match is trimmed from the
+%% streamed text and the matched value is reported as
+%% `stop_sequence` in the result map / stats.
 -type infer_params() :: #{
     response_tokens => pos_integer(),
     parent_key => term(),
@@ -261,7 +273,7 @@ concurrently through one decode call per tick.
     min_p => float(),
     repetition_penalty => float(),
     seed => non_neg_integer(),
-    stop => [binary()],
+    stop_sequences => [binary()],
     grammar => binary(),
     _ => _
 }.
@@ -322,7 +334,25 @@ concurrently through one decode call per tick.
     %% step_tick iteration drops it from req_table; deferring the
     %% removal lets the tick walk results without mid-iteration
     %% mutation of req_table.
-    finishing = false :: boolean()
+    finishing = false :: boolean(),
+    %% Caller-supplied stop strings; first-match-wins by list order.
+    %% Empty disables the scanner.
+    stop_sequences = [] :: [binary()],
+    %% binary:compile_pattern/1 result for stop_sequences. `undefined`
+    %% when stop_sequences = [].
+    stop_pattern = undefined :: binary:cp() | undefined,
+    %% Max byte length across stop_sequences. Used to decide how many
+    %% trailing bytes of detokenized output to hold back in
+    %% pending_text so a stop string spanning a chunk boundary is
+    %% still detected.
+    stop_max_len = 0 :: non_neg_integer(),
+    %% Detokenized bytes not yet flushed to the caller. Suffix of the
+    %% generated text that may be the prefix of a future stop match.
+    pending_text = <<>> :: binary(),
+    %% Matched stop string once a hit fires; `undefined` otherwise.
+    %% Drives the finish_reason classifier and the `stop_sequence`
+    %% key on the result / stats map.
+    matched_stop = undefined :: binary() | undefined
 }).
 
 -record(data, {
@@ -859,6 +889,7 @@ start_request({complete, From, Prompt, Opts}, SeqId, Data) ->
     case sampler_for(Opts, Data) of
         {ok, SamplerRef, SamplerCfg, Data0} ->
             PromptTokens = backend_call(Data0, tokenize, [Prompt]),
+            {Stops, StopPat, StopMax} = stop_sequences_from(Opts),
             Req = #req{
                 seq_id = SeqId,
                 mode = standard,
@@ -871,7 +902,10 @@ start_request({complete, From, Prompt, Opts}, SeqId, Data) ->
                 request_fp = Data0#data.effective_fp,
                 sampler_ref = SamplerRef,
                 last_sampler_cfg = SamplerCfg,
-                prefill_started_at = erlang:monotonic_time(millisecond)
+                prefill_started_at = erlang:monotonic_time(millisecond),
+                stop_sequences = Stops,
+                stop_pattern = StopPat,
+                stop_max_len = StopMax
             },
             ParentKey = maps:get(parent_key, Opts, undefined),
             Req1 = setup_lookup(Req, ParentKey, Data0),
@@ -906,6 +940,7 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Data) ->
         {ok, SamplerRef, SamplerCfg, Data0} ->
             Ref = make_ref(),
             ok = erllama_inflight:register(Ref, self()),
+            {Stops, StopPat, StopMax} = stop_sequences_from(Params),
             Req = #req{
                 seq_id = SeqId,
                 mode = streaming,
@@ -919,7 +954,10 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Data) ->
                 request_fp = Data0#data.effective_fp,
                 sampler_ref = SamplerRef,
                 last_sampler_cfg = SamplerCfg,
-                prefill_started_at = erlang:monotonic_time(millisecond)
+                prefill_started_at = erlang:monotonic_time(millisecond),
+                stop_sequences = Stops,
+                stop_pattern = StopPat,
+                stop_max_len = StopMax
             },
             ParentKey = maps:get(parent_key, Params, undefined),
             Req1 = setup_lookup(Req, ParentKey, Data0),
@@ -1561,9 +1599,15 @@ apply_step_results([{{SeqId, {decode, _}}, {token, Tok, EogFlag}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     Req1 = req_append_token(Req, Tok),
     Req2 = req_stream_emit(Req1, Tok, Data),
-    %% Mark terminal if eog or response_target reached.
+    %% Mark terminal if eog, response_target reached, or a stop
+    %% sequence fired. matched_stop is set inside req_stream_emit
+    %% on a hit; check it here so the request is marked finishing
+    %% at the same point the existing EOG/length paths are.
     GenLen = length(Req2#req.generated),
-    Done = EogFlag =:= 1 orelse GenLen >= Req2#req.response_target,
+    Done =
+        EogFlag =:= 1 orelse
+            GenLen >= Req2#req.response_target orelse
+            Req2#req.matched_stop =/= undefined,
     Req3 =
         case Done of
             true -> Req2#req{finishing = true};
@@ -1578,9 +1622,12 @@ req_append_token(Req, Token) ->
         generated = Req#req.generated ++ [Token]
     }.
 
-%% Stream a token to the caller (no-op for non-streaming modes).
+%% Stream a token to the caller (no-op for non-streaming modes
+%% unless stop_sequences are active, in which case we still need to
+%% accumulate detokenized bytes so an early match can stop the
+%% request and trim the eventual standard-mode reply).
 req_stream_emit(
-    #req{mode = streaming, caller_pid = Pid, request_ref = Ref} = Req,
+    #req{stop_pattern = undefined, mode = streaming, caller_pid = Pid, request_ref = Ref} = Req,
     Token,
     Data
 ) ->
@@ -1592,8 +1639,49 @@ req_stream_emit(
     end,
     Pid ! {erllama_token_id, Ref, Token},
     Req;
-req_stream_emit(Req, _Token, _Data) ->
-    Req.
+req_stream_emit(#req{stop_pattern = undefined} = Req, _Token, _Data) ->
+    Req;
+req_stream_emit(Req, Token, Data) ->
+    Chunk =
+        case backend_call(Data, detokenize, [[Token]]) of
+            B when is_binary(B) -> B;
+            _ -> <<>>
+        end,
+    Buf = <<(Req#req.pending_text)/binary, Chunk/binary>>,
+    case binary:match(Buf, Req#req.stop_pattern) of
+        {Pos, Len} ->
+            Match = binary:part(Buf, Pos, Len),
+            Prefix = binary:part(Buf, 0, Pos),
+            maybe_emit_stream(Req, Prefix, Token),
+            Req#req{pending_text = <<>>, matched_stop = Match};
+        nomatch ->
+            case Req#req.mode of
+                streaming ->
+                    Hold = max(Req#req.stop_max_len - 1, 0),
+                    Total = byte_size(Buf),
+                    EmitN = max(Total - Hold, 0),
+                    Safe = binary:part(Buf, 0, EmitN),
+                    Tail = binary:part(Buf, EmitN, Total - EmitN),
+                    maybe_emit_stream(Req, Safe, Token),
+                    Req#req{pending_text = Tail};
+                _ ->
+                    Req#req{pending_text = Buf}
+            end
+    end.
+
+maybe_emit_stream(
+    #req{mode = streaming, caller_pid = Pid, request_ref = Ref}, Text, Token
+) when
+    is_pid(Pid), is_reference(Ref)
+->
+    case Text of
+        <<>> -> ok;
+        _ -> Pid ! {erllama_token, Ref, Text}
+    end,
+    Pid ! {erllama_token_id, Ref, Token},
+    ok;
+maybe_emit_stream(_Req, _Text, _Token) ->
+    ok.
 
 %% Mark any req whose generated count >= response_target as
 %% finishing. Called after apply_step_results so we don't mutate
@@ -1670,6 +1758,8 @@ finish_marked_reqs(Data, Actions) ->
                 case R#req.cancel_pending of
                     true ->
                         cancelled;
+                    false when R#req.matched_stop =/= undefined ->
+                        stop;
                     false ->
                         case length(R#req.generated) >= R#req.response_target of
                             true -> length;
@@ -1700,8 +1790,9 @@ finish_req(Req, FinishReason, Data, Actions) ->
     {Data2, Actions ++ Action}.
 
 finish_action(#req{mode = standard, caller = From} = Req, FinishReason, FinishKey, Stats, Data) ->
-    Reply = backend_call(Data, detokenize, [Req#req.generated]),
-    Result = #{
+    Reply0 = backend_call(Data, detokenize, [Req#req.generated]),
+    Reply = trim_at_match(Reply0, Req#req.matched_stop),
+    Result0 = #{
         reply => Reply,
         generated => Req#req.generated,
         context_tokens => Req#req.context_tokens,
@@ -1711,8 +1802,10 @@ finish_action(#req{mode = standard, caller = From} = Req, FinishReason, FinishKe
         finish_reason => FinishReason,
         stats => Stats
     },
+    Result = maybe_add_stop_sequence(Result0, Req#req.matched_stop),
     [{reply, From, {ok, Result}}];
 finish_action(#req{mode = streaming} = Req, _FinishReason, _FinishKey, Stats, _Data) ->
+    flush_pending_text(Req),
     send_done_for_req(Req, Stats),
     [];
 finish_action(
@@ -1868,6 +1961,21 @@ sampler_for(Opts, Data = #data{backend = Mod, backend_state = S}) ->
             {ok, undefined, Cfg, Data}
     end.
 
+%% Parse `stop_sequences` from an Opts/Params map. Non-binary or
+%% empty-binary entries are dropped silently; an entirely missing or
+%% empty list yields {[], undefined, 0} which disables the scanner.
+stop_sequences_from(Opts) ->
+    Raw = maps:get(stop_sequences, Opts, []),
+    Stops = [S || S <- Raw, is_binary(S), S =/= <<>>],
+    case Stops of
+        [] ->
+            {[], undefined, 0};
+        _ ->
+            Pat = binary:compile_pattern(Stops),
+            Max = lists:max([byte_size(S) || S <- Stops]),
+            {Stops, Pat, Max}
+    end.
+
 %% Per-#req stats. Mirrors the v0.2 build_stats/4 but reads from the
 %% request record instead of #data.
 build_stats_for_req(FinishReason, Cancelled, FinishKey, Req) ->
@@ -1885,7 +1993,7 @@ build_stats_for_req(FinishReason, Cancelled, FinishKey, Req) ->
             undefined -> 0;
             _ -> max(0, Now - GenStart)
         end,
-    #{
+    Stats0 = #{
         prompt_tokens => length(Req#req.prompt_tokens),
         completion_tokens => length(Req#req.generated),
         prefill_ms => PrefillMs,
@@ -1895,7 +2003,46 @@ build_stats_for_req(FinishReason, Cancelled, FinishKey, Req) ->
         cancelled => Cancelled,
         finish_key => FinishKey,
         committed_tokens => length(Req#req.context_tokens)
-    }.
+    },
+    maybe_add_stop_sequence(Stats0, Req#req.matched_stop).
+
+%% Additive: include `stop_sequence` only when a stop string fired.
+maybe_add_stop_sequence(Map, undefined) ->
+    Map;
+maybe_add_stop_sequence(Map, Match) when is_binary(Match) ->
+    Map#{stop_sequence => Match}.
+
+%% Standard-mode reply trim: cut the bulk-detokenized reply at the
+%% first occurrence of the matched stop string. The bulk detokenize
+%% can differ slightly from per-token concat for some tokenizers, so
+%% we re-scan rather than reuse pending_text.
+trim_at_match(Reply, undefined) ->
+    Reply;
+trim_at_match(Reply, Match) when is_binary(Reply), is_binary(Match) ->
+    case binary:match(Reply, Match) of
+        {Pos, _Len} -> binary:part(Reply, 0, Pos);
+        nomatch -> Reply
+    end.
+
+%% Flush any text held back in pending_text as one final
+%% `{erllama_token, _, _}` message. Only relevant for streaming
+%% requests with stop_sequences active and no match: the trailing
+%% (max_stop_len - 1) bytes were withheld in case they were the
+%% prefix of a future match; at the terminal step they are safe to
+%% emit. When matched_stop is set, pending_text is already cleared
+%% so this is a no-op.
+flush_pending_text(#req{
+    mode = streaming,
+    caller_pid = Pid,
+    request_ref = Ref,
+    pending_text = Tail
+}) when
+    is_pid(Pid), is_reference(Ref), is_binary(Tail), Tail =/= <<>>
+->
+    Pid ! {erllama_token, Ref, Tail},
+    ok;
+flush_pending_text(_Req) ->
+    ok.
 
 %% =============================================================================
 %% Internal: cache integration
