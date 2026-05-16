@@ -49,7 +49,8 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     unload_adapter/2,
     apply_adapters/2,
     extra_metadata/1,
-    verify/4
+    verify/4,
+    thinking_signature/3
 ]).
 
 -record(s, {
@@ -63,7 +64,15 @@ passthroughs `split_mode`, `main_gpu`, `tensor_split`,
     total_layers = 0 :: non_neg_integer(),
     %% Signed: llama.cpp uses negative (typically -1) to mean
     %% "offload all layers".
-    n_gpu_layers = 0 :: integer()
+    n_gpu_layers = 0 :: integer(),
+    %% Token ids that open / close a thinking block. Populated at
+    %% init from the optional `thinking_markers` config key by
+    %% tokenising the start / end strings through this model's own
+    %% vocabulary. Empty lists disable marker recognition entirely;
+    %% the backend then behaves identically to a non-thinking
+    %% backend regardless of the per-request thinking flag.
+    thinking_start_ids = [] :: [erllama_nif:token_id()],
+    thinking_end_ids = [] :: [erllama_nif:token_id()]
 }).
 
 init(Config) ->
@@ -71,16 +80,20 @@ init(Config) ->
     MOpts = maps:get(model_opts, Config, #{}),
     COpts = maps:get(context_opts, Config, #{}),
     NGpuLayers = maps:get(n_gpu_layers, MOpts, 0),
+    Markers = maps:get(thinking_markers, Config, #{}),
     case erllama_nif:load_model(Path, MOpts) of
         {ok, Model} ->
             case erllama_nif:new_context(Model, COpts) of
                 {ok, Ctx} ->
+                    {StartIds, EndIds} = tokenize_markers(Model, Markers),
                     {ok, #s{
                         model = Model,
                         ctx = Ctx,
                         model_size_bytes = safe_uint(erllama_nif:model_size(Model)),
                         total_layers = safe_uint(erllama_nif:model_n_layer(Model)),
-                        n_gpu_layers = NGpuLayers
+                        n_gpu_layers = NGpuLayers,
+                        thinking_start_ids = StartIds,
+                        thinking_end_ids = EndIds
                     }};
                 {error, _} = E ->
                     erllama_nif:free_model(Model),
@@ -92,6 +105,30 @@ init(Config) ->
 
 safe_uint(N) when is_integer(N), N >= 0 -> N;
 safe_uint(_) -> 0.
+
+%% Resolve the configured `thinking_markers => #{start => Binary,
+%% end => Binary}` map into two token-id lists by running each
+%% string through the model's own vocabulary. Missing or invalid
+%% entries yield an empty list, which keeps the step wrapper a
+%% no-op for that side.
+tokenize_markers(_Model, Markers) when map_size(Markers) =:= 0 ->
+    {[], []};
+tokenize_markers(Model, Markers) when is_map(Markers) ->
+    Start = tokenize_marker(Model, maps:get(start, Markers, undefined)),
+    End = tokenize_marker(Model, maps:get('end', Markers, undefined)),
+    {Start, End};
+tokenize_markers(_Model, _Other) ->
+    {[], []}.
+
+tokenize_marker(_Model, undefined) ->
+    [];
+tokenize_marker(_Model, <<>>) ->
+    [];
+tokenize_marker(Model, Bin) when is_binary(Bin) ->
+    case erllama_nif:tokenize(Model, Bin, #{add_special => false, parse_special => true}) of
+        Tokens when is_list(Tokens) -> Tokens;
+        _ -> []
+    end.
 
 terminate(#s{ctx = Ctx, model = Model}) ->
     erllama_nif:free_context(Ctx),
@@ -147,10 +184,33 @@ seq_rm(#s{ctx = C}, SeqId) when is_integer(SeqId), SeqId >= 0 ->
 seq_clear(#s{ctx = C}) ->
     erllama_nif:kv_seq_rm(C, 0, 0, -1).
 
-%% Drive one batched-decode tick. Forwards directly to the NIF; the
-%% scheduler owns the op list and the sampler refs.
-step(#s{ctx = C}, Ops) ->
-    erllama_nif:step(C, Ops).
+%% Drive one batched-decode tick. Forwards to the NIF and, when
+%% thinking markers are configured, maps any sampled token that
+%% matches one of them into the corresponding thinking step-result
+%% variant. With markers unset the mapping is the identity and the
+%% return shape is exactly what the NIF produced.
+step(#s{ctx = C, thinking_start_ids = SI, thinking_end_ids = EI}, Ops) ->
+    case erllama_nif:step(C, Ops) of
+        {ok, Results} when SI =:= [], EI =:= [] ->
+            {ok, Results};
+        {ok, Results} ->
+            {ok, [map_thinking_marker(R, SI, EI) || R <- Results]};
+        Other ->
+            Other
+    end.
+
+map_thinking_marker({SeqId, {token, Tok, _Eog}} = R, SI, EI) ->
+    case lists:member(Tok, SI) of
+        true ->
+            {SeqId, {thinking_token, Tok}};
+        false ->
+            case lists:member(Tok, EI) of
+                true -> {SeqId, thinking_end};
+                false -> R
+            end
+    end;
+map_thinking_marker(R, _SI, _EI) ->
+    R.
 
 %% Build a per-request sampler chain. The opaque sampler_ref is held
 %% by the scheduler for the request's lifetime and freed when the
@@ -261,3 +321,22 @@ restore_after_verify(Ctx, P, LastPrefixToken) ->
     _ = erllama_nif:kv_seq_rm(Ctx, 0, P, -1),
     _ = erllama_nif:prefill(Ctx, [LastPrefixToken]),
     ok.
+
+%% Sign the observed thinking-phase bytes with an HMAC-SHA256 over
+%% the node-wide signing key. The Anthropic SDK round-trips the
+%% resulting binary as `signature_delta` so the server can verify
+%% the thinking text on the next turn. The key is read from the
+%% application environment:
+%%
+%%     application:set_env(erllama, thinking_signing_key, <<"...">>).
+%%
+%% Leaving the key unset returns `<<>>`, the documented
+%% "no signature available" path: the downstream omits
+%% `signature_delta` from its SSE output.
+thinking_signature(_S, _SeqId, Bytes) when is_binary(Bytes) ->
+    case application:get_env(erllama, thinking_signing_key) of
+        {ok, Key} when is_binary(Key), Key =/= <<>> ->
+            crypto:mac(hmac, sha256, Key, Bytes);
+        _ ->
+            <<>>
+    end.
