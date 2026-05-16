@@ -136,6 +136,12 @@ extern int32_t erllama_safe_tokenize(const struct llama_vocab *vocab,
                                      bool add_special, bool parse_special);
 extern int erllama_safe_decode(struct llama_context *c,
                                struct llama_batch batch);
+extern struct llama_batch erllama_safe_batch_init(int32_t n_tokens,
+                                                  int32_t embd,
+                                                  int32_t n_seq_max);
+extern struct llama_batch erllama_safe_batch_get_one(llama_token *tokens,
+                                                     int32_t n_tokens);
+extern void erllama_safe_batch_free(struct llama_batch batch);
 extern size_t erllama_safe_state_seq_get_size(struct llama_context *c,
                                               int seq_id);
 extern size_t erllama_safe_state_seq_get_data(struct llama_context *c,
@@ -1596,10 +1602,10 @@ static ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
      * llama_batch_init allocates the arrays with size = total and
      * each seq_id[i] pointing to an array of length 1 (n_seq_max=1
      * argument). */
-    struct llama_batch batch = llama_batch_init(total, 0, 1);
+    struct llama_batch batch = erllama_safe_batch_init(total, 0, 1);
     if (!batch.token || !batch.pos || !batch.n_seq_id ||
         !batch.seq_id || !batch.logits) {
-        llama_batch_free(batch);
+        erllama_safe_batch_free(batch);
         pthread_mutex_unlock(&c->mu);
         free_step_ops(ops, n_ops);
         return enif_make_tuple2(env, atom_error, atom_oom);
@@ -1608,7 +1614,7 @@ static ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
 
     int32_t *last_logits_idx_new = enif_alloc(sizeof(int32_t) * n_ops);
     if (!last_logits_idx_new) {
-        llama_batch_free(batch);
+        erllama_safe_batch_free(batch);
         pthread_mutex_unlock(&c->mu);
         free_step_ops(ops, n_ops);
         return enif_make_tuple2(env, atom_error, atom_oom);
@@ -1636,7 +1642,7 @@ static ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
 
     int dr = erllama_safe_decode(c->ctx, batch);
     if (dr != 0) {
-        llama_batch_free(batch);
+        erllama_safe_batch_free(batch);
         enif_free(last_logits_idx_new);
         c->decode_ready = 0;
         pthread_mutex_unlock(&c->mu);
@@ -1656,7 +1662,7 @@ static ERL_NIF_TERM nif_step(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
     }
     c->decode_ready = 1;
 
-    llama_batch_free(batch);
+    erllama_safe_batch_free(batch);
     enif_free(last_logits_idx_new);
     pthread_mutex_unlock(&c->mu);
 
@@ -1799,7 +1805,7 @@ static ERL_NIF_TERM nif_prefill(ErlNifEnv *env, int argc, const ERL_NIF_TERM arg
         enif_free(tokens);
         return enif_make_tuple2(env, atom_error, atom_batch_overflow);
     }
-    struct llama_batch batch = llama_batch_get_one(tokens, n);
+    struct llama_batch batch = erllama_safe_batch_get_one(tokens, n);
     int dr = erllama_safe_decode(c->ctx, batch);
     if (dr == 0) c->decode_ready = 1;
     pthread_mutex_unlock(&c->mu);
@@ -1866,7 +1872,7 @@ static ERL_NIF_TERM nif_decode_one(ErlNifEnv *env, int argc, const ERL_NIF_TERM 
     int eog = vocab ? erllama_safe_vocab_is_eog(vocab, tok) : 0;
 
     llama_token tok_buf = tok;
-    struct llama_batch batch = llama_batch_get_one(&tok_buf, 1);
+    struct llama_batch batch = erllama_safe_batch_get_one(&tok_buf, 1);
     int rc = erllama_safe_decode(c->ctx, batch);
     if (rc == 0) c->decode_ready = 1;
     else c->decode_ready = 0;
@@ -2518,7 +2524,7 @@ static ERL_NIF_TERM nif_embed(ErlNifEnv *env, int argc,
         return enif_make_tuple2(env, atom_error, atom_exception);
     }
 
-    struct llama_batch batch = llama_batch_get_one(tokens, n);
+    struct llama_batch batch = erllama_safe_batch_get_one(tokens, n);
     int dr = erllama_safe_decode(c->ctx, batch);
     if (dr == ERLLAMA_DECODE_EXC_SENTINEL) {
         pthread_mutex_unlock(&c->mu);

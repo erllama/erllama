@@ -450,6 +450,43 @@ int erllama_safe_decode(struct llama_context *c,
     }
 }
 
+// llama_batch_{init,free,get_one} are C++ entry points exported as
+// C ABI. Today the vendored implementation uses malloc rather than
+// new, but the surface is C++ and may grow throwing call sites
+// across vendor bumps. Wrap them so an exception cannot unwind
+// into the C NIF frame. On thrown exception the init/get_one
+// shims return a zero-initialised batch (.token == nullptr,
+// .n_tokens == 0); callers already check .token / .pos / .n_seq_id
+// for NULL and treat it as allocation failure.
+struct llama_batch erllama_safe_batch_init(int32_t n_tokens, int32_t embd,
+                                           int32_t n_seq_max) noexcept {
+    try {
+        return llama_batch_init(n_tokens, embd, n_seq_max);
+    } catch (...) {
+        struct llama_batch z = {0, nullptr, nullptr, nullptr,
+                                nullptr, nullptr, nullptr};
+        return z;
+    }
+}
+
+struct llama_batch erllama_safe_batch_get_one(llama_token *tokens,
+                                              int32_t n_tokens) noexcept {
+    try {
+        return llama_batch_get_one(tokens, n_tokens);
+    } catch (...) {
+        struct llama_batch z = {0, nullptr, nullptr, nullptr,
+                                nullptr, nullptr, nullptr};
+        return z;
+    }
+}
+
+void erllama_safe_batch_free(struct llama_batch batch) noexcept {
+    try {
+        llama_batch_free(batch);
+    } catch (...) {
+    }
+}
+
 // State seq APIs. Return SIZE_MAX on thrown exception (callers treat
 // as failure).
 size_t erllama_safe_state_seq_get_size(struct llama_context *c,
