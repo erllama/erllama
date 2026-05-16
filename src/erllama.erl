@@ -152,9 +152,14 @@ carrying:
   the finish save was suppressed
 - `cache_hit_kind` — `exact | partial | cold`
 - `finish_reason` — `stop | length | cancelled`
+- `cache_delta` — `#{read := N, created := N}`. `read` is the warm
+  prefix length restored from cache at admission; `created` is the
+  largest contribution this request added to the cache beyond that
+  prefix (0 when no save fired)
 - `stop_sequence` — only present when a `stop_sequences` entry
   fired; the binary of the matched stop string
-- `stats` — per-request timing and cache stats
+- `stats` — per-request timing and cache stats (also carries
+  `cache_delta` for streaming callers)
 """.
 -spec complete(model(), binary(), map()) ->
     {ok, erllama_model:completion_result()} | {error, term()}.
@@ -206,6 +211,11 @@ strings appears in the accumulated detokenised output, generation
 halts. The match is trimmed from the streamed `{erllama_token, _,
 _}` chunks and the matched value is reported as `stop_sequence` in
 the final `{erllama_done, _, Stats}`.
+
+`Stats` carries `cache_delta => #{read := N, created := N}` for
+Anthropic-style cache accounting: `read` tokens came from the warm
+prefix at admission, `created` tokens were added to the cache by
+this request.
 """.
 -spec infer(
     model(),
