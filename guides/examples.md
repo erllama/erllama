@@ -270,17 +270,57 @@ on terminal end when no match fired.
 
 ## 10. Extended thinking (`thinking_delta` / `thinking_end`)
 
-When `Params` carries `thinking => enabled` and the backend
-supports extended thinking, streaming requests receive
-thinking-phase fragments as `{erllama_token, Ref, {thinking_delta,
-Bin}}` and a single `{erllama_thinking_end, Ref, Sig}` close marker
-before any non-thinking token. `Sig` is an opaque integrity
-signature (or `<<>>` when none is available) that thinking-capable
-SDKs verify on the next turn.
+Some LLMs emit a "thinking" phase before their actual answer —
+typically text wrapped in template-defined markers like
+`<think>...</think>`. erllama surfaces those thoughts as a
+separate stream so Anthropic-Messages SDKs can render and verify
+them.
+
+### Enabling thinking on a real model
+
+Tell the backend which token strings open and close a thinking
+block for *this* GGUF. Each model has its own — qwen3 uses
+`<think>`/`</think>`, deepseek-r1 uses different markers. The
+strings are tokenised through the model's own vocabulary at load
+time.
 
 ```erlang
-{ok, Tokens} = erllama:tokenize(ModelId, <<"Solve: 23 * 17.">>),
-{ok, Ref} = erllama:infer(ModelId, Tokens,
+erllama:load_model(<<"qwen3-thinking">>, #{
+    backend => erllama_model_llama,
+    model_path => "/models/qwen3-7b.gguf",
+    context_size => 8192,
+    policy => default_policy(),
+    thinking_markers => #{
+        start => <<"<think>">>,
+        end   => <<"</think>">>
+    }
+}).
+```
+
+Omitting `thinking_markers` (or passing `#{}`) keeps the backend
+on the non-thinking path — requests with `thinking => enabled`
+behave identically to a normal text request, no thinking messages
+arrive.
+
+For tamper-proof signatures on each thinking block, set a
+node-wide HMAC key once at boot:
+
+```erlang
+{erllama, [
+    {thinking_signing_key, <<"a-32-byte-secret-or-longer">>}
+]}.
+```
+
+`erllama_model_llama:thinking_signature/3` HMACs the observed
+thinking text with this key. Leaving it unset returns `<<>>`, the
+documented "no signature" path — the downstream forwards no
+`signature_delta` event.
+
+### Per-request usage
+
+```erlang
+{ok, Tokens} = erllama:tokenize(<<"qwen3-thinking">>, <<"Solve: 23 * 17.">>),
+{ok, Ref} = erllama:infer(<<"qwen3-thinking">>, Tokens,
                           #{response_tokens => 256,
                             thinking => enabled},
                           self()),
@@ -298,11 +338,25 @@ loop(Ref, _Thinking = <<>>, _Answer = <<>>, _Sig = <<>>) ->
     end.
 ```
 
-With `thinking => disabled` (the default), backends without
-thinking support, or when no thinking phase fires, no
-`{thinking_delta, _}` payloads and no `erllama_thinking_end`
-messages arrive — the stream is identical to a plain text-only
-request.
+### Capping the thinking phase (`thinking_budget_tokens`)
+
+Anthropic's API takes a `thinking.budget_tokens` hint that caps
+the thinking phase. erllama honours it as the maximum number of
+`{thinking_delta, _}` payloads to deliver. Once the budget is
+reached, the scheduler synthesises the `erllama_thinking_end`
+close immediately and routes any further model-emitted thinking
+tokens through the normal post-thinking pipeline so generation
+still progresses.
+
+```erlang
+{ok, Ref} = erllama:infer(<<"qwen3-thinking">>, Tokens,
+                          #{response_tokens => 256,
+                            thinking => enabled,
+                            thinking_budget_tokens => 64},
+                          self()).
+```
+
+Non-positive values and a missing key both mean "no cap".
 
 ## 11. Warm a session without sampling (`prefill_only/2`)
 
@@ -390,7 +444,36 @@ the model has not admitted any request yet. All four are O(1) ETS
 reads and safe to call from a hot path or via `erpc` from another
 node.
 
-## 14. Inspecting cache state
+## 14. Per-request cache delta (`cache_creation_input_tokens` / `cache_read_input_tokens`)
+
+Every result and `Stats` map carries `cache_delta => #{read := N,
+created := N}`. `read` counts tokens served from the warm prefix
+at admission, `created` counts tokens this request added to the
+cache beyond that prefix. Both default to `0`; together they
+populate Anthropic's `cache_read_input_tokens` and
+`cache_creation_input_tokens` accurately.
+
+```erlang
+{ok, #{cache_delta := #{read := R, created := C},
+       cache_hit_kind := Hit}} =
+    erllama:complete(ModelId, Prompt, #{response_tokens => 64}),
+io:format("hit=~p read=~p created=~p~n", [Hit, R, C]).
+```
+
+What each combination tells you:
+
+| `cache_hit_kind` | `read`         | `created`        |
+| ---------------- | -------------- | ---------------- |
+| `cold`           | `0`            | `prompt + generated` |
+| `partial`        | warm prefix    | `committed - warm prefix` |
+| `exact`          | full prompt    | `generated` |
+| any, save below `min_tokens` | warm prefix | `0` (no save fired) |
+
+Streaming consumers read the same map from the final
+`{erllama_done, Ref, Stats}` message; `prefill_only/2` exposes it
+on its result map too.
+
+## 15. Inspecting cache state
 
 ```erlang
 %% Hit/miss/save counters and per-path latency totals.
@@ -412,7 +495,7 @@ erllama_cache:evict_bytes(256 * 1024 * 1024, [ram, ram_file]).
 erllama_cache:gc().
 ```
 
-## 15. Memory-pressure-driven eviction (in `sys.config`)
+## 16. Memory-pressure-driven eviction (in `sys.config`)
 
 ```erlang
 {erllama, [
@@ -431,7 +514,7 @@ Sources shipped: `noop`, `system`, `nvidia_smi`, `{module, M}`. Roll
 your own with `-behaviour(erllama_pressure)` and pass
 `{module, M}` as the source.
 
-## 16. Cache-only tests (no model required)
+## 17. Cache-only tests (no model required)
 
 The cache subsystem is independently usable. eunit tests that
 exercise save/load round-trips never touch llama.cpp:
@@ -474,7 +557,7 @@ round_trip_test() ->
 The lazy `llama_backend_init` means cache-only tests never trigger
 `ggml_backend_load_all` — no Metal/CUDA discovery cost.
 
-## 17. End-to-end against a real GGUF
+## 18. End-to-end against a real GGUF
 
 ```bash
 LLAMA_TEST_MODEL=/path/to/tinyllama-1.1b-chat.Q4_K_M.gguf \
@@ -486,7 +569,7 @@ parent-key resume, longest-prefix walk, eviction, and a multi-model
 concurrent run. Without the env var it skips so default
 `rebar3 ct` stays green.
 
-## 18. Microbench: cold vs. warm
+## 19. Microbench: cold vs. warm
 
 ```bash
 bench/run.sh tiny    # TinyLlama 1.1B Q4_K_M
