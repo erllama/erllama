@@ -86,6 +86,20 @@ its own supervisor, and never returns approximate matches.
   per-path latency totals exposed via `erllama_cache:get_counters/0`.
   Per-counter cost is ~10-20 ns; you cannot meaningfully turn them
   off.
+- **Multi-sequence batched scheduler.** Opt in with
+  `context_opts.n_seq_max > 1` and up to N requests prefill and
+  decode concurrently through a single `llama_decode` per tick.
+  Default `n_seq_max => 1` keeps single-tenant behaviour
+  bit-identical to 0.1.
+- **Chunked prefill.** A long prompt is sliced into per-tick
+  chunks (`prefill_chunk_size`, default `max(64, n_batch div 4)`)
+  so it never monopolises the batch and concurrent decoders keep
+  making progress.
+- **Lock-free observability.** `erllama:phase/1`,
+  `pending_len/1`, `last_cache_hit/1`, and `queue_depth/1` read a
+  public ETS row without crossing the model gen_statem, so a
+  router can probe "is this model busy?" without serialising
+  behind the work it is probing.
 
 ## Installation
 
@@ -95,7 +109,7 @@ Add to `rebar.config`:
 
 ```erlang
 {deps, [
-    {erllama, "~> 0.1"}
+    {erllama, "~> 0.2"}
 ]}.
 ```
 
@@ -181,8 +195,20 @@ CtxHash = crypto:hash(sha256, term_to_binary({8192, 4096})),
 {ok, M} = erllama:load_model(#{
     backend          => erllama_model_llama,
     model_path       => "/srv/models/llama-3.1-8b.Q4_K_M.gguf",
-    model_opts       => #{n_gpu_layers => 99},
-    context_opts     => #{n_ctx => 8192, n_batch => 4096},
+    model_opts       => #{
+        n_gpu_layers => 99,
+        split_mode   => layer,           %% multi-GPU split policy
+        main_gpu     => 0,
+        tensor_split => [0.5, 0.5]       %% 50/50 across two devices
+    },
+    context_opts     => #{
+        n_ctx        => 8192,
+        n_batch      => 4096,
+        n_seq_max    => 4,               %% admit up to 4 concurrent reqs
+        flash_attn   => auto,            %% boolean() | auto
+        type_k       => f16,             %% KV cache element type
+        type_v       => f16
+    },
     fingerprint      => Fp,
     fingerprint_mode => safe,
     quant_type       => q4_k_m,
@@ -194,7 +220,8 @@ CtxHash = crypto:hash(sha256, term_to_binary({8192, 4096})),
     policy           => #{
         boundary_trim_tokens   => 32,
         boundary_align_tokens  => 256,
-        session_resume_wait_ms => 500
+        session_resume_wait_ms => 500,
+        prefill_chunk_size     => 1024   %% cap per-tick prefill slice
     }
 }).
 ```
@@ -241,6 +268,32 @@ Inspect cache state from a shell:
 %%   {Key, Tier, Size, LastUsedNs, Refcount, Status, HeaderBin,
 %%    Location, TokensRef, Hits}
 [{<<_:256>>, disk, 8388608, 1737..., 0, available, _, _, _, 4}, ...]
+```
+
+Per-model observability is lock-free (reads a public ETS row, never
+crosses the model gen_statem):
+
+```erlang
+1> erllama:phase(<<"big">>).
+generating
+2> erllama:pending_len(<<"big">>).
+3
+3> erllama:last_cache_hit(<<"big">>).
+#{kind => partial, prefix_len => 1024}
+4> erllama:queue_depth(<<"big">>).
+2
+```
+
+Warm a session without sampling. Useful for priming the cache
+before a burst of short follow-ups, or for holding a warm context
+across long pauses:
+
+```erlang
+{ok, Toks} = erllama:tokenize(M, SystemPrompt),
+{ok, #{finish_key := FK}} = erllama:prefill_only(M, Toks),
+%% Later turns pass FK as parent_key to skip the longest-prefix walk.
+{ok, #{reply := R}} =
+    erllama:complete(M, UserTurn, #{parent_key => FK}).
 ```
 
 ## Requirements

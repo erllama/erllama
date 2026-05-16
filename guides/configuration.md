@@ -92,7 +92,14 @@ Passed to `erllama:load_model/1,2`:
   backend           => erllama_model_llama,
   model_path        => "/path/to/x.gguf",
   model_opts        => #{n_gpu_layers => 99},
-  context_opts      => #{n_ctx => 4096, n_batch => 512},
+  context_opts      => #{
+    n_ctx      => 4096,
+    n_batch    => 512,
+    n_seq_max  => 1,           %% > 1 enables the multi-tenant scheduler
+    flash_attn => auto,        %% boolean() | auto
+    type_k     => f16,         %% KV element type for keys
+    type_v     => f16          %% KV element type for values
+  },
   fingerprint       => <<32 bytes>>,
   fingerprint_mode  => safe,
   quant_type        => q4_k_m,
@@ -108,10 +115,27 @@ Passed to `erllama:load_model/1,2`:
     continued_interval     => 256,
     boundary_trim_tokens   => 32,
     boundary_align_tokens  => 256,
-    session_resume_wait_ms => 500
+    session_resume_wait_ms => 500,
+    prefill_chunk_size     => 1024   %% per-tick prefill slice cap
   }
 }
 ```
+
+### `prefill_chunk_size`
+
+Per-tick prefill slice cap. Default `max(64, n_batch div 4)`; pass
+`infinity` to disable. Lives in the `policy` map for parity with
+the save-policy gates but does not gate saving - it caps how many
+tokens a single prefill row contributes to one `step_tick`, so a
+long prompt is sliced across multiple ticks and concurrent decoders
+keep making progress between chunks.
+
+### `n_seq_max`
+
+Maximum concurrent sequences. Belongs under `context_opts`, not the
+`policy` map - it is a context shape, not a save-policy gate.
+Default `1` (single-tenant). Set higher to opt into multi-tenant
+co-batched scheduling.
 
 See [loading a model](loading.md) for the per-field walkthrough.
 
