@@ -216,6 +216,12 @@ the final `{erllama_done, _, Stats}`.
 Anthropic-style cache accounting: `read` tokens came from the warm
 prefix at admission, `created` tokens were added to the cache by
 this request.
+
+When `Params` carries `thinking_budget_tokens => N` and the
+thinking phase emits `N` or more `{thinking_delta, _}` payloads,
+the scheduler synthesises the `{erllama_thinking_end, _, _}` close
+early. Any subsequent backend `{thinking_token, _}` is routed
+through the normal token pipeline so generation still progresses.
 """.
 -spec infer(
     model(),
