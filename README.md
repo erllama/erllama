@@ -417,28 +417,52 @@ sections 11–13 for full code patterns.
 ## Architecture at a glance
 
 ```
-erllama_sup
+erllama_sup                         one_for_one root
 ├── erllama_cache_sup
 │   ├── erllama_cache_meta_srv      sole writer; meta + LRU + reservations
 │   ├── erllama_cache_ram           RAM tier (ETS slabs)
-│   ├── erllama_cache_ramfile_srv   ram_file tier
-│   ├── erllama_cache_disk_srv      disk tier (plain read/write I/O)
 │   └── erllama_cache_writer        writer pool, leak-proof semaphore
+├── erllama_registry                {ModelId, pid()} name registry
+├── erllama_inflight                {request_ref, pid()} index for cancel/end_session
 ├── erllama_model_sup               simple_one_for_one for dynamic models
+│   └── erllama_model (per loaded model, one gen_statem each)
 └── erllama_scheduler               memory-pressure poller (off by default)
 ```
 
-Inside a request:
+Disk and `ram_file` tier servers (`erllama_cache_disk_srv`,
+`erllama_cache_ramfile_srv`) are started by the operator outside
+this tree — one per root directory — and referenced by each
+loaded model through `tier_srv` and `tier`. The cache pipeline
+fans out to them through the `meta_srv` reservation flow.
 
-1. `erllama:complete/2` enters the per-model `gen_statem`.
-2. **prefilling** — tokenize, then either hit the cache and
-   `kv_unpack` (warm) or run `llama_decode` over the prompt (cold).
-   Cold path fires an async `cold` save at the trimmed-prefix
-   boundary.
-3. **generating** — token-by-token greedy `llama_decode`. Every
-   `continued_interval` tokens, fire an async `continued` save.
-4. **idle** — fire an async `finish` save for the full prompt +
-   reply. The KV state becomes evictable.
+### Inside a request
+
+The per-model `gen_statem` has two states: **idle** (no
+in-flight requests) and **running** (one or more requests
+prefilling and/or decoding through the multi-seq scheduler).
+Every incoming request takes the same path:
+
+1. **Admit.** Pop a `seq_id` from the idle pool (or reuse the
+   session's pinned seq when `session_id` is set). Optionally
+   build a per-request sampler chain.
+2. **Resolve the cache.** Token-exact lookup; on a partial hit
+   walk the longest cached prefix. The result is
+   `cache_hit_kind :: exact | partial | cold | sticky`.
+3. **Warm-restore or cold-prefill.** Warm: `kv_unpack` the
+   stored payload under the seq's id, then re-prefill the last
+   cell as a logits primer. Cold: clear the seq and prefill the
+   prompt. Sticky: skip both — the cells are already live, just
+   prefill the new suffix.
+4. **Decode.** A single `nif_step` per tick mixes prefill and
+   decode rows across every active request (SARATHI-style
+   co-batching, bounded by `n_batch`). Tool-call and thinking
+   markers are recognised inline and surfaced on the streaming
+   wire.
+5. **Save.** `cold` save fires at the trimmed-prefix boundary
+   during prefill, `continued` saves every `continued_interval`
+   tokens during decode, and a `finish` save when the request
+   terminates. Sticky requests keep the seq's KV live; one-shot
+   requests release it back to the idle pool.
 
 For the publish protocol, the reservation state machine, and the
 exception-safe NIF wrappers, see
