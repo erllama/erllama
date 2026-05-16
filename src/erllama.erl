@@ -49,6 +49,7 @@ an explicit `model_id` in the config map.
     prefill_only/3,
     infer/4,
     cancel/1,
+    end_session/2,
     status/1,
     evict/1,
     shutdown/1,
@@ -245,6 +246,15 @@ thinking phase emits `N` or more `{thinking_delta, _}` payloads,
 the scheduler synthesises the `{erllama_thinking_end, _, _}` close
 early. Any subsequent backend `{thinking_token, _}` is routed
 through the normal token pipeline so generation still progresses.
+
+When `Params` carries `session_id => Term`, the underlying seq_id is
+pinned to that session across successive requests. The next
+request with the same `session_id` truncates-and-prefills in place
+on the live KV cells instead of warm-restoring from disk, as long
+as its prompt continues the stored tokens. Concurrent requests
+on the same `session_id` are out of scope: the second one returns
+`{error, sticky_busy}`. Release the session explicitly with
+`end_session/2` when the conversation ends.
 """.
 -spec infer(
     model(),
@@ -265,6 +275,17 @@ Stats}` with `cancelled => true`.
 -spec cancel(reference()) -> ok.
 cancel(Ref) ->
     erllama_model:cancel(Ref).
+
+-doc """
+Release a sticky session: free the pinned seq_id's KV cells and
+return the seq to the idle pool so a new conversation can take it.
+Idempotent — unknown session ids are a no-op. Call when the user's
+conversation ends, on TTL expiry, or any time the live KV is no
+longer worth keeping resident.
+""".
+-spec end_session(model(), term()) -> ok.
+end_session(Model, SessionId) ->
+    erllama_model:end_session(Model, SessionId).
 
 -doc """
 Current model state. `idle` means no request is in flight;
