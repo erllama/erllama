@@ -6,8 +6,26 @@ this project adheres to [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-05-16
+
+Anthropic-Messages compatibility additions on top of 0.2.0:
+caller-supplied stop sequences with trimmed output, an opt-in
+extended-thinking message surface with per-block integrity
+signatures, and a round of NIF safety hardening on the C/C++ side.
+
 ### Added
 
+- `stop_sequences :: [binary()]` on `infer/4` `Params` and
+  `complete/3` `Opts`. Generation halts on the first occurrence of
+  any element in the accumulated detokenised output. The match is
+  trimmed from the streamed `{erllama_token, _, _}` chunks and the
+  synchronous `reply`, and the matched binary is reported as
+  `stop_sequence` on the result map (`complete/3`) and stats map
+  (`infer/4` done message). The key is absent when generation hit
+  `length`, was cancelled, or reached EOG without a match. The
+  previously reserved `stop` placeholder is renamed to
+  `stop_sequences`; it was never wired up so this is not a
+  breaking change (#32).
 - `thinking => enabled | disabled` on `infer/4` `Params` (default
   `disabled`). When `enabled` against a thinking-capable backend,
   streaming requests receive `{erllama_token, Ref, {thinking_delta,
@@ -15,11 +33,25 @@ this project adheres to [Semantic Versioning](https://semver.org).
   close marker before any subsequent token. `Sig` is an opaque
   integrity signature the downstream forwards verbatim into the
   Anthropic `signature_delta` SSE event, or `<<>>` when no
-  signature is available. The `step_result()` type on
-  `erllama_model_backend` gains `{thinking_token, _}` and
-  `thinking_end` variants and a new optional
-  `thinking_signature/2` callback; backends without thinking
-  support emit neither and require no changes.
+  signature is available (#33).
+- `erllama_model_backend` gains `{thinking_token, token_id()}` and
+  `thinking_end` variants on `step_result()` plus an optional
+  `thinking_signature/2` callback. Backends without extended
+  thinking emit neither variant and require no changes (#33).
+
+### Changed
+
+- `llama_batch_init`, `llama_batch_free`, and `llama_batch_get_one`
+  are now routed through `erllama_safe_batch_*` `noexcept` shims
+  so a C++ exception cannot unwind through the C NIF frame (#30).
+- Per-thread `thread_local` storage replaces the process-global
+  log buffer used by the malformed-GGUF classifier; concurrent
+  model loads no longer scramble each other's `GGML_ASSERT` text
+  on a NULL return (#31).
+- NIF unload no longer calls `llama_backend_free` (avoids a
+  `pthread_once` wedge on `.so` reload paths) and clears the
+  `llama_log_set` callback so a post-unload log emission cannot
+  dispatch into freed memory (#31).
 
 ## [0.2.0] - 2026-05-15
 
