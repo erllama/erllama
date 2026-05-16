@@ -135,11 +135,16 @@ Recognised keys in `Opts`:
 - `parent_key` (`erllama_cache:cache_key()`) — the previous turn's
   `finish_key`. Skips the longest-prefix walk and resumes directly
   from that row.
+- `stop_sequences` (`[binary()]`) — caller-supplied stop strings.
+  Generation halts on the first occurrence (by list order) of any
+  element in the accumulated detokenised output; the matched string
+  is trimmed from `reply` and reported as `stop_sequence`.
 
 Returns `{ok, Result}` where `Result` is a `completion_result()` map
 carrying:
 
-- `reply` — detokenised reply text
+- `reply` — detokenised reply text (trimmed at the matched stop
+  string when one fired)
 - `generated` — tokens produced by this request
 - `context_tokens` — full token list (prompt ++ generated)
 - `committed_tokens` — `length(context_tokens)`
@@ -147,6 +152,8 @@ carrying:
   the finish save was suppressed
 - `cache_hit_kind` — `exact | partial | cold`
 - `finish_reason` — `stop | length | cancelled`
+- `stop_sequence` — only present when a `stop_sequences` entry
+  fired; the binary of the matched stop string
 - `stats` — per-request timing and cache stats
 """.
 -spec complete(model(), binary(), map()) ->
@@ -184,6 +191,12 @@ async messages:
 `Tokens` is the prompt as a list of token ids; tokenisation is the
 caller's responsibility (use `tokenize/2` or apply a chat template
 first).
+
+When `Params` carries `stop_sequences => [binary()]` and one of the
+strings appears in the accumulated detokenised output, generation
+halts. The match is trimmed from the streamed `{erllama_token, _,
+_}` chunks and the matched value is reported as `stop_sequence` in
+the final `{erllama_done, _, Stats}`.
 """.
 -spec infer(
     model(),

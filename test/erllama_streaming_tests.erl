@@ -166,6 +166,73 @@ stats_carry_finish_key_and_committed_tokens_test() ->
     end).
 
 %% =============================================================================
+%% stop_sequences
+%% =============================================================================
+
+%% The stub backend's detokenize produces space-separated decimal
+%% integers, so a stop_sequence containing any digit hits early.
+%% Use the full digit set to guarantee a match regardless of which
+%% 32-bit token IDs the stub picks.
+all_digits() ->
+    [
+        <<"0">>,
+        <<"1">>,
+        <<"2">>,
+        <<"3">>,
+        <<"4">>,
+        <<"5">>,
+        <<"6">>,
+        <<"7">>,
+        <<"8">>,
+        <<"9">>
+    ].
+
+stop_sequence_value_reported_on_match_test() ->
+    with_model(fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        Params = #{response_tokens => 16, stop_sequences => all_digits()},
+        {ok, Ref} = erllama:infer(Id, Tokens, Params, self()),
+        {_Out, Stats} = collect_stream(Ref, 5000),
+        ?assertEqual(stop, maps:get(finish_reason, Stats)),
+        Match = maps:get(stop_sequence, Stats),
+        ?assert(is_binary(Match)),
+        ?assert(lists:member(Match, all_digits()))
+    end).
+
+stop_sequence_absent_on_length_test() ->
+    with_model(fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        %% A stop string the decimal output cannot contain.
+        Params = #{
+            response_tokens => 1,
+            stop_sequences => [<<"unmatchable-xyz">>]
+        },
+        {ok, Ref} = erllama:infer(Id, Tokens, Params, self()),
+        {_Out, Stats} = collect_stream(Ref, 5000),
+        ?assertNot(maps:is_key(stop_sequence, Stats)),
+        ?assertEqual(length, maps:get(finish_reason, Stats))
+    end).
+
+stop_sequence_absent_when_no_param_test() ->
+    with_model(fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        {ok, Ref} = erllama:infer(Id, Tokens, #{response_tokens => 2}, self()),
+        {_Out, Stats} = collect_stream(Ref, 5000),
+        ?assertNot(maps:is_key(stop_sequence, Stats))
+    end).
+
+stop_sequence_trimmed_from_stream_test() ->
+    with_model(fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        Params = #{response_tokens => 16, stop_sequences => all_digits()},
+        {ok, Ref} = erllama:infer(Id, Tokens, Params, self()),
+        {Out, Stats} = collect_stream(Ref, 5000),
+        Match = maps:get(stop_sequence, Stats),
+        Streamed = iolist_to_binary(Out),
+        ?assertEqual(nomatch, binary:match(Streamed, Match))
+    end).
+
+%% =============================================================================
 %% Concurrency / busy
 %% =============================================================================
 
