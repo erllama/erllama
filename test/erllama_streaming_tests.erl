@@ -321,6 +321,57 @@ non_thinking_stub_with_thinking_enabled_is_normal_stream_test() ->
         ?assertEqual(done, lists:last(Kinds))
     end).
 
+thinking_budget_clips_after_one_delta_test() ->
+    %% Stub normally emits two thinking_token deltas before its
+    %% thinking_end marker. With budget = 1 the scheduler must
+    %% synthesise the close right after the first delta and route
+    %% subsequent thinking_tokens through the normal token path.
+    with_model(#{thinking_capable => true}, fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        {ok, Ref} = erllama:infer(
+            Id,
+            Tokens,
+            #{
+                response_tokens => 4,
+                thinking => enabled,
+                thinking_budget_tokens => 1
+            },
+            self()
+        ),
+        Events = collect_all(Ref, 5000),
+        Kinds = [K || {K, _} <- Events],
+        Deltas = [K || K <- Kinds, K =:= thinking_delta],
+        Ends = [K || K <- Kinds, K =:= thinking_end],
+        ?assertEqual(1, length(Deltas)),
+        %% Exactly one thinking_end across the whole stream, even if
+        %% the backend later emitted its own thinking_end marker.
+        ?assertEqual(1, length(Ends)),
+        ?assertEqual(done, lists:last(Kinds)),
+        %% Every thinking_delta arrives before the thinking_end.
+        EndIdx = idx_of(thinking_end, Kinds),
+        ?assert(
+            lists:all(
+                fun({K, I}) -> K =/= thinking_delta orelse I < EndIdx end,
+                indexed(Kinds)
+            )
+        )
+    end).
+
+thinking_budget_unset_keeps_existing_shape_test() ->
+    %% Regression: with no thinking_budget_tokens, the stub's full
+    %% natural shape (two thinking_deltas) must still come through.
+    with_model(#{thinking_capable => true}, fun(Id) ->
+        {ok, Tokens} = erllama:tokenize(Id, <<"hello">>),
+        {ok, Ref} = erllama:infer(
+            Id, Tokens, #{response_tokens => 3, thinking => enabled}, self()
+        ),
+        Events = collect_all(Ref, 5000),
+        Kinds = [K || {K, _} <- Events],
+        Deltas = [K || K <- Kinds, K =:= thinking_delta],
+        ?assertEqual(2, length(Deltas)),
+        ?assertEqual(1, length([1 || thinking_end <- Kinds]))
+    end).
+
 %% Helpers for the thinking tests.
 indexed(L) ->
     lists:zip(L, lists:seq(1, length(L))).

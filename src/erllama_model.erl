@@ -304,6 +304,14 @@ concurrently through one decode call per tick.
     %% token. Defaults to `disabled`; backends without thinking
     %% support ignore the flag entirely.
     thinking => enabled | disabled,
+    %% Caller-side cap on the thinking phase. Once the scheduler has
+    %% forwarded this many `{thinking_delta, _}` payloads for the
+    %% request, it synthesises the `erllama_thinking_end` close
+    %% early and re-routes any further `{thinking_token, _}` step
+    %% results through the normal token pipeline so generation
+    %% progresses. Non-positive values and a missing key both mean
+    %% "no cap". Only meaningful with `thinking => enabled`.
+    thinking_budget_tokens => pos_integer(),
     _ => _
 }.
 
@@ -404,7 +412,22 @@ concurrently through one decode call per tick.
     %% lifetime. Combined with `cache_hit_prefix_len` (which is the
     %% read side) it powers the `cache_delta` map surfaced on
     %% `completion_result()`, `stats()`, and `prefill_result()`.
-    cache_delta_created = 0 :: non_neg_integer()
+    cache_delta_created = 0 :: non_neg_integer(),
+    %% Caller-side thinking-phase cap (`undefined` means no cap).
+    %% Counted in delivered `{thinking_delta, _}` payloads, not raw
+    %% thinking_token step results, so an empty detokenisation does
+    %% not consume the budget.
+    thinking_budget = undefined :: pos_integer() | undefined,
+    %% Number of `{thinking_delta, _}` payloads delivered so far for
+    %% this request. Compared against `thinking_budget` after each
+    %% emit; on overflow the scheduler synthesises the
+    %% `erllama_thinking_end` close immediately.
+    thinking_count = 0 :: non_neg_integer(),
+    %% Set after the budget-triggered `thinking_end`. Any further
+    %% `{thinking_token, _}` step result is treated as a normal
+    %% `{token, _, 0}` for the rest of the request so generation
+    %% progresses without surfacing further `thinking_delta`s.
+    thinking_capped = false :: boolean()
 }).
 
 -record(data, {
@@ -958,7 +981,8 @@ start_request({complete, From, Prompt, Opts}, SeqId, Data) ->
                 stop_sequences = Stops,
                 stop_pattern = StopPat,
                 stop_max_len = StopMax,
-                thinking = thinking_from(Opts)
+                thinking = thinking_from(Opts),
+                thinking_budget = thinking_budget_from(Opts)
             },
             ParentKey = maps:get(parent_key, Opts, undefined),
             Req1 = setup_lookup(Req, ParentKey, Data0),
@@ -1011,7 +1035,8 @@ start_request({infer, From, Tokens, Params, CallerPid}, SeqId, Data) ->
                 stop_sequences = Stops,
                 stop_pattern = StopPat,
                 stop_max_len = StopMax,
-                thinking = thinking_from(Params)
+                thinking = thinking_from(Params),
+                thinking_budget = thinking_budget_from(Params)
             },
             ParentKey = maps:get(parent_key, Params, undefined),
             Req1 = setup_lookup(Req, ParentKey, Data0),
@@ -1668,15 +1693,26 @@ apply_step_results([{{SeqId, {decode, _}}, {token, Tok, EogFlag}} | T], Data) ->
             false -> maybe_fire_continued_for_req(Req2, Data)
         end,
     apply_step_results(T, put_req(Data, Req3));
-apply_step_results([{{SeqId, {decode, _}}, {thinking_token, Tok}} | T], Data) ->
+apply_step_results([{{SeqId, {decode, S}}, {thinking_token, Tok}} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
-    %% Thinking tokens are NOT appended to generated/context_tokens:
-    %% they belong to a separate content track and the cache is
-    %% keyed on the post-thinking output. The backend is responsible
-    %% for any internal bookkeeping needed to keep its KV state
-    %% consistent.
-    Req1 = req_thinking_emit(Req, Tok, Data),
-    apply_step_results(T, put_req(Data, Req1));
+    case Req#req.thinking_capped of
+        true ->
+            %% Caller-side thinking budget was already hit. Route
+            %% this token through the normal post-thinking pipeline
+            %% so generation progresses; the backend can keep
+            %% emitting thinking_token without surprises.
+            apply_step_results(
+                [{{SeqId, {decode, S}}, {token, Tok, 0}} | T], Data
+            );
+        false ->
+            %% Thinking tokens are NOT appended to generated/context_tokens:
+            %% they belong to a separate content track and the cache
+            %% is keyed on the post-thinking output. The backend is
+            %% responsible for any internal bookkeeping needed to
+            %% keep its KV state consistent.
+            Req1 = req_thinking_emit(Req, Tok, Data),
+            apply_step_results(T, put_req(Data, Req1))
+    end;
 apply_step_results([{{SeqId, {decode, _}}, thinking_end} | T], Data) ->
     Req = maps:get(SeqId, Data#data.req_table),
     Req1 = req_thinking_end(Req, Data),
@@ -1772,11 +1808,19 @@ req_thinking_emit(
             B when is_binary(B) -> B;
             _ -> <<>>
         end,
+    Req1 = Req#req{
+        thinking_bytes = <<(Req#req.thinking_bytes)/binary, Bin/binary>>
+    },
     case Bin of
-        <<>> -> ok;
-        _ -> Pid ! {erllama_token, Ref, {thinking_delta, Bin}}
-    end,
-    Req#req{thinking_bytes = <<(Req#req.thinking_bytes)/binary, Bin/binary>>};
+        <<>> ->
+            %% Empty detokenisation doesn't consume the budget and
+            %% isn't observed by the caller.
+            Req1;
+        _ ->
+            Pid ! {erllama_token, Ref, {thinking_delta, Bin}},
+            Req2 = Req1#req{thinking_count = Req1#req.thinking_count + 1},
+            maybe_cap_thinking(Req2, Data)
+    end;
 req_thinking_emit(Req, _Token, _Data) ->
     %% Non-streaming caller with thinking_token in flight: drop the
     %% delta but keep the bytes for the eventual signature so
@@ -1784,6 +1828,34 @@ req_thinking_emit(Req, _Token, _Data) ->
     %% coherent thinking_end. Mostly a defensive branch.
     Req.
 
+%% Caller-side thinking budget. When the count of delivered
+%% `{thinking_delta, _}` payloads reaches the configured budget,
+%% synthesise the `erllama_thinking_end` close immediately so the
+%% caller sees a coherent thinking block; subsequent
+%% `{thinking_token, _}` step results are routed through the
+%% normal token pipeline by apply_step_results.
+maybe_cap_thinking(#req{thinking_budget = undefined} = Req, _Data) ->
+    Req;
+maybe_cap_thinking(#req{thinking_count = N, thinking_budget = B} = Req, _Data) when
+    N < B
+->
+    Req;
+maybe_cap_thinking(
+    #req{caller_pid = Pid, request_ref = Ref} = Req, Data
+) when
+    is_pid(Pid), is_reference(Ref)
+->
+    Sig = thinking_signature(Req, Data),
+    Pid ! {erllama_thinking_end, Ref, Sig},
+    Req#req{thinking_bytes = <<>>, thinking_capped = true};
+maybe_cap_thinking(Req, _Data) ->
+    Req#req{thinking_bytes = <<>>, thinking_capped = true}.
+
+req_thinking_end(#req{thinking_capped = true} = Req, _Data) ->
+    %% The caller-side budget already synthesised the close;
+    %% suppress a late `thinking_end` from the backend so the
+    %% caller doesn't see two close markers.
+    Req;
 req_thinking_end(
     #req{mode = streaming, caller_pid = Pid, request_ref = Ref} = Req,
     Data
@@ -2144,6 +2216,15 @@ thinking_from(Opts) ->
     case maps:get(thinking, Opts, disabled) of
         enabled -> enabled;
         _ -> disabled
+    end.
+
+%% Caller's thinking-phase budget. Non-positive integers and any
+%% non-integer (including a missing key) yield `undefined`, which
+%% means "no cap".
+thinking_budget_from(Opts) ->
+    case maps:get(thinking_budget_tokens, Opts, undefined) of
+        N when is_integer(N), N > 0 -> N;
+        _ -> undefined
     end.
 
 %% Per-#req stats. Mirrors the v0.2 build_stats/4 but reads from the
