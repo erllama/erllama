@@ -459,6 +459,62 @@ complete_stop_sequence_absent_when_no_match_test() ->
         ?assertNot(maps:is_key(stop_sequence, maps:get(stats, Result)))
     end).
 
+%% =============================================================================
+%% cache_delta accounting (Anthropic-style)
+%% =============================================================================
+
+complete_cache_delta_cold_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        {ok, Result} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 4}
+        ),
+        Delta = maps:get(cache_delta, Result),
+        ?assertEqual(0, maps:get(read, Delta)),
+        Committed = maps:get(committed_tokens, Result),
+        ?assertEqual(Committed, maps:get(created, Delta)),
+        %% Stats carry the same delta for streaming callers.
+        ?assertEqual(Delta, maps:get(cache_delta, maps:get(stats, Result)))
+    end).
+
+complete_cache_delta_exact_warm_test() ->
+    with_model(#{}, fun(Cfg) ->
+        Tokens = prompt_tokens(long_prompt()),
+        %% First call: cold; cold save fires on the prompt prefix.
+        {ok, _R1} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 4}
+        ),
+        ColdKey = key_for_tokens(Tokens, Cfg),
+        {ok, _} = wait_for_key(ColdKey, 1000),
+        %% Second call with the same prompt: exact hit on the cold-save key.
+        {ok, R2} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 4}
+        ),
+        ?assertEqual(exact, maps:get(cache_hit_kind, R2)),
+        Delta = maps:get(cache_delta, R2),
+        ?assertEqual(length(Tokens), maps:get(read, Delta)),
+        Generated = length(maps:get(generated, R2)),
+        ?assertEqual(Generated, maps:get(created, Delta))
+    end).
+
+complete_cache_delta_finish_suppressed_test() ->
+    with_model(#{min_tokens => 10_000}, fun(_Cfg) ->
+        {ok, Result} = erllama_model:complete(
+            <<"test_model">>, long_prompt(), #{response_tokens => 2}
+        ),
+        Delta = maps:get(cache_delta, Result),
+        ?assertEqual(0, maps:get(read, Delta)),
+        ?assertEqual(0, maps:get(created, Delta))
+    end).
+
+prefill_only_cache_delta_test() ->
+    with_model(#{}, fun(_Cfg) ->
+        Tokens = prompt_tokens(long_prompt()),
+        {ok, Result} = erllama_model:prefill_only(<<"test_model">>, Tokens),
+        Delta = maps:get(cache_delta, Result),
+        ?assertEqual(0, maps:get(read, Delta)),
+        ?assertEqual(length(Tokens), maps:get(created, Delta))
+    end).
+
 prefill_only_returns_finish_key_and_warm_resumes_test() ->
     with_model(#{}, fun(Cfg) ->
         Tokens = prompt_tokens(long_prompt()),

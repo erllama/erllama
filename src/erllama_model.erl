@@ -216,6 +216,16 @@ concurrently through one decode call per tick.
     %% to `prompt_tokens + completion_tokens` unless the cache pruned
     %% the live context (not currently possible).
     committed_tokens := non_neg_integer(),
+    %% Anthropic-style per-request cache breakdown. `read` is the
+    %% warm prefix length restored from cache at admission;
+    %% `created` is the largest contribution this request added to
+    %% the cache beyond that prefix (saves below `min_tokens` and
+    %% writer back-pressure leave `created` unchanged). Both
+    %% default to 0.
+    cache_delta := #{
+        read := non_neg_integer(),
+        created := non_neg_integer()
+    },
     %% Only present when a caller-supplied `stop_sequences` entry
     %% fired. The value is the binary of the matched stop string.
     %% Absent on `length`, `cancelled`, or natural end-of-generation
@@ -241,6 +251,11 @@ concurrently through one decode call per tick.
     %% How this request resolved against the cache on admission.
     cache_hit_kind := cache_hit_kind(),
     finish_reason := finish_reason(),
+    %% Per-request Anthropic cache breakdown. See `stats()`.
+    cache_delta := #{
+        read := non_neg_integer(),
+        created := non_neg_integer()
+    },
     stats := stats(),
     %% Only present when a caller-supplied `stop_sequences` entry
     %% fired. The value is the binary of the matched stop string.
@@ -252,7 +267,12 @@ concurrently through one decode call per tick.
     context_tokens := [non_neg_integer()],
     committed_tokens := non_neg_integer(),
     finish_key := binary() | undefined,
-    cache_hit_kind := cache_hit_kind()
+    cache_hit_kind := cache_hit_kind(),
+    %% Per-request Anthropic cache breakdown. See `stats()`.
+    cache_delta := #{
+        read := non_neg_integer(),
+        created := non_neg_integer()
+    }
 }.
 
 %% Optional fields the caller may set on `infer/4`. The same fields
@@ -378,7 +398,14 @@ concurrently through one decode call per tick.
     %% `erllama_error` (e.g. backend contract violation). The
     %% finish path skips the `erllama_done` send in that case so
     %% the caller doesn't see both.
-    errored = undefined :: term() | undefined
+    errored = undefined :: term() | undefined,
+    %% Anthropic-style cache delta: tokens this request added to
+    %% cache that weren't already there. Tracks the largest save
+    %% contribution above the warm prefix seen during the request
+    %% lifetime. Combined with `cache_hit_prefix_len` (which is the
+    %% read side) it powers the `cache_delta` map surfaced on
+    %% `completion_result()`, `stats()`, and `prefill_result()`.
+    cache_delta_created = 0 :: non_neg_integer()
 }).
 
 -record(data, {
@@ -1838,13 +1865,13 @@ maybe_fire_cold_save(
     Req = #req{cold_save_remaining = Remaining, context_tokens = Trimmed},
     Data
 ) ->
-    _ = fire_save_for_tokens(cold, Trimmed, Req, Data),
+    Req0 = fire_save_for_tokens(cold, Trimmed, Req, Data),
     NextCursor =
         case Remaining of
             [] -> undefined;
             _ -> Remaining
         end,
-    Req#req{
+    Req0#req{
         cold_save_remaining = undefined,
         last_save_at = length(Trimmed),
         prefill_cursor = NextCursor
@@ -1859,8 +1886,8 @@ maybe_fire_continued_for_req(Req, Data) ->
     ),
     case Should of
         true ->
-            _ = fire_save_for_tokens(continued, Req#req.context_tokens, Req, Data),
-            Req#req{last_save_at = LiveCount};
+            Req0 = fire_save_for_tokens(continued, Req#req.context_tokens, Req, Data),
+            Req0#req{last_save_at = LiveCount};
         false ->
             Req
     end.
@@ -1895,17 +1922,22 @@ finish_req(Req, FinishReason, Data, Actions) ->
     FinishKey = finish_key_or_undefined(
         fire_finish_save_for_req(Req#req.context_tokens, Req, Data)
     ),
+    Req1 =
+        case FinishKey of
+            undefined -> Req;
+            _ -> bump_cache_delta(Req, Req#req.context_tokens)
+        end,
     Stats = build_stats_for_req(
-        FinishReason, Req#req.cancel_pending, FinishKey, Req
+        FinishReason, Req1#req.cancel_pending, FinishKey, Req1
     ),
-    Action = finish_action(Req, FinishReason, FinishKey, Stats, Data),
+    Action = finish_action(Req1, FinishReason, FinishKey, Stats, Data),
     %% Release the sampler and free the seq's KV before returning
     %% the seq_id to the pool. The gen_statem holds the context
     %% mutex so no concurrent reader of this seq_id is possible.
-    _ = release_sampler(Req, Data),
-    _ = release_seq(Req#req.seq_id, Data),
-    Data1 = remove_req(Data, Req#req.seq_id),
-    Data2 = Data1#data{idle_seq_ids = [Req#req.seq_id | Data1#data.idle_seq_ids]},
+    _ = release_sampler(Req1, Data),
+    _ = release_seq(Req1#req.seq_id, Data),
+    Data1 = remove_req(Data, Req1#req.seq_id),
+    Data2 = Data1#data{idle_seq_ids = [Req1#req.seq_id | Data1#data.idle_seq_ids]},
     {Data2, Actions ++ Action}.
 
 finish_action(#req{mode = standard, caller = From} = Req, FinishReason, FinishKey, Stats, Data) ->
@@ -1919,6 +1951,7 @@ finish_action(#req{mode = standard, caller = From} = Req, FinishReason, FinishKe
         finish_key => FinishKey,
         cache_hit_kind => Req#req.cache_hit_kind,
         finish_reason => FinishReason,
+        cache_delta => cache_delta_for(Req),
         stats => Stats
     },
     Result = maybe_add_stop_sequence(Result0, Req#req.matched_stop),
@@ -1941,7 +1974,8 @@ finish_action(
         context_tokens => Req#req.context_tokens,
         committed_tokens => length(Req#req.context_tokens),
         finish_key => FinishKey,
-        cache_hit_kind => Req#req.cache_hit_kind
+        cache_hit_kind => Req#req.cache_hit_kind,
+        cache_delta => cache_delta_for(Req)
     },
     [{reply, From, {ok, Result}}].
 
@@ -2137,9 +2171,22 @@ build_stats_for_req(FinishReason, Cancelled, FinishKey, Req) ->
         finish_reason => FinishReason,
         cancelled => Cancelled,
         finish_key => FinishKey,
-        committed_tokens => length(Req#req.context_tokens)
+        committed_tokens => length(Req#req.context_tokens),
+        cache_delta => cache_delta_for(Req)
     },
     maybe_add_stop_sequence(Stats0, Req#req.matched_stop).
+
+%% Anthropic-style per-request cache breakdown. `read` counts tokens
+%% served from the warm prefix at admission; `created` counts tokens
+%% this request added to the cache beyond that prefix (largest save
+%% contribution seen across cold / continued / finish / evict /
+%% shutdown). Both default to 0 when no relevant cache activity
+%% happened.
+cache_delta_for(Req) ->
+    #{
+        read => Req#req.cache_hit_prefix_len,
+        created => Req#req.cache_delta_created
+    }.
 
 %% Additive: include `stop_sequence` only when a stop string fired.
 maybe_add_stop_sequence(Map, undefined) ->
@@ -2315,7 +2362,8 @@ load_payload(_Tier, _Loc, Key, Data) ->
     end.
 
 %% Generic per-tokens save. Used for cold and continued saves; finish
-%% save goes through fire_finish_save_for_req.
+%% save goes through fire_finish_save_for_req. Returns the updated
+%% Req with cache_delta_created bumped when the save actually fired.
 fire_save_for_tokens(Reason, Tokens, Req, Data) ->
     Should =
         case Reason of
@@ -2325,7 +2373,10 @@ fire_save_for_tokens(Reason, Tokens, Req, Data) ->
             _ ->
                 true
         end,
-    fire_save_if(Should, Reason, Tokens, Req, Data).
+    case fire_save_if(Should, Reason, Tokens, Req, Data) of
+        fired -> bump_cache_delta(Req, Tokens);
+        not_fired -> Req
+    end.
 
 %% Returns `{ok, Key}` if a finish save fired. Returns `skipped` if
 %% the policy suppressed it (live token count below `min_tokens`).
@@ -2334,14 +2385,12 @@ fire_finish_save_for_req(LiveTokens, Req, Data) ->
         length(LiveTokens), Data#data.policy
     ),
     case fire_save_if(Should, finish, LiveTokens, Req, Data) of
-        ok when Should ->
-            {ok, make_key(LiveTokens, Req, Data)};
-        ok ->
-            skipped
+        fired -> {ok, make_key(LiveTokens, Req, Data)};
+        not_fired -> skipped
     end.
 
 fire_save_if(false, _Reason, _Tokens, _Req, _Data) ->
-    ok;
+    not_fired;
 fire_save_if(true, Reason, Tokens, Req, Data) ->
     BuildMeta = build_meta_for(Reason, Tokens, Req, Data),
     T0 = erlang:monotonic_time(nanosecond),
@@ -2354,11 +2403,26 @@ fire_save_if(true, Reason, Tokens, Req, Data) ->
         )
     of
         {ok, _} ->
-            ok;
+            fired;
+        {error, already_present} ->
+            %% A prior save (typically this request's cold save) or
+            %% a concurrent writer already published the key. The
+            %% data is in cache, so credit this request for it.
+            fired;
         {error, _SaveErr} ->
             erllama_cache_counters:incr(?C_SAVES_DROPPED),
-            ok
+            not_fired
     end.
+
+%% Bump the largest save contribution above the warm prefix. Each
+%% call site passes the tokens it just persisted; the
+%% `cache_delta_created` field tracks the max so a continued save
+%% followed by a finish save doesn't double-count.
+bump_cache_delta(Req, Tokens) ->
+    Contribution = max(length(Tokens) - Req#req.cache_hit_prefix_len, 0),
+    Req#req{
+        cache_delta_created = max(Req#req.cache_delta_created, Contribution)
+    }.
 
 %% Evict and shutdown saves: walk every in-flight req and fire one
 %% save per req that has non-empty context_tokens.
@@ -2371,8 +2435,12 @@ fire_save_for_reason(Reason, Data) ->
                 [] ->
                     Req;
                 Tokens ->
-                    _ = fire_save_if(true, Reason, Tokens, Req, Data),
-                    Req#req{last_save_at = length(Tokens)}
+                    Req0 =
+                        case fire_save_if(true, Reason, Tokens, Req, Data) of
+                            fired -> bump_cache_delta(Req, Tokens);
+                            not_fired -> Req
+                        end,
+                    Req0#req{last_save_at = length(Tokens)}
             end
         end,
         Data#data.req_table
